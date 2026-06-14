@@ -1,0 +1,214 @@
+name: Publish Desktop Artifact
+
+on:
+  workflow_run:
+    workflows:
+      - Build Release
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Build Release run ID. Leave empty to use the latest successful run with a desktop artifact.
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  publish-desktop-artifact:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          path: source
+          fetch-depth: 0
+
+      - name: Resolve desktop artifacts
+        id: artifact
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id || '' }}
+          INPUT_RUN_ID: ${{ github.event.inputs.run_id || '' }}
+        run: |
+          set -euo pipefail
+
+          artifact_root="$GITHUB_WORKSPACE/desktop-artifacts"
+          mkdir -p "$artifact_root"
+
+          run_ids=()
+          if [ "$EVENT_NAME" = "workflow_run" ]; then
+            run_ids=("$WORKFLOW_RUN_ID")
+          elif [ -n "$INPUT_RUN_ID" ]; then
+            run_ids=("$INPUT_RUN_ID")
+          else
+            mapfile -t run_ids < <(gh api \
+              "repos/$SOURCE_REPOSITORY/actions/workflows/release.yml/runs?status=success&branch=master&per_page=10" \
+              --jq '.workflow_runs[].id')
+          fi
+
+          if [ "${#run_ids[@]}" -eq 0 ] || [ -z "${run_ids[0]}" ]; then
+            echo "No Build Release runs found."
+            echo "has_artifact=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          selected_run_id=""
+          selected_artifacts=()
+          for run_id in "${run_ids[@]}"; do
+            [ -n "$run_id" ] || continue
+            mapfile -t artifact_names < <(gh api \
+              "repos/$SOURCE_REPOSITORY/actions/runs/$run_id/artifacts" \
+              --jq '.artifacts[] | select(.expired == false and (.name | startswith("adbpilot-"))) | .name')
+
+            if [ "${#artifact_names[@]}" -eq 0 ]; then
+              echo "Run $run_id has no non-expired adbpilot-* desktop artifact."
+              continue
+            fi
+
+            selected_run_id="$run_id"
+            selected_artifacts=("${artifact_names[@]}")
+            break
+          done
+
+          if [ -z "$selected_run_id" ]; then
+            echo "No desktop artifact found; publish step will end without changes."
+            echo "has_artifact=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for artifact_name in "${selected_artifacts[@]}"; do
+            echo "Downloading artifact $artifact_name from run $selected_run_id"
+            gh run download "$selected_run_id" \
+              --repo "$SOURCE_REPOSITORY" \
+              --name "$artifact_name" \
+              --dir "$artifact_root/$artifact_name"
+          done
+
+          zip_count="$(find "$artifact_root" -type f -name '*.zip' | wc -l | tr -d ' ')"
+          if [ "$zip_count" = "0" ]; then
+            echo "Desktop artifacts exist but contain no .zip files; publish step will end without changes."
+            echo "has_artifact=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found $zip_count desktop package file(s) in release artifacts."
+          echo "has_artifact=true" >> "$GITHUB_OUTPUT"
+          echo "source_run_id=$selected_run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Check target repository token
+        if: steps.artifact.outputs.has_artifact == 'true'
+        env:
+          TARGET_REPO_TOKEN: ${{ secrets.PUBLISH_APP_FROM_ADB_PILOT_TO_GITHUB_IO }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TARGET_REPO_TOKEN" ]; then
+            echo "Missing secret PUBLISH_APP_FROM_ADB_PILOT_TO_GITHUB_IO. It must allow write access to wk1995/wk1995.github.io." >&2
+            exit 1
+          fi
+
+      - name: Checkout target repository
+        if: steps.artifact.outputs.has_artifact == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: wk1995/wk1995.github.io
+          token: ${{ secrets.PUBLISH_APP_FROM_ADB_PILOT_TO_GITHUB_IO }}
+          path: target-site
+
+      - name: Copy desktop package files
+        if: steps.artifact.outputs.has_artifact == 'true'
+        env:
+          SOURCE_RUN_ID: ${{ steps.artifact.outputs.source_run_id }}
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import shutil
+          from pathlib import Path
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          source = workspace / "source"
+          artifacts = workspace / "desktop-artifacts"
+          target_site = workspace / "target-site"
+          source_run_id = os.environ["SOURCE_RUN_ID"]
+          pattern = re.compile(
+              r"^AdbPilot-(window|mac)-(\d+\.\d+\.\d+)-(32|64|arm64|x86_64)\.zip$"
+          )
+
+          readme_file = next(
+              (
+                  path
+                  for path in sorted(source.iterdir())
+                  if path.is_file() and path.name.lower().startswith("readme")
+              ),
+              None,
+          )
+          copied_paths = []
+
+          for package_file in sorted(artifacts.rglob("*.zip")):
+              match = pattern.match(package_file.name)
+              if not match:
+                  raise SystemExit(f"Unsupported desktop package name: {package_file.name}")
+
+              platform, version, systemos = match.groups()
+              target_path = Path("apps") / "packages" / platform / "adbPilot" / version / systemos
+              target_dir = target_site / target_path
+              target_dir.mkdir(parents=True, exist_ok=True)
+
+              shutil.copy2(package_file, target_dir / package_file.name)
+              if readme_file:
+                  shutil.copy2(readme_file, target_dir / readme_file.name)
+
+              manifest = {
+                  "app": "adbPilot",
+                  "platform": platform,
+                  "version": version,
+                  "systemos": systemos,
+                  "sourceRunId": source_run_id,
+                  "files": sorted(path.name for path in target_dir.glob("*.zip")),
+              }
+              (target_dir / "manifest.json").write_text(
+                  json.dumps(manifest, indent=2) + "\n",
+                  encoding="utf-8",
+              )
+              copied_paths.append(str(target_path))
+
+          if not copied_paths:
+              raise SystemExit("No desktop packages copied.")
+
+          print("Copied packages to:")
+          for target_path in copied_paths:
+              print(f"- {target_path}")
+          PY
+
+      - name: Commit and push package files
+        if: steps.artifact.outputs.has_artifact == 'true'
+        working-directory: target-site
+        env:
+          SOURCE_RUN_ID: ${{ steps.artifact.outputs.source_run_id }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-publish-actions[bot]"
+          git config user.email "41898282+github-publish-actions[bot]@users.noreply.github.com"
+
+          git add apps/packages/window/adbPilot apps/packages/mac/adbPilot
+
+          if git diff --cached --quiet; then
+            echo "No package file changes to commit."
+            exit 0
+          fi
+
+          git commit -m "[codex] publish AdbPilot desktop artifacts from run $SOURCE_RUN_ID"
+          git push
