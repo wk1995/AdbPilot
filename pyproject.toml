@@ -29,5 +29,8 @@ classifiers = [
 [project.scripts]
 adbpilot = "adbpilot.cli:main"
 
+[project.gui-scripts]
+adbpilot-gui = "adbpilot.gui:main"
+
 [tool.setuptools.packages.find]
 include = ["adbpilot*"]
