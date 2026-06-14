@@ -43,6 +43,9 @@ class AdbPilotGui(BaseTk):
         self.device_rows: dict[str, dict[str, Any]] = {}
         self.device_poll_running = False
         self.manual_refresh_in_progress = False
+        self.floating_window: tk.Toplevel | None = None
+        self.floating_devices_frame: ttk.Frame | None = None
+        self.floating_status_var = tk.StringVar(value="监听中")
         self.result_queue: queue.Queue[tuple[str, str, Any, ResultCallback | None]] = queue.Queue()
 
         self.adb_path_var = tk.StringVar()
@@ -51,6 +54,7 @@ class AdbPilotGui(BaseTk):
         self.status_var = tk.StringVar(value="就绪")
 
         self._configure_style()
+        self.protocol("WM_DELETE_WINDOW", self._close_app)
         self._build_ui()
         if DND_FILES is None:
             self._append_output("提示：安装 tkinterdnd2 后可将文件拖到路径输入框。\n")
@@ -93,6 +97,7 @@ class AdbPilotGui(BaseTk):
         ttk.Button(toolbar, text="检测版本", command=self.show_version).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="重启服务", command=self.restart_server).pack(side=tk.LEFT, padx=4)
         ttk.Button(toolbar, text="刷新设备", command=self.refresh_devices).pack(side=tk.LEFT, padx=4)
+        ttk.Button(toolbar, text="悬浮窗", command=self.enter_floating_mode).pack(side=tk.LEFT, padx=4)
 
     def _build_device_panel(self, parent: ttk.Frame) -> None:
         panel = ttk.LabelFrame(parent, text="设备")
@@ -367,6 +372,111 @@ class AdbPilotGui(BaseTk):
         if path:
             self.local_path_var.set(path)
 
+    def enter_floating_mode(self) -> None:
+        self._show_floating_window()
+        self.withdraw()
+
+    def restore_main_window(self) -> None:
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+        if self.floating_window is not None:
+            self.floating_window.withdraw()
+
+    def _show_floating_window(self) -> None:
+        if self.floating_window is None or not self.floating_window.winfo_exists():
+            self.floating_window = tk.Toplevel(self)
+            self.floating_window.title("AdbPilot 设备")
+            self.floating_window.geometry("360x240+80+80")
+            self.floating_window.minsize(320, 180)
+            self.floating_window.attributes("-topmost", True)
+            self.floating_window.protocol("WM_DELETE_WINDOW", self.restore_main_window)
+
+            root = ttk.Frame(self.floating_window, padding=10)
+            root.pack(fill=tk.BOTH, expand=True)
+
+            header = ttk.Frame(root)
+            header.pack(fill=tk.X)
+            ttk.Label(header, text="设备监听", style="Header.TLabel").pack(side=tk.LEFT)
+            ttk.Label(header, textvariable=self.floating_status_var, style="Status.TLabel").pack(side=tk.RIGHT)
+
+            self.floating_devices_frame = ttk.Frame(root)
+            self.floating_devices_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
+
+            actions = ttk.Frame(root)
+            actions.pack(fill=tk.X)
+            ttk.Button(actions, text="打开主界面", command=self.restore_main_window).pack(side=tk.LEFT)
+            ttk.Button(actions, text="刷新", command=self.refresh_devices).pack(side=tk.RIGHT)
+        else:
+            self.floating_window.deiconify()
+
+        self.floating_window.lift()
+        self._render_floating_devices()
+
+    def _render_floating_devices(self) -> None:
+        if self.floating_window is None or not self.floating_window.winfo_exists():
+            return
+        if self.floating_devices_frame is None:
+            return
+
+        for child in self.floating_devices_frame.winfo_children():
+            child.destroy()
+
+        connected = [
+            (serial, row)
+            for serial, row in self.device_rows.items()
+            if row.get("state") != "已断开"
+        ]
+        disconnected = [
+            (serial, row)
+            for serial, row in self.device_rows.items()
+            if row.get("state") == "已断开"
+        ]
+
+        if connected:
+            self.floating_status_var.set(f"已连接 {len(connected)} 台")
+            for serial, row in sorted(connected):
+                self._add_floating_device_row(serial, row, warning=False)
+        else:
+            self.floating_status_var.set("无在线设备")
+            ttk.Label(
+                self.floating_devices_frame,
+                text="未检测到已连接设备",
+                foreground="#b91c1c",
+            ).pack(anchor=tk.W, pady=4)
+
+        for serial, row in sorted(disconnected):
+            self._add_floating_device_row(serial, row, warning=True)
+
+    def _add_floating_device_row(self, serial: str, row: dict[str, Any], *, warning: bool) -> None:
+        assert self.floating_devices_frame is not None
+        details = dict(row.get("details", {}))
+        name = device_display_name(serial, details)
+        connection_type = device_connection_type(serial)
+        state = str(row.get("state", ""))
+
+        wrapper = ttk.Frame(self.floating_devices_frame)
+        wrapper.pack(fill=tk.X, pady=3)
+
+        title = f"{name}  ·  {connection_type}"
+        if warning:
+            title = f"警示：设备已断开  ·  {name}  ·  {connection_type}"
+        ttk.Label(
+            wrapper,
+            text=title,
+            foreground="#b91c1c" if warning else "#111827",
+        ).pack(anchor=tk.W)
+        ttk.Label(
+            wrapper,
+            text=f"{serial}  ·  {state}",
+            foreground="#6b7280",
+        ).pack(anchor=tk.W)
+
+    def _close_app(self) -> None:
+        if self.floating_window is not None and self.floating_window.winfo_exists():
+            self.floating_window.destroy()
+        self.destroy()
+
     def _register_file_drop(self, widget: tk.Widget, variable: tk.StringVar) -> None:
         if DND_FILES is None or not hasattr(widget, "drop_target_register"):
             return
@@ -577,6 +687,7 @@ class AdbPilotGui(BaseTk):
             self._append_output(f"检测到 {len(devices)} 台在线设备\n")
         if self.selected_serial_var.get() and not self.log_package_var.get().strip():
             self.use_foreground_package(default_only=True)
+        self._render_floating_devices()
 
     def show_device_info(self) -> None:
         serial = self._selected_serial()
@@ -856,6 +967,19 @@ def main() -> int:
     except subprocess.TimeoutExpired as exc:
         messagebox.showerror("AdbPilot", f"命令超时：{exc}")
         return 2
+
+
+def device_connection_type(serial: str) -> str:
+    if ":" in serial:
+        return "无线"
+    return "USB"
+
+
+def device_display_name(serial: str, details: dict[str, str]) -> str:
+    model = details.get("model") or details.get("product") or details.get("device")
+    if model:
+        return model.replace("_", " ")
+    return serial
 
 
 if __name__ == "__main__":
