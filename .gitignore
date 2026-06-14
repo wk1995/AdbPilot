@@ -23,6 +23,7 @@ logs/
 reports/
 screenshots/
 apks/
+.adbpilot/
 
 # OS / editor
 .DS_Store

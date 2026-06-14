@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import subprocess
 import threading
@@ -65,6 +66,7 @@ class AdbPilotGui(BaseTk):
         self.floating_menu: tk.Menu | None = None
         self.floating_drag_start: tuple[int, int] | None = None
         self.floating_status_var = tk.StringVar(value="监听中")
+        self.gui_config = load_gui_config()
         self.locked_serial_var = tk.StringVar()
         self.lock_status_var = tk.StringVar(value="未锁定")
         self.result_queue: queue.Queue[tuple[str, str, Any, ResultCallback | None]] = queue.Queue()
@@ -489,13 +491,14 @@ class AdbPilotGui(BaseTk):
         self.lift()
         self.focus_force()
         if self.floating_window is not None:
+            self._save_floating_window_position()
             self.floating_window.withdraw()
 
     def _show_floating_window(self) -> None:
         if self.floating_window is None or not self.floating_window.winfo_exists():
             self.floating_window = tk.Toplevel(self)
             self.floating_window.title("AdbPilot 设备")
-            self.floating_window.geometry("300x88+80+80")
+            self.floating_window.geometry(self._floating_window_geometry())
             self.floating_window.minsize(260, 76)
             self.floating_window.configure(bg="#ff00ff")
             self.floating_window.attributes("-topmost", True)
@@ -641,7 +644,7 @@ class AdbPilotGui(BaseTk):
             shown = " / ".join(names[:2])
             if len(names) > 2:
                 shown += f" 等 {len(names)} 台"
-            return (f"{len(connected)} 台设备", shown, "全部在线")
+            return (f"{len(connected)} 台设备", shown, device_connection_summary(serial for serial, _ in connected))
 
         if disconnected:
             serial, row = disconnected[0]
@@ -706,11 +709,30 @@ class AdbPilotGui(BaseTk):
         y = self.floating_window.winfo_y() + dy
         self.floating_window.geometry(f"+{x}+{y}")
         self.floating_drag_start = (event.x_root, event.y_root)
+        self._save_floating_window_position()
 
     def _close_app(self) -> None:
         if self.floating_window is not None and self.floating_window.winfo_exists():
+            self._save_floating_window_position()
             self.floating_window.destroy()
         self.destroy()
+
+    def _floating_window_geometry(self) -> str:
+        position = self.gui_config.get("floating_window", {})
+        x = position.get("x")
+        y = position.get("y")
+        if isinstance(x, int) and isinstance(y, int):
+            return f"300x88+{x}+{y}"
+        return "300x88+80+80"
+
+    def _save_floating_window_position(self) -> None:
+        if self.floating_window is None or not self.floating_window.winfo_exists():
+            return
+        self.gui_config["floating_window"] = {
+            "x": int(self.floating_window.winfo_x()),
+            "y": int(self.floating_window.winfo_y()),
+        }
+        save_gui_config(self.gui_config)
 
     def _register_file_drop(self, widget: tk.Widget, variable: tk.StringVar) -> None:
         if DND_FILES is None or not hasattr(widget, "drop_target_register"):
@@ -1248,8 +1270,16 @@ def main() -> int:
 
 def device_connection_type(serial: str) -> str:
     if ":" in serial:
-        return "无线"
+        return "Wi-Fi"
     return "USB"
+
+
+def device_connection_summary(serials: Any) -> str:
+    counts = {"USB": 0, "Wi-Fi": 0}
+    for serial in serials:
+        counts[device_connection_type(str(serial))] += 1
+    parts = [f"{name} {count}" for name, count in counts.items() if count]
+    return " · ".join(parts) if parts else "无设备"
 
 
 def device_display_name(serial: str, details: dict[str, str]) -> str:
@@ -1257,6 +1287,27 @@ def device_display_name(serial: str, details: dict[str, str]) -> str:
     if model:
         return model.replace("_", " ")
     return serial
+
+
+def gui_config_path() -> Path:
+    return Path.home() / ".adbpilot" / "gui.json"
+
+
+def load_gui_config() -> dict[str, Any]:
+    path = gui_config_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_gui_config(config: dict[str, Any]) -> None:
+    path = gui_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
