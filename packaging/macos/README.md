@@ -29,6 +29,8 @@ The output is:
 dist/AdbPilot.app
 ```
 
+The current macOS app version is `0.0.1`. The bundle version is read from `adbpilot.__version__`.
+
 ## ADB
 
 The app first checks user-configured paths and common macOS Android SDK locations:

@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+from adbpilot import __version__
+
 
 ROOT = Path.cwd()
 ENTRY = ROOT / "packaging" / "entrypoints" / "adbpilot_gui.py"
@@ -67,8 +69,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "AdbPilot",
         "CFBundleDisplayName": "AdbPilot",
-        "CFBundleShortVersionString": "0.1.0",
-        "CFBundleVersion": "0.1.0",
+        "CFBundleShortVersionString": __version__,
+        "CFBundleVersion": __version__,
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "11.0",
     },
