@@ -26,6 +26,21 @@ except ImportError:  # Drag and drop is optional; browse buttons still work.
 ResultCallback = Callable[[Any], None]
 BaseTk = TkinterDnD.Tk if TkinterDnD else tk.Tk
 
+COLORS = {
+    "app": "#f3f6fb",
+    "surface": "#ffffff",
+    "surface_alt": "#f8fafc",
+    "border": "#d9e2ec",
+    "text": "#111827",
+    "muted": "#64748b",
+    "accent": "#2563eb",
+    "accent_hover": "#1d4ed8",
+    "accent_soft": "#dbeafe",
+    "success": "#047857",
+    "warning": "#b45309",
+    "danger": "#b91c1c",
+}
+
 
 class AdbPilotGui(BaseTk):
     """Windows-friendly visual interface backed by the existing AdbClient."""
@@ -35,8 +50,9 @@ class AdbPilotGui(BaseTk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"AdbPilot {__version__}")
-        self.geometry("1120x760")
-        self.minsize(980, 680)
+        self.geometry("1220x800")
+        self.minsize(1040, 700)
+        self.configure(bg=COLORS["app"])
 
         self.client: AdbClient | None = None
         self.devices: list[Device] = []
@@ -66,44 +82,92 @@ class AdbPilotGui(BaseTk):
     def _configure_style(self) -> None:
         self.option_add("*Font", ("Microsoft YaHei UI", 10))
         style = ttk.Style(self)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        style.configure("TButton", padding=(10, 5))
-        style.configure("TLabel", padding=(0, 2))
-        style.configure("Header.TLabel", font=("Microsoft YaHei UI", 12, "bold"))
-        style.configure("Status.TLabel", foreground="#4b5563")
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        style.configure("App.TFrame", background=COLORS["app"])
+        style.configure("TFrame", background=COLORS["surface"])
+        style.configure("Surface.TFrame", background=COLORS["surface"], relief=tk.FLAT)
+        style.configure("Sidebar.TFrame", background=COLORS["surface"], relief=tk.FLAT)
+        style.configure("Toolbar.TFrame", background=COLORS["surface"])
+        style.configure("CommandBar.TFrame", background=COLORS["surface"])
+        style.configure("TLabel", background=COLORS["surface"], foreground=COLORS["text"], padding=(0, 2))
+        style.configure("Muted.TLabel", background=COLORS["surface"], foreground=COLORS["muted"])
+        style.configure("AppMuted.TLabel", background=COLORS["app"], foreground=COLORS["muted"])
+        style.configure("Header.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=("Microsoft YaHei UI", 13, "bold"))
+        style.configure("Title.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=("Microsoft YaHei UI", 18, "bold"))
+        style.configure("Section.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=("Microsoft YaHei UI", 11, "bold"))
+        style.configure("Status.TLabel", background=COLORS["surface"], foreground=COLORS["muted"])
+        style.configure("TButton", padding=(12, 6), background=COLORS["surface_alt"], foreground=COLORS["text"], bordercolor=COLORS["border"])
+        style.map("TButton", background=[("active", "#eef2f7"), ("pressed", "#e5e7eb")])
+        style.configure("Primary.TButton", padding=(14, 6), background=COLORS["accent"], foreground="#ffffff", bordercolor=COLORS["accent"])
+        style.map("Primary.TButton", background=[("active", COLORS["accent_hover"]), ("pressed", COLORS["accent_hover"])])
+        style.configure("Quiet.TButton", padding=(10, 5), background=COLORS["surface"], foreground=COLORS["text"], bordercolor=COLORS["border"])
+        style.configure("Danger.TButton", padding=(10, 5), background="#fef2f2", foreground=COLORS["danger"], bordercolor="#fecaca")
+        style.configure("TEntry", fieldbackground="#ffffff", bordercolor=COLORS["border"], lightcolor=COLORS["border"], darkcolor=COLORS["border"], padding=(6, 5))
+        style.configure("TCombobox", fieldbackground="#ffffff", bordercolor=COLORS["border"], padding=(6, 5))
+        style.configure("TLabelframe", background=COLORS["surface"], bordercolor=COLORS["border"], relief=tk.SOLID)
+        style.configure("TLabelframe.Label", background=COLORS["surface"], foreground=COLORS["text"], font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("TNotebook", background=COLORS["surface"], borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(14, 8), background=COLORS["surface_alt"], foreground=COLORS["muted"])
+        style.map("TNotebook.Tab", background=[("selected", COLORS["surface"])], foreground=[("selected", COLORS["accent"])])
+        style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground=COLORS["text"], rowheight=26, bordercolor=COLORS["border"], borderwidth=1)
+        style.configure("Treeview.Heading", background=COLORS["surface_alt"], foreground=COLORS["muted"], font=("Microsoft YaHei UI", 9, "bold"), padding=(4, 6))
+        style.map("Treeview", background=[("selected", COLORS["accent_soft"])], foreground=[("selected", COLORS["text"])])
+        style.configure("TCheckbutton", background=COLORS["surface"], foreground=COLORS["text"])
 
     def _build_ui(self) -> None:
-        root = ttk.Frame(self, padding=12)
+        root = ttk.Frame(self, padding=(16, 14, 16, 12), style="App.TFrame")
         root.pack(fill=tk.BOTH, expand=True)
 
         self._build_toolbar(root)
-        self._build_device_panel(root)
-        self._build_tabs(root)
+
+        body = ttk.Frame(root, style="App.TFrame")
+        body.pack(fill=tk.BOTH, expand=True)
+        self._build_device_panel(body)
+        self._build_tabs(body)
         self._build_output(root)
 
     def _build_toolbar(self, parent: ttk.Frame) -> None:
-        toolbar = ttk.Frame(parent)
-        toolbar.pack(fill=tk.X, pady=(0, 10))
+        toolbar = ttk.Frame(parent, padding=(16, 14), style="Toolbar.TFrame")
+        toolbar.pack(fill=tk.X, pady=(0, 12))
 
-        ttk.Label(toolbar, text="ADB 路径").pack(side=tk.LEFT)
-        adb_entry = ttk.Entry(toolbar, textvariable=self.adb_path_var, width=48)
+        title_area = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        title_area.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(title_area, text="AdbPilot", style="Title.TLabel").pack(anchor=tk.W)
+        ttk.Label(title_area, text="Android 设备调试、日志和文件操作工作台", style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 0))
+
+        commands = ttk.Frame(toolbar, style="CommandBar.TFrame")
+        commands.pack(side=tk.RIGHT, anchor=tk.NE)
+
+        ttk.Button(commands, text="检测版本", command=self.show_version, style="Quiet.TButton").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(commands, text="重启服务", command=self.restart_server, style="Quiet.TButton").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(commands, text="刷新设备", command=self.refresh_devices, style="Primary.TButton").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(commands, text="悬浮窗", command=self.enter_floating_mode, style="Quiet.TButton").pack(side=tk.LEFT)
+
+        path_row = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        path_row.pack(fill=tk.X, pady=(12, 0))
+
+        ttk.Label(path_row, text="ADB 路径", style="Muted.TLabel").pack(side=tk.LEFT)
+        adb_entry = ttk.Entry(path_row, textvariable=self.adb_path_var, width=48)
         adb_entry.pack(side=tk.LEFT, padx=(8, 4), fill=tk.X, expand=True)
         self._register_file_drop(adb_entry, self.adb_path_var)
-        ttk.Button(toolbar, text="浏览", command=self._browse_adb).pack(side=tk.LEFT, padx=4)
+        ttk.Button(path_row, text="浏览", command=self._browse_adb, style="Quiet.TButton").pack(side=tk.LEFT, padx=4)
 
-        ttk.Label(toolbar, text="超时").pack(side=tk.LEFT, padx=(12, 4))
-        ttk.Entry(toolbar, textvariable=self.timeout_var, width=6).pack(side=tk.LEFT)
-        ttk.Label(toolbar, text="秒").pack(side=tk.LEFT, padx=(2, 12))
-
-        ttk.Button(toolbar, text="检测版本", command=self.show_version).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="重启服务", command=self.restart_server).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="刷新设备", command=self.refresh_devices).pack(side=tk.LEFT, padx=4)
-        ttk.Button(toolbar, text="悬浮窗", command=self.enter_floating_mode).pack(side=tk.LEFT, padx=4)
+        ttk.Label(path_row, text="超时", style="Muted.TLabel").pack(side=tk.LEFT, padx=(12, 4))
+        ttk.Entry(path_row, textvariable=self.timeout_var, width=6).pack(side=tk.LEFT)
+        ttk.Label(path_row, text="秒", style="Muted.TLabel").pack(side=tk.LEFT, padx=(2, 0))
 
     def _build_device_panel(self, parent: ttk.Frame) -> None:
-        panel = ttk.LabelFrame(parent, text="设备")
-        panel.pack(fill=tk.X, pady=(0, 10))
+        panel = ttk.Frame(parent, padding=(14, 14), style="Sidebar.TFrame")
+        panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
+        panel.pack_propagate(False)
+        panel.configure(width=360)
+
+        header = ttk.Frame(panel, style="Sidebar.TFrame")
+        header.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(header, text="设备中心", style="Header.TLabel").pack(side=tk.LEFT)
+        ttk.Label(header, text="自动监听", style="Status.TLabel").pack(side=tk.RIGHT)
 
         columns = ("serial", "state", "product", "model", "device", "transport")
         self.device_table = ttk.Treeview(panel, columns=columns, show="headings", height=5)
@@ -116,38 +180,42 @@ class AdbPilotGui(BaseTk):
             "transport": "Transport",
         }
         widths = {
-            "serial": 230,
-            "state": 110,
-            "product": 160,
-            "model": 190,
-            "device": 150,
-            "transport": 90,
+            "serial": 132,
+            "state": 74,
+            "product": 0,
+            "model": 118,
+            "device": 0,
+            "transport": 52,
         }
         for column in columns:
             self.device_table.heading(column, text=headings[column])
             self.device_table.column(column, width=widths[column], anchor=tk.W)
-        self.device_table.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8, pady=8)
+            if widths[column] == 0:
+                self.device_table.column(column, minwidth=0, stretch=False)
+        self.device_table.pack(fill=tk.X, pady=(0, 12))
         self.device_table.bind("<<TreeviewSelect>>", self._on_device_selected)
 
-        side = ttk.Frame(panel)
-        side.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8), pady=8)
-        ttk.Label(side, text="当前设备").pack(anchor=tk.W)
-        ttk.Entry(side, textvariable=self.selected_serial_var, width=28).pack(fill=tk.X, pady=(4, 8))
-        ttk.Button(side, text="设备详情", command=self.show_device_info).pack(fill=tk.X, pady=2)
-        ttk.Button(side, text="锁定当前设备", command=self.lock_current_device).pack(fill=tk.X, pady=(8, 2))
-        ttk.Button(side, text="解除锁定", command=self.unlock_device).pack(fill=tk.X, pady=2)
-        ttk.Label(side, textvariable=self.lock_status_var, style="Status.TLabel").pack(anchor=tk.W, pady=(4, 0))
+        side = ttk.Frame(panel, style="Sidebar.TFrame")
+        side.pack(fill=tk.X)
+        ttk.Label(side, text="当前设备", style="Section.TLabel").pack(anchor=tk.W)
+        ttk.Entry(side, textvariable=self.selected_serial_var, width=28).pack(fill=tk.X, pady=(6, 8))
+        ttk.Button(side, text="设备详情", command=self.show_device_info, style="Quiet.TButton").pack(fill=tk.X, pady=2)
+        ttk.Button(side, text="锁定当前设备", command=self.lock_current_device, style="Primary.TButton").pack(fill=tk.X, pady=(8, 2))
+        ttk.Button(side, text="解除锁定", command=self.unlock_device, style="Quiet.TButton").pack(fill=tk.X, pady=2)
+        ttk.Label(side, textvariable=self.lock_status_var, style="Status.TLabel", wraplength=320).pack(anchor=tk.W, pady=(6, 0))
 
         wireless = ttk.LabelFrame(side, text="无线调试")
-        wireless.pack(fill=tk.X, pady=(8, 0))
+        wireless.pack(fill=tk.X, pady=(14, 0))
         self.connect_addr_var = tk.StringVar(value="192.168.1.10:5555")
         ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(6, 4))
-        ttk.Button(wireless, text="连接", command=self.connect_device).pack(fill=tk.X, padx=6, pady=2)
-        ttk.Button(wireless, text="断开", command=self.disconnect_device).pack(fill=tk.X, padx=6, pady=(2, 6))
+        wireless_actions = ttk.Frame(wireless, style="Surface.TFrame")
+        wireless_actions.pack(fill=tk.X, padx=6, pady=(2, 6))
+        ttk.Button(wireless_actions, text="连接", command=self.connect_device, style="Primary.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ttk.Button(wireless_actions, text="断开", command=self.disconnect_device, style="Quiet.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
 
     def _build_tabs(self, parent: ttk.Frame) -> None:
         self.tabs = ttk.Notebook(parent)
-        self.tabs.pack(fill=tk.BOTH, expand=True)
+        self.tabs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self._build_apps_tab(self.tabs)
         self._build_file_tab(self.tabs)
@@ -156,7 +224,7 @@ class AdbPilotGui(BaseTk):
         self._build_log_tab(self.tabs)
 
     def _build_apps_tab(self, tabs: ttk.Notebook) -> None:
-        tab = ttk.Frame(tabs, padding=10)
+        tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
         tabs.add(tab, text="应用")
 
         ttk.Label(tab, text="APK 文件").grid(row=0, column=0, sticky=tk.W)
@@ -202,6 +270,7 @@ class AdbPilotGui(BaseTk):
         ttk.Button(list_bar, text="列出应用", command=self.list_apps).pack(side=tk.LEFT, padx=8)
 
         self.package_list = tk.Listbox(tab, height=12)
+        self._style_listbox(self.package_list)
         self.package_list.grid(row=5, column=0, columnspan=3, sticky=tk.NSEW)
         self.package_list.bind("<<ListboxSelect>>", self._on_package_selected)
 
@@ -209,7 +278,7 @@ class AdbPilotGui(BaseTk):
         tab.rowconfigure(5, weight=1)
 
     def _build_file_tab(self, tabs: ttk.Notebook) -> None:
-        tab = ttk.Frame(tabs, padding=10)
+        tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
         tabs.add(tab, text="文件")
 
         ttk.Label(tab, text="本机路径").grid(row=0, column=0, sticky=tk.W)
@@ -247,7 +316,7 @@ class AdbPilotGui(BaseTk):
         tab.columnconfigure(1, weight=1)
 
     def _build_screen_tab(self, tabs: ttk.Notebook) -> None:
-        tab = ttk.Frame(tabs, padding=10)
+        tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
         tabs.add(tab, text="屏幕与输入")
 
         ttk.Label(tab, text="录屏保存").grid(row=0, column=0, sticky=tk.W)
@@ -289,7 +358,7 @@ class AdbPilotGui(BaseTk):
         tab.columnconfigure(1, weight=1)
 
     def _build_shell_tab(self, tabs: ttk.Notebook) -> None:
-        tab = ttk.Frame(tabs, padding=10)
+        tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
         tabs.add(tab, text="Shell")
 
         ttk.Label(tab, text="adb shell").pack(anchor=tk.W)
@@ -300,10 +369,11 @@ class AdbPilotGui(BaseTk):
         ttk.Button(command_bar, text="执行", command=self.run_shell).pack(side=tk.LEFT, padx=(8, 0))
 
         self.shell_output = tk.Text(tab, height=14, wrap=tk.WORD)
+        self._style_text(self.shell_output)
         self.shell_output.pack(fill=tk.BOTH, expand=True)
 
     def _build_log_tab(self, tabs: ttk.Notebook) -> None:
-        tab = ttk.Frame(tabs, padding=10)
+        tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
         tabs.add(tab, text="日志")
 
         filters = ttk.Frame(tab)
@@ -348,18 +418,20 @@ class AdbPilotGui(BaseTk):
         self.process_table.bind("<<TreeviewSelect>>", self._on_process_selected)
 
         self.log_output = tk.Text(tab, height=14, wrap=tk.NONE)
+        self._style_text(self.log_output)
         self.log_output.pack(fill=tk.BOTH, expand=True)
 
     def _build_output(self, parent: ttk.Frame) -> None:
-        footer = ttk.Frame(parent)
-        footer.pack(fill=tk.BOTH, pady=(10, 0))
+        footer = ttk.Frame(parent, padding=(14, 10), style="Surface.TFrame")
+        footer.pack(fill=tk.BOTH, pady=(12, 0))
 
-        header = ttk.Frame(footer)
+        header = ttk.Frame(footer, style="Surface.TFrame")
         header.pack(fill=tk.X)
         ttk.Label(header, text="输出", style="Header.TLabel").pack(side=tk.LEFT)
         ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").pack(side=tk.RIGHT)
 
-        self.output = tk.Text(footer, height=7, wrap=tk.WORD)
+        self.output = tk.Text(footer, height=6, wrap=tk.WORD)
+        self._style_text(self.output)
         self.output.pack(fill=tk.BOTH, expand=False, pady=(4, 0))
 
     def _browse_adb(self) -> None:
@@ -376,6 +448,34 @@ class AdbPilotGui(BaseTk):
         path = filedialog.askopenfilename(title="选择本机文件")
         if path:
             self.local_path_var.set(path)
+
+    def _style_text(self, widget: tk.Text) -> None:
+        widget.configure(
+            background="#0f172a",
+            foreground="#e5e7eb",
+            insertbackground="#e5e7eb",
+            selectbackground=COLORS["accent"],
+            selectforeground="#ffffff",
+            relief=tk.FLAT,
+            borderwidth=0,
+            padx=10,
+            pady=8,
+            font=("Consolas", 10),
+        )
+
+    def _style_listbox(self, widget: tk.Listbox) -> None:
+        widget.configure(
+            background="#ffffff",
+            foreground=COLORS["text"],
+            selectbackground=COLORS["accent_soft"],
+            selectforeground=COLORS["text"],
+            activestyle="none",
+            relief=tk.FLAT,
+            borderwidth=1,
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["accent"],
+        )
 
     def enter_floating_mode(self) -> None:
         self._show_floating_window()
@@ -394,24 +494,25 @@ class AdbPilotGui(BaseTk):
             self.floating_window.title("AdbPilot 设备")
             self.floating_window.geometry("360x240+80+80")
             self.floating_window.minsize(320, 180)
+            self.floating_window.configure(bg=COLORS["app"])
             self.floating_window.attributes("-topmost", True)
             self.floating_window.protocol("WM_DELETE_WINDOW", self.restore_main_window)
 
-            root = ttk.Frame(self.floating_window, padding=10)
+            root = ttk.Frame(self.floating_window, padding=12, style="Surface.TFrame")
             root.pack(fill=tk.BOTH, expand=True)
 
-            header = ttk.Frame(root)
+            header = ttk.Frame(root, style="Surface.TFrame")
             header.pack(fill=tk.X)
             ttk.Label(header, text="设备监听", style="Header.TLabel").pack(side=tk.LEFT)
             ttk.Label(header, textvariable=self.floating_status_var, style="Status.TLabel").pack(side=tk.RIGHT)
 
-            self.floating_devices_frame = ttk.Frame(root)
+            self.floating_devices_frame = ttk.Frame(root, style="Surface.TFrame")
             self.floating_devices_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
 
-            actions = ttk.Frame(root)
+            actions = ttk.Frame(root, style="Surface.TFrame")
             actions.pack(fill=tk.X)
-            ttk.Button(actions, text="打开主界面", command=self.restore_main_window).pack(side=tk.LEFT)
-            ttk.Button(actions, text="刷新", command=self.refresh_devices).pack(side=tk.RIGHT)
+            ttk.Button(actions, text="打开主界面", command=self.restore_main_window, style="Primary.TButton").pack(side=tk.LEFT)
+            ttk.Button(actions, text="刷新", command=self.refresh_devices, style="Quiet.TButton").pack(side=tk.RIGHT)
         else:
             self.floating_window.deiconify()
 
@@ -471,7 +572,7 @@ class AdbPilotGui(BaseTk):
         connection_type = device_connection_type(serial)
         state = str(row.get("state", ""))
 
-        wrapper = ttk.Frame(self.floating_devices_frame)
+        wrapper = ttk.Frame(self.floating_devices_frame, style="Surface.TFrame")
         wrapper.pack(fill=tk.X, pady=3)
 
         title = f"{name}  ·  {connection_type}"
