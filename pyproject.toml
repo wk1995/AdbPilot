@@ -36,5 +36,10 @@ adbpilot-ai = "adbpilot.ai_cli:main"
 [project.gui-scripts]
 adbpilot-gui = "adbpilot.gui:main"
 
+[project.optional-dependencies]
+build = [
+  "pyinstaller>=6.0"
+]
+
 [tool.setuptools.packages.find]
 include = ["adbpilot*"]

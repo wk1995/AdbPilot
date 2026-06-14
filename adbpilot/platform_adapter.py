@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import sys
 from pathlib import Path
 
 from .errors import AdbNotFoundError
@@ -46,6 +47,7 @@ class PlatformAdapter:
             str(Path.cwd() / "tools" / "platform-tools" / self.executable_name),
             str(Path.cwd() / "platform-tools" / self.executable_name),
         ]
+        values.extend(str(path) for path in self._packaged_adb_candidates())
 
         if self.system == "darwin":
             values.extend(
@@ -75,3 +77,42 @@ class PlatformAdapter:
             )
 
         return [Path(value).expanduser() for value in values if value]
+
+    def _packaged_adb_candidates(self) -> list[Path]:
+        roots: list[Path] = []
+        frozen_root = getattr(sys, "_MEIPASS", None)
+        if frozen_root:
+            roots.append(Path(frozen_root))
+        if getattr(sys, "frozen", False):
+            executable = Path(sys.executable).resolve()
+            roots.extend(
+                [
+                    executable.parent,
+                    executable.parent.parent / "Resources",
+                    executable.parent.parent / "Frameworks",
+                ]
+            )
+
+        candidates: list[Path] = []
+        arch = platform.machine().lower()
+        arch_names = [arch]
+        if arch in {"arm64", "aarch64"}:
+            arch_names.extend(["darwin-arm64", "macos-arm64", "arm64"])
+        elif arch in {"x86_64", "amd64"}:
+            arch_names.extend(["darwin-x86_64", "macos-x86_64", "x86_64", "intel"])
+
+        for root in roots:
+            candidates.extend(
+                [
+                    root / "platform-tools" / self.executable_name,
+                    root / "tools" / "platform-tools" / self.executable_name,
+                ]
+            )
+            for arch_name in dict.fromkeys(arch_names):
+                candidates.extend(
+                    [
+                        root / "platform-tools" / arch_name / self.executable_name,
+                        root / "tools" / "platform-tools" / arch_name / self.executable_name,
+                    ]
+                )
+        return candidates
