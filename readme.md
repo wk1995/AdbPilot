@@ -54,6 +54,16 @@ python -m pip install -e .
 | Windows | 0.0.1 |
 | macOS | 0.0.1 |
 
+## Release automation
+
+Merging into `master` runs the `Build Release` workflow. It bumps the patch
+version, commits synchronized version files, creates the matching `vX.Y.Z` tag,
+builds Windows and macOS desktop packages, and publishes a GitHub release.
+
+After packaging succeeds, `Publish Desktop Artifact` copies the release archives
+and README into `wk1995/wk1995.github.io` under
+`apps/packages/desktop/adbpilot/vX.Y.Z`.
+
 ## Windows 可视化界面
 
 Windows 环境可以直接运行项目根目录下的启动脚本：
