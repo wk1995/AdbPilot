@@ -46,6 +46,8 @@ class AdbPilotGui(BaseTk):
         self.floating_window: tk.Toplevel | None = None
         self.floating_devices_frame: ttk.Frame | None = None
         self.floating_status_var = tk.StringVar(value="监听中")
+        self.locked_serial_var = tk.StringVar()
+        self.lock_status_var = tk.StringVar(value="未锁定")
         self.result_queue: queue.Queue[tuple[str, str, Any, ResultCallback | None]] = queue.Queue()
 
         self.adb_path_var = tk.StringVar()
@@ -132,6 +134,9 @@ class AdbPilotGui(BaseTk):
         ttk.Label(side, text="当前设备").pack(anchor=tk.W)
         ttk.Entry(side, textvariable=self.selected_serial_var, width=28).pack(fill=tk.X, pady=(4, 8))
         ttk.Button(side, text="设备详情", command=self.show_device_info).pack(fill=tk.X, pady=2)
+        ttk.Button(side, text="锁定当前设备", command=self.lock_current_device).pack(fill=tk.X, pady=(8, 2))
+        ttk.Button(side, text="解除锁定", command=self.unlock_device).pack(fill=tk.X, pady=2)
+        ttk.Label(side, textvariable=self.lock_status_var, style="Status.TLabel").pack(anchor=tk.W, pady=(4, 0))
 
         wireless = ttk.LabelFrame(side, text="无线调试")
         wireless.pack(fill=tk.X, pady=(8, 0))
@@ -432,16 +437,27 @@ class AdbPilotGui(BaseTk):
             for serial, row in self.device_rows.items()
             if row.get("state") == "已断开"
         ]
+        locked_serial = self.locked_serial_var.get().strip()
+        if locked_serial:
+            locked_row = self.device_rows.get(locked_serial)
+            connected = []
+            disconnected = []
+            if locked_row is None:
+                disconnected = [(locked_serial, {"state": "已断开", "details": {}})]
+            elif locked_row.get("state") == "已断开":
+                disconnected = [(locked_serial, locked_row)]
+            else:
+                connected = [(locked_serial, locked_row)]
 
         if connected:
-            self.floating_status_var.set(f"已连接 {len(connected)} 台")
+            self.floating_status_var.set(f"已锁定 1 台" if locked_serial else f"已连接 {len(connected)} 台")
             for serial, row in sorted(connected):
                 self._add_floating_device_row(serial, row, warning=False)
         else:
-            self.floating_status_var.set("无在线设备")
+            self.floating_status_var.set("锁定设备已断开" if locked_serial else "无在线设备")
             ttk.Label(
                 self.floating_devices_frame,
-                text="未检测到已连接设备",
+                text="警示：锁定设备已断开" if locked_serial else "未检测到已连接设备",
                 foreground="#b91c1c",
             ).pack(anchor=tk.W, pady=4)
 
@@ -500,7 +516,43 @@ class AdbPilotGui(BaseTk):
         return self.client
 
     def _selected_serial(self) -> str | None:
+        locked = self.locked_serial_var.get().strip()
+        if locked:
+            return locked
         return self.selected_serial_var.get().strip() or None
+
+    def lock_current_device(self) -> None:
+        selection = self.device_table.selection()
+        serial = self.selected_serial_var.get().strip()
+        if selection:
+            values = self.device_table.item(selection[0], "values")
+            if values:
+                serial = str(values[0]).strip()
+        if not serial:
+            messagebox.showwarning("AdbPilot", "请先选择一个设备再锁定。")
+            return
+        self.locked_serial_var.set(serial)
+        self.selected_serial_var.set(serial)
+        self._update_lock_status()
+        self._append_output(f"已锁定设备：{serial}\n")
+        self._render_floating_devices()
+
+    def unlock_device(self) -> None:
+        locked = self.locked_serial_var.get().strip()
+        if locked:
+            self._append_output(f"已解除设备锁定：{locked}\n")
+        self.locked_serial_var.set("")
+        self._update_lock_status()
+        self._render_floating_devices()
+
+    def _update_lock_status(self) -> None:
+        locked = self.locked_serial_var.get().strip()
+        if not locked:
+            self.lock_status_var.set("未锁定")
+            return
+        row = self.device_rows.get(locked, {})
+        state = row.get("state", "未知")
+        self.lock_status_var.set(f"已锁定：{locked}（{state}）")
 
     def _run_async(self, label: str, func: Callable[[], Any], on_success: ResultCallback | None = None) -> None:
         self.status_var.set(f"执行中：{label}")
@@ -553,7 +605,8 @@ class AdbPilotGui(BaseTk):
                 serial = str(values[0])
                 state = str(values[1])
                 if state == "已断开":
-                    self.selected_serial_var.set("")
+                    if self.locked_serial_var.get().strip() != serial:
+                        self.selected_serial_var.set("")
                     return
                 self.selected_serial_var.set(serial)
 
@@ -667,7 +720,10 @@ class AdbPilotGui(BaseTk):
         self.device_rows = next_rows
 
         selected = self.selected_serial_var.get().strip()
-        if selected and selected not in current_serials:
+        locked = self.locked_serial_var.get().strip()
+        if locked:
+            self.selected_serial_var.set(locked)
+        elif selected and selected not in current_serials:
             self.selected_serial_var.set("")
             self.log_package_var.set("")
             self._append_output(f"设备已断开：{selected}\n")
@@ -685,7 +741,9 @@ class AdbPilotGui(BaseTk):
 
         if noisy or connected or disconnected:
             self._append_output(f"检测到 {len(devices)} 台在线设备\n")
-        if self.selected_serial_var.get() and not self.log_package_var.get().strip():
+        self._update_lock_status()
+        selected_for_logs = self.selected_serial_var.get().strip()
+        if selected_for_logs in current_serials and not self.log_package_var.get().strip():
             self.use_foreground_package(default_only=True)
         self._render_floating_devices()
 
