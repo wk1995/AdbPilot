@@ -30,6 +30,8 @@ BaseTk = TkinterDnD.Tk if TkinterDnD else tk.Tk
 class AdbPilotGui(BaseTk):
     """Windows-friendly visual interface backed by the existing AdbClient."""
 
+    DEVICE_POLL_INTERVAL_MS = 3000
+
     def __init__(self) -> None:
         super().__init__()
         self.title(f"AdbPilot {__version__}")
@@ -38,6 +40,9 @@ class AdbPilotGui(BaseTk):
 
         self.client: AdbClient | None = None
         self.devices: list[Device] = []
+        self.device_rows: dict[str, dict[str, Any]] = {}
+        self.device_poll_running = False
+        self.manual_refresh_in_progress = False
         self.result_queue: queue.Queue[tuple[str, str, Any, ResultCallback | None]] = queue.Queue()
 
         self.adb_path_var = tk.StringVar()
@@ -50,6 +55,7 @@ class AdbPilotGui(BaseTk):
         if DND_FILES is None:
             self._append_output("提示：安装 tkinterdnd2 后可将文件拖到路径输入框。\n")
         self.after(100, self._process_results)
+        self.after(500, self._poll_devices)
 
     def _configure_style(self) -> None:
         self.option_add("*Font", ("Microsoft YaHei UI", 10))
@@ -407,15 +413,19 @@ class AdbPilotGui(BaseTk):
                 break
 
             if kind == "ok":
-                self.status_var.set(f"完成：{label}")
+                if label != "设备监听":
+                    self.status_var.set(f"完成：{label}")
                 if callback:
                     callback(payload)
                 elif payload is not None:
                     self._append_output(f"{payload}\n")
             else:
-                self.status_var.set(f"失败：{label}")
-                self._append_output(f"错误：{payload}\n")
-                if isinstance(payload, AdbPilotError):
+                if callback:
+                    callback(payload)
+                if label != "设备监听":
+                    self.status_var.set(f"失败：{label}")
+                    self._append_output(f"错误：{payload}\n")
+                if label != "设备监听" and isinstance(payload, AdbPilotError):
                     messagebox.showerror("AdbPilot", str(payload))
 
         self.after(100, self._process_results)
@@ -430,7 +440,12 @@ class AdbPilotGui(BaseTk):
         if selection:
             values = self.device_table.item(selection[0], "values")
             if values:
-                self.selected_serial_var.set(str(values[0]))
+                serial = str(values[0])
+                state = str(values[1])
+                if state == "已断开":
+                    self.selected_serial_var.set("")
+                    return
+                self.selected_serial_var.set(serial)
 
     def _on_package_selected(self, event: tk.Event[Any]) -> None:
         selection = self.package_list.curselection()
@@ -455,14 +470,56 @@ class AdbPilotGui(BaseTk):
         self._run_async("重启 ADB 服务", lambda: self._get_client().restart_server() or "adb server 已重启")
 
     def refresh_devices(self) -> None:
-        self._run_async("刷新设备", lambda: self._get_client().devices(), self._render_devices)
+        self.manual_refresh_in_progress = True
 
-    def _render_devices(self, devices: list[Device]) -> None:
+        def done(devices: list[Device]) -> None:
+            self.manual_refresh_in_progress = False
+            self._render_devices(devices, mark_disconnected=True, noisy=True)
+
+        self._run_async("刷新设备", lambda: self._get_client().devices(), done)
+
+    def _poll_devices(self) -> None:
+        if self.device_poll_running:
+            self.after(self.DEVICE_POLL_INTERVAL_MS, self._poll_devices)
+            return
+
+        self.device_poll_running = True
+
+        def worker() -> None:
+            try:
+                devices = self._get_client().devices()
+                self.result_queue.put(("ok", "设备监听", devices, self._render_polled_devices))
+            except Exception as exc:  # noqa: BLE001 - listener should surface failures but keep retrying.
+                self.result_queue.put(("err", "设备监听", exc, self._finish_device_poll))
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(self.DEVICE_POLL_INTERVAL_MS, self._poll_devices)
+
+    def _finish_device_poll(self, payload: Any = None) -> None:
+        self.device_poll_running = False
+
+    def _render_polled_devices(self, devices: list[Device]) -> None:
+        self.device_poll_running = False
+        self._render_devices(devices, mark_disconnected=True, noisy=False)
+
+    def _render_devices(self, devices: list[Device], *, mark_disconnected: bool = True, noisy: bool = True) -> None:
+        previous_connected = {
+            serial
+            for serial, row in self.device_rows.items()
+            if row.get("state") != "已断开"
+        }
         self.devices = devices
+        current_serials = {device.serial for device in devices}
         for item in self.device_table.get_children():
             self.device_table.delete(item)
+        next_rows: dict[str, dict[str, Any]] = {}
+
         for device in devices:
             details = device.details
+            next_rows[device.serial] = {
+                "state": device.state,
+                "details": dict(details),
+            }
             self.device_table.insert(
                 "",
                 tk.END,
@@ -475,9 +532,49 @@ class AdbPilotGui(BaseTk):
                     details.get("transport_id", ""),
                 ),
             )
-        if devices and not self.selected_serial_var.get():
-            self.selected_serial_var.set(devices[0].serial)
-        self._append_output(f"检测到 {len(devices)} 台设备\n")
+
+        if mark_disconnected:
+            for serial, row in self.device_rows.items():
+                if serial in current_serials:
+                    continue
+                details = dict(row.get("details", {}))
+                next_rows[serial] = {"state": "已断开", "details": details}
+                self.device_table.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        serial,
+                        "已断开",
+                        details.get("product", ""),
+                        details.get("model", ""),
+                        details.get("device", ""),
+                        details.get("transport_id", ""),
+                    ),
+                    tags=("disconnected",),
+                )
+
+        self.device_table.tag_configure("disconnected", foreground="#9ca3af")
+        self.device_rows = next_rows
+
+        selected = self.selected_serial_var.get().strip()
+        if selected and selected not in current_serials:
+            self.selected_serial_var.set("")
+            self.log_package_var.set("")
+            self._append_output(f"设备已断开：{selected}\n")
+        elif not selected and devices:
+            ready = next((device for device in devices if device.is_ready), devices[0])
+            self.selected_serial_var.set(ready.serial)
+
+        disconnected = sorted(previous_connected - current_serials)
+        connected = sorted(current_serials - previous_connected)
+        for serial in connected:
+            if previous_connected:
+                self._append_output(f"设备已连接：{serial}\n")
+        for serial in disconnected:
+            self._append_output(f"设备已断开：{serial}\n")
+
+        if noisy or connected or disconnected:
+            self._append_output(f"检测到 {len(devices)} 台在线设备\n")
         if self.selected_serial_var.get() and not self.log_package_var.get().strip():
             self.use_foreground_package(default_only=True)
 
