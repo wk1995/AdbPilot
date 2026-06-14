@@ -56,9 +56,17 @@ jobs:
           echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build-windows:
-    name: Build Windows
+    name: Build Window ${{ matrix.systemos }}-bit
     runs-on: windows-latest
     needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python-architecture: x86
+            systemos: "32"
+          - python-architecture: x64
+            systemos: "64"
     steps:
       - name: Checkout release source
         uses: actions/checkout@v4
@@ -69,6 +77,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          architecture: ${{ matrix.python-architecture }}
 
       - name: Build Windows app
         shell: pwsh
@@ -78,16 +87,17 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ needs.version.outputs.version }}
-        run: Compress-Archive -Path dist\AdbPilot -DestinationPath "AdbPilot-windows-$env:VERSION.zip" -Force
+          SYSTEMOS: ${{ matrix.systemos }}
+        run: Compress-Archive -Path dist\AdbPilot -DestinationPath "AdbPilot-window-$env:VERSION-$env:SYSTEMOS.zip" -Force
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: adbpilot-windows-${{ needs.version.outputs.version }}
-          path: AdbPilot-windows-${{ needs.version.outputs.version }}.zip
+          name: adbpilot-window-${{ needs.version.outputs.version }}-${{ matrix.systemos }}
+          path: AdbPilot-window-${{ needs.version.outputs.version }}-${{ matrix.systemos }}.zip
 
   build-macos:
-    name: Build macOS ${{ matrix.arch }}
+    name: Build Mac ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     needs: version
     strategy:
@@ -121,13 +131,13 @@ jobs:
         env:
           VERSION: ${{ needs.version.outputs.version }}
           ARCH: ${{ matrix.arch }}
-        run: ditto -c -k --sequesterRsrc --keepParent dist/AdbPilot.app "AdbPilot-macos-$VERSION-$ARCH.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent dist/AdbPilot.app "AdbPilot-mac-$VERSION-$ARCH.zip"
 
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: adbpilot-macos-${{ needs.version.outputs.version }}-${{ matrix.arch }}
-          path: AdbPilot-macos-${{ needs.version.outputs.version }}-${{ matrix.arch }}.zip
+          name: adbpilot-mac-${{ needs.version.outputs.version }}-${{ matrix.arch }}
+          path: AdbPilot-mac-${{ needs.version.outputs.version }}-${{ matrix.arch }}.zip
 
   release:
     name: Publish GitHub release

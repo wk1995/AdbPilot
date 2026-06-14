@@ -61,8 +61,11 @@ version, commits synchronized version files, creates the matching `vX.Y.Z` tag,
 builds Windows and macOS desktop packages, and publishes a GitHub release.
 
 After packaging succeeds, `Publish Desktop Artifact` copies the release archives
-and README into `wk1995/wk1995.github.io` under
-`apps/packages/desktop/adbpilot/vX.Y.Z`.
+and README into `wk1995/wk1995.github.io` under these platform paths:
+`apps/packages/window/adbPilot/X.Y.Z/32`,
+`apps/packages/window/adbPilot/X.Y.Z/64`,
+`apps/packages/mac/adbPilot/X.Y.Z/x86_64`, and
+`apps/packages/mac/adbPilot/X.Y.Z/arm64`.
 
 ## Windows 可视化界面
 
