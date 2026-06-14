@@ -61,6 +61,9 @@ class AdbPilotGui(BaseTk):
         self.manual_refresh_in_progress = False
         self.floating_window: tk.Toplevel | None = None
         self.floating_devices_frame: ttk.Frame | None = None
+        self.floating_canvas: tk.Canvas | None = None
+        self.floating_menu: tk.Menu | None = None
+        self.floating_drag_start: tuple[int, int] | None = None
         self.floating_status_var = tk.StringVar(value="监听中")
         self.locked_serial_var = tk.StringVar()
         self.lock_status_var = tk.StringVar(value="未锁定")
@@ -492,27 +495,32 @@ class AdbPilotGui(BaseTk):
         if self.floating_window is None or not self.floating_window.winfo_exists():
             self.floating_window = tk.Toplevel(self)
             self.floating_window.title("AdbPilot 设备")
-            self.floating_window.geometry("360x240+80+80")
-            self.floating_window.minsize(320, 180)
-            self.floating_window.configure(bg=COLORS["app"])
+            self.floating_window.geometry("300x88+80+80")
+            self.floating_window.minsize(260, 76)
+            self.floating_window.configure(bg="#ff00ff")
             self.floating_window.attributes("-topmost", True)
+            self.floating_window.overrideredirect(True)
+            try:
+                self.floating_window.attributes("-transparentcolor", "#ff00ff")
+            except tk.TclError:
+                pass
             self.floating_window.protocol("WM_DELETE_WINDOW", self.restore_main_window)
 
-            root = ttk.Frame(self.floating_window, padding=12, style="Surface.TFrame")
-            root.pack(fill=tk.BOTH, expand=True)
-
-            header = ttk.Frame(root, style="Surface.TFrame")
-            header.pack(fill=tk.X)
-            ttk.Label(header, text="设备监听", style="Header.TLabel").pack(side=tk.LEFT)
-            ttk.Label(header, textvariable=self.floating_status_var, style="Status.TLabel").pack(side=tk.RIGHT)
-
-            self.floating_devices_frame = ttk.Frame(root, style="Surface.TFrame")
-            self.floating_devices_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 8))
-
-            actions = ttk.Frame(root, style="Surface.TFrame")
-            actions.pack(fill=tk.X)
-            ttk.Button(actions, text="打开主界面", command=self.restore_main_window, style="Primary.TButton").pack(side=tk.LEFT)
-            ttk.Button(actions, text="刷新", command=self.refresh_devices, style="Quiet.TButton").pack(side=tk.RIGHT)
+            self.floating_canvas = tk.Canvas(
+                self.floating_window,
+                width=300,
+                height=88,
+                bg="#ff00ff",
+                highlightthickness=0,
+                bd=0,
+            )
+            self.floating_canvas.pack(fill=tk.BOTH, expand=True)
+            self.floating_canvas.bind("<ButtonPress-1>", self._start_floating_drag)
+            self.floating_canvas.bind("<B1-Motion>", self._drag_floating_window)
+            self.floating_canvas.bind("<Button-3>", self._show_floating_menu)
+            self.floating_canvas.bind("<Double-Button-1>", lambda event: self.restore_main_window())
+            self.floating_canvas.bind("<Configure>", lambda event: self._render_floating_devices())
+            self._build_floating_menu()
         else:
             self.floating_window.deiconify()
 
@@ -522,11 +530,8 @@ class AdbPilotGui(BaseTk):
     def _render_floating_devices(self) -> None:
         if self.floating_window is None or not self.floating_window.winfo_exists():
             return
-        if self.floating_devices_frame is None:
+        if self.floating_canvas is None:
             return
-
-        for child in self.floating_devices_frame.winfo_children():
-            child.destroy()
 
         connected = [
             (serial, row)
@@ -550,44 +555,157 @@ class AdbPilotGui(BaseTk):
             else:
                 connected = [(locked_serial, locked_row)]
 
+        self._draw_floating_sphere(connected, disconnected, locked_serial=locked_serial)
+
         if connected:
             self.floating_status_var.set(f"已锁定 1 台" if locked_serial else f"已连接 {len(connected)} 台")
-            for serial, row in sorted(connected):
-                self._add_floating_device_row(serial, row, warning=False)
         else:
             self.floating_status_var.set("锁定设备已断开" if locked_serial else "无在线设备")
-            ttk.Label(
-                self.floating_devices_frame,
-                text="警示：锁定设备已断开" if locked_serial else "未检测到已连接设备",
-                foreground="#b91c1c",
-            ).pack(anchor=tk.W, pady=4)
 
-        for serial, row in sorted(disconnected):
-            self._add_floating_device_row(serial, row, warning=True)
+    def _draw_floating_sphere(
+        self,
+        connected: list[tuple[str, dict[str, Any]]],
+        disconnected: list[tuple[str, dict[str, Any]]],
+        *,
+        locked_serial: str,
+    ) -> None:
+        assert self.floating_canvas is not None
+        canvas = self.floating_canvas
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 260)
+        height = max(canvas.winfo_height(), 76)
+        warning = bool(disconnected) and not connected
 
-    def _add_floating_device_row(self, serial: str, row: dict[str, Any], *, warning: bool) -> None:
-        assert self.floating_devices_frame is not None
-        details = dict(row.get("details", {}))
-        name = device_display_name(serial, details)
-        connection_type = device_connection_type(serial)
-        state = str(row.get("state", ""))
-
-        wrapper = ttk.Frame(self.floating_devices_frame, style="Surface.TFrame")
-        wrapper.pack(fill=tk.X, pady=3)
-
-        title = f"{name}  ·  {connection_type}"
         if warning:
-            title = f"警示：设备已断开  ·  {name}  ·  {connection_type}"
-        ttk.Label(
-            wrapper,
-            text=title,
-            foreground="#b91c1c" if warning else "#111827",
-        ).pack(anchor=tk.W)
-        ttk.Label(
-            wrapper,
-            text=f"{serial}  ·  {state}",
-            foreground="#6b7280",
-        ).pack(anchor=tk.W)
+            bg, border, dot, title_color, subtitle_color = "#fef2f2", "#fca5a5", "#ef4444", "#991b1b", "#7f1d1d"
+        elif connected:
+            bg, border, dot, title_color, subtitle_color = "#f8fafc", "#bfdbfe", "#22c55e", "#111827", "#475569"
+        else:
+            bg, border, dot, title_color, subtitle_color = "#f8fafc", "#cbd5e1", "#f59e0b", "#334155", "#64748b"
+
+        margin = 4
+        radius = 18
+        canvas.create_rectangle(margin + 3, margin + 4, width - margin + 3, height - margin + 4, fill="#0f172a", outline="", stipple="gray50")
+        self._rounded_rect(canvas, margin, margin, width - margin, height - margin, radius, fill=bg, outline=border, width=1)
+        canvas.create_oval(18, height // 2 - 8, 34, height // 2 + 8, fill=dot, outline="")
+
+        title, subtitle, footer = self._floating_text_lines(connected, disconnected, locked_serial=locked_serial)
+        canvas.create_text(46, 24, text=title, fill=title_color, font=("Microsoft YaHei UI", 10, "bold"), anchor=tk.W, width=width - 88)
+        canvas.create_text(46, 47, text=subtitle, fill=subtitle_color, font=("Microsoft YaHei UI", 8), anchor=tk.W, width=width - 88)
+        canvas.create_text(width - 14, 24, text=footer, fill=subtitle_color, font=("Microsoft YaHei UI", 8), anchor=tk.E)
+        canvas.create_text(width - 14, height - 18, text="右键菜单", fill="#94a3b8", font=("Microsoft YaHei UI", 8), anchor=tk.E)
+
+    def _rounded_rect(
+        self,
+        canvas: tk.Canvas,
+        x1: int,
+        y1: int,
+        x2: int,
+        y2: int,
+        radius: int,
+        **kwargs: Any,
+    ) -> None:
+        points = [
+            x1 + radius, y1,
+            x2 - radius, y1,
+            x2, y1,
+            x2, y1 + radius,
+            x2, y2 - radius,
+            x2, y2,
+            x2 - radius, y2,
+            x1 + radius, y2,
+            x1, y2,
+            x1, y2 - radius,
+            x1, y1 + radius,
+            x1, y1,
+        ]
+        canvas.create_polygon(points, smooth=True, **kwargs)
+
+    def _floating_text_lines(
+        self,
+        connected: list[tuple[str, dict[str, Any]]],
+        disconnected: list[tuple[str, dict[str, Any]]],
+        *,
+        locked_serial: str,
+    ) -> tuple[str, str, str]:
+        if connected:
+            if locked_serial:
+                serial, row = connected[0]
+                details = dict(row.get("details", {}))
+                return (
+                    device_display_name(serial, details),
+                    f"{device_connection_type(serial)} · 已锁定",
+                    "设备在线",
+                )
+            names = [device_display_name(serial, dict(row.get("details", {}))) for serial, row in connected]
+            shown = " / ".join(names[:2])
+            if len(names) > 2:
+                shown += f" 等 {len(names)} 台"
+            return (f"{len(connected)} 台设备", shown, "全部在线")
+
+        if disconnected:
+            serial, row = disconnected[0]
+            details = dict(row.get("details", {}))
+            return (
+                "警示：已断开",
+                device_display_name(serial, details),
+                f"{device_connection_type(serial)} · 保持锁定" if locked_serial else device_connection_type(serial),
+            )
+
+        return ("无设备", "等待连接", "右键刷新")
+
+    def _build_floating_menu(self) -> None:
+        self.floating_menu = tk.Menu(
+            self.floating_window,
+            tearoff=False,
+            bg="#ffffff",
+            fg=COLORS["text"],
+            activebackground=COLORS["accent_soft"],
+            activeforeground=COLORS["text"],
+            borderwidth=1,
+            relief=tk.SOLID,
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.floating_menu.add_command(label="打开主界面", command=self.restore_main_window)
+        self.floating_menu.add_separator()
+        self.floating_menu.add_command(label="刷新设备", command=self.refresh_devices)
+        self.floating_menu.add_command(label="设备详情", command=self.show_device_info)
+        self.floating_menu.add_command(label="锁定当前设备", command=self.lock_current_device)
+        self.floating_menu.add_command(label="解除锁定", command=self.unlock_device)
+        self.floating_menu.add_separator()
+        self.floating_menu.add_command(label="获取前台包名", command=self.use_foreground_package)
+        self.floating_menu.add_command(label="刷新运行进程", command=self.refresh_processes)
+        self.floating_menu.add_separator()
+        self.floating_menu.add_command(label="读取日志", command=self.dump_logcat)
+        self.floating_menu.add_command(label="保存日志", command=self.save_logcat)
+        self.floating_menu.add_command(label="清空日志", command=self.clear_logcat)
+        self.floating_menu.add_separator()
+        self.floating_menu.add_command(label="截屏", command=self.screencap)
+        self.floating_menu.add_command(label="录屏", command=self.screenrecord)
+        self.floating_menu.add_separator()
+        self.floating_menu.add_command(label="退出程序", command=self._close_app)
+
+    def _show_floating_menu(self, event: tk.Event[Any]) -> None:
+        if self.floating_menu is None:
+            return
+        try:
+            self.floating_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.floating_menu.grab_release()
+
+    def _start_floating_drag(self, event: tk.Event[Any]) -> None:
+        self.floating_drag_start = (event.x_root, event.y_root)
+
+    def _drag_floating_window(self, event: tk.Event[Any]) -> None:
+        if self.floating_window is None or self.floating_drag_start is None:
+            return
+        start_x, start_y = self.floating_drag_start
+        dx = event.x_root - start_x
+        dy = event.y_root - start_y
+        x = self.floating_window.winfo_x() + dx
+        y = self.floating_window.winfo_y() + dy
+        self.floating_window.geometry(f"+{x}+{y}")
+        self.floating_drag_start = (event.x_root, event.y_root)
 
     def _close_app(self) -> None:
         if self.floating_window is not None and self.floating_window.winfo_exists():
