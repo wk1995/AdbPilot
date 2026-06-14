@@ -33,4 +33,4 @@ elseif (Test-Path "tools\platform-tools") {
 }
 
 python -m PyInstaller @args
-Write-Host "Built dist\AdbPilot for Windows, version 0.0.2"
+Write-Host "Built dist\AdbPilot for Windows, version 0.0.3"

@@ -51,8 +51,8 @@ python -m pip install -e .
 
 | 平台 | 版本 |
 | --- | --- |
-| Windows | 0.0.2 |
-| macOS | 0.0.2 |
+| Windows | 0.0.3 |
+| macOS | 0.0.3 |
 
 ## Release automation
 
