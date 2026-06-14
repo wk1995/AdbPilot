@@ -1,0 +1,77 @@
+"""Platform-specific adb discovery."""
+
+from __future__ import annotations
+
+import os
+import platform
+import shutil
+from pathlib import Path
+
+from .errors import AdbNotFoundError
+
+
+class PlatformAdapter:
+    """Finds an adb executable without making assumptions about the host OS."""
+
+    def __init__(self, env: dict[str, str] | None = None) -> None:
+        self.env = env or os.environ
+        self.system = platform.system().lower()
+
+    @property
+    def executable_name(self) -> str:
+        return "adb.exe" if self.system == "windows" else "adb"
+
+    def resolve_adb(self, configured_path: str | None = None) -> Path:
+        candidates = list(self._candidate_paths(configured_path))
+        for candidate in candidates:
+            if candidate and candidate.exists() and candidate.is_file():
+                return candidate
+
+        path_hit = shutil.which(self.executable_name) or shutil.which("adb")
+        if path_hit:
+            return Path(path_hit)
+
+        searched = "\n".join(f"- {path}" for path in candidates)
+        raise AdbNotFoundError(
+            "未找到 adb。请安装 Android platform-tools，或通过 --adb-path / ADBPILOT_ADB 指定路径。\n"
+            f"已检查路径：\n{searched}"
+        )
+
+    def _candidate_paths(self, configured_path: str | None) -> list[Path]:
+        values: list[str | None] = [
+            configured_path,
+            self.env.get("ADBPILOT_ADB"),
+            self.env.get("ANDROID_HOME") and str(Path(self.env["ANDROID_HOME"]) / "platform-tools" / self.executable_name),
+            self.env.get("ANDROID_SDK_ROOT") and str(Path(self.env["ANDROID_SDK_ROOT"]) / "platform-tools" / self.executable_name),
+            str(Path.cwd() / "tools" / "platform-tools" / self.executable_name),
+            str(Path.cwd() / "platform-tools" / self.executable_name),
+        ]
+
+        if self.system == "darwin":
+            values.extend(
+                [
+                    "/opt/homebrew/bin/adb",
+                    "/usr/local/bin/adb",
+                    str(Path.home() / "Library" / "Android" / "sdk" / "platform-tools" / "adb"),
+                ]
+            )
+        elif self.system == "linux":
+            values.extend(
+                [
+                    "/usr/bin/adb",
+                    "/usr/local/bin/adb",
+                    str(Path.home() / "Android" / "Sdk" / "platform-tools" / "adb"),
+                ]
+            )
+        elif self.system == "windows":
+            local_app_data = self.env.get("LOCALAPPDATA")
+            program_files = self.env.get("ProgramFiles")
+            values.extend(
+                [
+                    local_app_data
+                    and str(Path(local_app_data) / "Android" / "Sdk" / "platform-tools" / "adb.exe"),
+                    program_files and str(Path(program_files) / "Android" / "platform-tools" / "adb.exe"),
+                ]
+            )
+
+        return [Path(value).expanduser() for value in values if value]
