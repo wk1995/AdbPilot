@@ -14,13 +14,20 @@ from typing import Any, Callable
 from . import __version__
 from .client import AdbClient
 from .errors import AdbPilotError
-from .models import Device
+from .models import Device, RunningProcess
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:  # Drag and drop is optional; browse buttons still work.
+    DND_FILES = None
+    TkinterDnD = None
 
 
 ResultCallback = Callable[[Any], None]
+BaseTk = TkinterDnD.Tk if TkinterDnD else tk.Tk
 
 
-class AdbPilotGui(tk.Tk):
+class AdbPilotGui(BaseTk):
     """Windows-friendly visual interface backed by the existing AdbClient."""
 
     def __init__(self) -> None:
@@ -40,6 +47,8 @@ class AdbPilotGui(tk.Tk):
 
         self._configure_style()
         self._build_ui()
+        if DND_FILES is None:
+            self._append_output("提示：安装 tkinterdnd2 后可将文件拖到路径输入框。\n")
         self.after(100, self._process_results)
 
     def _configure_style(self) -> None:
@@ -68,6 +77,7 @@ class AdbPilotGui(tk.Tk):
         ttk.Label(toolbar, text="ADB 路径").pack(side=tk.LEFT)
         adb_entry = ttk.Entry(toolbar, textvariable=self.adb_path_var, width=48)
         adb_entry.pack(side=tk.LEFT, padx=(8, 4), fill=tk.X, expand=True)
+        self._register_file_drop(adb_entry, self.adb_path_var)
         ttk.Button(toolbar, text="浏览", command=self._browse_adb).pack(side=tk.LEFT, padx=4)
 
         ttk.Label(toolbar, text="超时").pack(side=tk.LEFT, padx=(12, 4))
@@ -135,7 +145,9 @@ class AdbPilotGui(tk.Tk):
 
         ttk.Label(tab, text="APK 文件").grid(row=0, column=0, sticky=tk.W)
         self.apk_path_var = tk.StringVar()
-        ttk.Entry(tab, textvariable=self.apk_path_var).grid(row=0, column=1, sticky=tk.EW, padx=8)
+        apk_entry = ttk.Entry(tab, textvariable=self.apk_path_var)
+        apk_entry.grid(row=0, column=1, sticky=tk.EW, padx=8)
+        self._register_file_drop(apk_entry, self.apk_path_var)
         ttk.Button(tab, text="选择 APK", command=self._browse_apk).grid(row=0, column=2, sticky=tk.EW)
 
         install_options = ttk.Frame(tab)
@@ -186,7 +198,9 @@ class AdbPilotGui(tk.Tk):
 
         ttk.Label(tab, text="本机路径").grid(row=0, column=0, sticky=tk.W)
         self.local_path_var = tk.StringVar()
-        ttk.Entry(tab, textvariable=self.local_path_var).grid(row=0, column=1, sticky=tk.EW, padx=8)
+        local_entry = ttk.Entry(tab, textvariable=self.local_path_var)
+        local_entry.grid(row=0, column=1, sticky=tk.EW, padx=8)
+        self._register_file_drop(local_entry, self.local_path_var)
         ttk.Button(tab, text="选择文件", command=self._browse_local_file).grid(row=0, column=2, sticky=tk.EW)
 
         ttk.Label(tab, text="设备路径").grid(row=1, column=0, sticky=tk.W, pady=8)
@@ -202,12 +216,16 @@ class AdbPilotGui(tk.Tk):
 
         ttk.Label(tab, text="截图保存").grid(row=4, column=0, sticky=tk.W)
         self.screencap_path_var = tk.StringVar(value=str(Path.cwd() / "screenshots" / "screen.png"))
-        ttk.Entry(tab, textvariable=self.screencap_path_var).grid(row=4, column=1, sticky=tk.EW, padx=8)
+        screencap_entry = ttk.Entry(tab, textvariable=self.screencap_path_var)
+        screencap_entry.grid(row=4, column=1, sticky=tk.EW, padx=8)
+        self._register_file_drop(screencap_entry, self.screencap_path_var)
         ttk.Button(tab, text="截屏", command=self.screencap).grid(row=4, column=2, sticky=tk.EW)
 
         ttk.Label(tab, text="Bugreport").grid(row=5, column=0, sticky=tk.W, pady=8)
         self.bugreport_path_var = tk.StringVar(value=str(Path.cwd() / "reports" / "bugreport.zip"))
-        ttk.Entry(tab, textvariable=self.bugreport_path_var).grid(row=5, column=1, sticky=tk.EW, padx=8, pady=8)
+        bugreport_entry = ttk.Entry(tab, textvariable=self.bugreport_path_var)
+        bugreport_entry.grid(row=5, column=1, sticky=tk.EW, padx=8, pady=8)
+        self._register_file_drop(bugreport_entry, self.bugreport_path_var)
         ttk.Button(tab, text="导出", command=self.bugreport).grid(row=5, column=2, sticky=tk.EW)
 
         tab.columnconfigure(1, weight=1)
@@ -218,7 +236,9 @@ class AdbPilotGui(tk.Tk):
 
         ttk.Label(tab, text="录屏保存").grid(row=0, column=0, sticky=tk.W)
         self.record_path_var = tk.StringVar(value=str(Path.cwd() / "screenshots" / "record.mp4"))
-        ttk.Entry(tab, textvariable=self.record_path_var).grid(row=0, column=1, sticky=tk.EW, padx=8)
+        record_entry = ttk.Entry(tab, textvariable=self.record_path_var)
+        record_entry.grid(row=0, column=1, sticky=tk.EW, padx=8)
+        self._register_file_drop(record_entry, self.record_path_var)
         ttk.Label(tab, text="秒数").grid(row=0, column=2, sticky=tk.E)
         self.record_seconds_var = tk.StringVar(value="10")
         ttk.Entry(tab, textvariable=self.record_seconds_var, width=6).grid(row=0, column=3, sticky=tk.W, padx=4)
@@ -277,6 +297,7 @@ class AdbPilotGui(tk.Tk):
         self.log_level_var = tk.StringVar(value="")
         ttk.Label(filters, text="包名").pack(side=tk.LEFT)
         ttk.Entry(filters, textvariable=self.log_package_var, width=28).pack(side=tk.LEFT, padx=6)
+        ttk.Button(filters, text="当前前台", command=self.use_foreground_package).pack(side=tk.LEFT)
         ttk.Label(filters, text="Tag").pack(side=tk.LEFT, padx=(10, 0))
         ttk.Entry(filters, textvariable=self.log_tag_var, width=20).pack(side=tk.LEFT, padx=6)
         ttk.Label(filters, text="级别").pack(side=tk.LEFT, padx=(10, 0))
@@ -288,8 +309,27 @@ class AdbPilotGui(tk.Tk):
         save_bar.pack(fill=tk.X, pady=8)
         self.log_output_path_var = tk.StringVar(value=str(Path.cwd() / "logs" / "logcat.txt"))
         ttk.Label(save_bar, text="保存路径").pack(side=tk.LEFT)
-        ttk.Entry(save_bar, textvariable=self.log_output_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        log_entry = ttk.Entry(save_bar, textvariable=self.log_output_path_var)
+        log_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=6)
+        self._register_file_drop(log_entry, self.log_output_path_var)
         ttk.Button(save_bar, text="保存日志", command=self.save_logcat).pack(side=tk.LEFT)
+
+        process_frame = ttk.LabelFrame(tab, text="运行进程")
+        process_frame.pack(fill=tk.X, pady=(0, 8))
+        process_toolbar = ttk.Frame(process_frame)
+        process_toolbar.pack(fill=tk.X, padx=8, pady=(6, 4))
+        ttk.Label(process_toolbar, text="点击包名可切换日志过滤包名").pack(side=tk.LEFT)
+        ttk.Button(process_toolbar, text="刷新进程", command=self.refresh_processes).pack(side=tk.RIGHT)
+
+        process_columns = ("pid", "user", "package", "name")
+        self.process_table = ttk.Treeview(process_frame, columns=process_columns, show="headings", height=6)
+        process_headings = {"pid": "PID", "user": "用户", "package": "包名", "name": "进程名"}
+        process_widths = {"pid": 80, "user": 110, "package": 300, "name": 430}
+        for column in process_columns:
+            self.process_table.heading(column, text=process_headings[column])
+            self.process_table.column(column, width=process_widths[column], anchor=tk.W)
+        self.process_table.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.process_table.bind("<<TreeviewSelect>>", self._on_process_selected)
 
         self.log_output = tk.Text(tab, height=14, wrap=tk.NONE)
         self.log_output.pack(fill=tk.BOTH, expand=True)
@@ -320,6 +360,20 @@ class AdbPilotGui(tk.Tk):
         path = filedialog.askopenfilename(title="选择本机文件")
         if path:
             self.local_path_var.set(path)
+
+    def _register_file_drop(self, widget: tk.Widget, variable: tk.StringVar) -> None:
+        if DND_FILES is None or not hasattr(widget, "drop_target_register"):
+            return
+        widget.drop_target_register(DND_FILES)
+        widget.dnd_bind("<<Drop>>", lambda event: self._handle_file_drop(event, variable))
+
+    def _handle_file_drop(self, event: tk.Event[Any], variable: tk.StringVar) -> None:
+        paths = self.tk.splitlist(str(event.data))
+        if not paths:
+            return
+        path = str(paths[0]).removeprefix("file:///")
+        variable.set(path)
+        self._append_output(f"已拖入文件：{path}\n")
 
     def _get_client(self) -> AdbClient:
         timeout = self._int_value(self.timeout_var, default=30)
@@ -381,7 +435,18 @@ class AdbPilotGui(tk.Tk):
     def _on_package_selected(self, event: tk.Event[Any]) -> None:
         selection = self.package_list.curselection()
         if selection:
-            self.package_var.set(self.package_list.get(selection[0]))
+            self._set_package_context(self.package_list.get(selection[0]))
+
+    def _on_process_selected(self, event: tk.Event[Any]) -> None:
+        selection = self.process_table.selection()
+        if not selection:
+            return
+        values = self.process_table.item(selection[0], "values")
+        if not values:
+            return
+        package = str(values[2] or values[3]).strip()
+        if package:
+            self._set_package_context(package)
 
     def show_version(self) -> None:
         self._run_async("检测 ADB 版本", lambda: self._get_client().version())
@@ -413,6 +478,8 @@ class AdbPilotGui(tk.Tk):
         if devices and not self.selected_serial_var.get():
             self.selected_serial_var.set(devices[0].serial)
         self._append_output(f"检测到 {len(devices)} 台设备\n")
+        if self.selected_serial_var.get() and not self.log_package_var.get().strip():
+            self.use_foreground_package(default_only=True)
 
     def show_device_info(self) -> None:
         serial = self._selected_serial()
@@ -428,6 +495,41 @@ class AdbPilotGui(tk.Tk):
     def disconnect_device(self) -> None:
         address = self.connect_addr_var.get().strip() or None
         self._run_async("断开无线设备", lambda: self._get_client().disconnect(address))
+
+    def use_foreground_package(self, default_only: bool = False) -> None:
+        if default_only and self.log_package_var.get().strip():
+            return
+
+        def apply(package: str) -> None:
+            if default_only and self.log_package_var.get().strip():
+                return
+            self._set_package_context(package)
+            self._append_output(f"当前前台应用：{package}\n")
+
+        self._run_async(
+            "获取前台应用",
+            lambda: self._get_client().foreground_package(self._selected_serial()),
+            apply,
+        )
+
+    def refresh_processes(self) -> None:
+        self._run_async(
+            "刷新运行进程",
+            lambda: self._get_client().running_processes(self._selected_serial()),
+            self._render_processes,
+        )
+
+    def _render_processes(self, processes: list[RunningProcess]) -> None:
+        for item in self.process_table.get_children():
+            self.process_table.delete(item)
+        sorted_processes = sorted(processes, key=lambda process: (not bool(process.package), process.name))
+        for process in sorted_processes:
+            self.process_table.insert(
+                "",
+                tk.END,
+                values=(process.pid, process.user, process.package, process.name),
+            )
+        self._append_output(f"列出 {len(processes)} 个运行进程\n")
 
     def install_apk(self) -> None:
         apk = self.apk_path_var.get().strip()
@@ -623,6 +725,11 @@ class AdbPilotGui(tk.Tk):
             mapping = mapping.__dict__
         lines = [f"{key}: {value}" for key, value in dict(mapping).items()]
         self._append_output("\n".join(lines) + "\n")
+
+    def _set_package_context(self, package: str) -> None:
+        self.package_var.set(package)
+        self.log_package_var.set(package)
+        self._append_output(f"已切换包名：{package}\n")
 
     def _required_package(self) -> str | None:
         package = self.package_var.get().strip()

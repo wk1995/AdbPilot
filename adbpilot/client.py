@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import subprocess
 import time
+import re
 from pathlib import Path
 from typing import BinaryIO, Iterable, TextIO
 
 from .errors import AdbCommandError, DeviceSelectionError, suggestion_for_device_state
-from .models import CommandResult, Device, DeviceInfo
+from .models import CommandResult, Device, DeviceInfo, RunningProcess
 from .platform_adapter import PlatformAdapter
 
 
@@ -231,6 +232,28 @@ class AdbClient:
         output = self.run(["shell", "dumpsys", "package", package], serial=target, timeout=30).stdout
         return parse_package_dump(output)
 
+    def foreground_package(self, serial: str | None = None) -> str:
+        target = self.require_serial(serial)
+        window_output = self.run(["shell", "dumpsys", "window"], serial=target, timeout=20, check=False).stdout
+        package = parse_foreground_package(window_output)
+        if package:
+            return package
+
+        activity_output = self.run(["shell", "dumpsys", "activity", "activities"], serial=target, timeout=20, check=False).stdout
+        package = parse_foreground_package(activity_output)
+        if package:
+            return package
+
+        raise DeviceSelectionError("未能识别当前前台应用包名。请确认设备已解锁且有应用处于前台。")
+
+    def running_processes(self, serial: str | None = None) -> list[RunningProcess]:
+        target = self.require_serial(serial)
+        result = self.run(["shell", "ps", "-A"], serial=target, check=False, timeout=20)
+        output = result.stdout
+        if result.returncode != 0 or not output.strip():
+            output = self.run(["shell", "ps"], serial=target, timeout=20).stdout
+        return parse_processes(output)
+
     def export_apk(self, package: str, output_dir: Path, serial: str | None = None) -> list[Path]:
         target = self.require_serial(serial)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -417,3 +440,56 @@ def parse_package_dump(output: str) -> dict[str, str]:
         elif line.startswith("dataDir="):
             fields["dataDir"] = line.split("=", 1)[1]
     return fields
+
+
+def parse_foreground_package(output: str) -> str:
+    patterns = [
+        r"mCurrentFocus=.*?\s([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/",
+        r"mFocusedApp=.*?\s([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/",
+        r"topResumedActivity=.*?\s([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/",
+        r"mResumedActivity=.*?\s([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/",
+        r"ACTIVITY\s+([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, output)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def parse_processes(output: str) -> list[RunningProcess]:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return []
+
+    header = lines[0].split()
+    if "PID" not in header:
+        return []
+
+    pid_index = header.index("PID")
+    user_index = header.index("USER") if "USER" in header else 0
+    name_index = find_process_name_index(header)
+    processes: list[RunningProcess] = []
+
+    for line in lines[1:]:
+        parts = line.split(None, name_index)
+        if len(parts) <= max(pid_index, user_index, name_index):
+            continue
+        pid = parts[pid_index]
+        user = parts[user_index]
+        name = parts[name_index]
+        package = name if looks_like_package_name(name) else ""
+        processes.append(RunningProcess(pid=pid, user=user, name=name, package=package))
+
+    return processes
+
+
+def find_process_name_index(header: list[str]) -> int:
+    for candidate in ("NAME", "ARGS", "CMD", "COMMAND"):
+        if candidate in header:
+            return header.index(candidate)
+    return len(header) - 1
+
+
+def looks_like_package_name(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+(?:[:][A-Za-z0-9_.-]+)?$", value))

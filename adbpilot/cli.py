@@ -12,7 +12,7 @@ from typing import Any
 from . import __version__
 from .client import AdbClient
 from .errors import AdbPilotError, suggestion_for_device_state
-from .models import Device, DeviceInfo
+from .models import Device, DeviceInfo, RunningProcess
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -108,6 +108,17 @@ def build_parser() -> argparse.ArgumentParser:
     app_info.add_argument("package")
     app_info.add_argument("--json", action="store_true", help="以 JSON 输出")
     app_info.set_defaults(handler=handle_app_info)
+
+    foreground = subparsers.add_parser("foreground", help="显示当前前台应用包名")
+    add_serial_arg(foreground)
+    foreground.add_argument("--json", action="store_true", help="以 JSON 输出")
+    foreground.set_defaults(handler=handle_foreground)
+
+    processes = subparsers.add_parser("processes", help="列出设备运行进程")
+    add_serial_arg(processes)
+    processes.add_argument("--json", action="store_true", help="以 JSON 输出")
+    processes.add_argument("--packages-only", action="store_true", help="只显示看起来像应用包名的进程")
+    processes.set_defaults(handler=handle_processes)
 
     export_apk = subparsers.add_parser("export-apk", help="导出应用 APK")
     add_serial_arg(export_apk)
@@ -299,6 +310,28 @@ def handle_app_info(client: AdbClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_foreground(client: AdbClient, args: argparse.Namespace) -> int:
+    package = client.foreground_package(args.serial)
+    if args.json:
+        print(json.dumps({"package": package}, ensure_ascii=False, indent=2))
+    else:
+        print(package)
+    return 0
+
+
+def handle_processes(client: AdbClient, args: argparse.Namespace) -> int:
+    processes = client.running_processes(args.serial)
+    if args.packages_only:
+        processes = [process for process in processes if process.package]
+    if args.json:
+        print(json.dumps([process_to_dict(process) for process in processes], ensure_ascii=False, indent=2))
+    else:
+        for process in processes:
+            package = f"\t{process.package}" if process.package else ""
+            print(f"{process.pid}\t{process.user}\t{process.name}{package}")
+    return 0
+
+
 def handle_export_apk(client: AdbClient, args: argparse.Namespace) -> int:
     outputs = client.export_apk(args.package, args.output_dir, args.serial)
     for output in outputs:
@@ -388,6 +421,15 @@ def device_info_to_dict(info: DeviceInfo) -> dict[str, str]:
         "abi": info.abi,
         "battery_level": info.battery_level,
         "battery_status": info.battery_status,
+    }
+
+
+def process_to_dict(process: RunningProcess) -> dict[str, str]:
+    return {
+        "pid": process.pid,
+        "user": process.user,
+        "name": process.name,
+        "package": process.package,
     }
 
 

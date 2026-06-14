@@ -8,6 +8,9 @@ version = "0.1.0"
 description = "Cross-platform ADB device management CLI"
 readme = "readme.md"
 requires-python = ">=3.9"
+dependencies = [
+  "tkinterdnd2>=0.4.3; platform_system == 'Windows'"
+]
 authors = [
   { name = "AdbPilot Contributors" }
 ]
@@ -28,6 +31,7 @@ classifiers = [
 
 [project.scripts]
 adbpilot = "adbpilot.cli:main"
+adbpilot-ai = "adbpilot.ai_cli:main"
 
 [project.gui-scripts]
 adbpilot-gui = "adbpilot.gui:main"

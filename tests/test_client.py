@@ -1,6 +1,6 @@
 import unittest
 
-from adbpilot.client import parse_devices, parse_key_value_lines, parse_package_dump
+from adbpilot.client import parse_devices, parse_foreground_package, parse_key_value_lines, parse_package_dump, parse_processes
 
 
 class ClientParsingTests(unittest.TestCase):
@@ -52,6 +52,36 @@ status: 2
         self.assertEqual(info["versionName"], "1.2.3")
         self.assertEqual(info["firstCodePath"], "/data/app/~~hash/com.example.app/base.apk")
         self.assertEqual(info["dataDir"], "/data/user/0/com.example.app")
+
+    def test_parse_foreground_package_from_window_focus(self):
+        output = """
+  mCurrentFocus=Window{5fd1a1 u0 com.example.app/.MainActivity}
+  mFocusedApp=ActivityRecord{abc u0 com.other/.Other t10}
+"""
+
+        self.assertEqual(parse_foreground_package(output), "com.example.app")
+
+    def test_parse_foreground_package_from_top_resumed_activity(self):
+        output = """
+    topResumedActivity=ActivityRecord{123 u0 com.demo/.HomeActivity t88}
+"""
+
+        self.assertEqual(parse_foreground_package(output), "com.demo")
+
+    def test_parse_processes_android_ps(self):
+        output = """USER           PID  PPID     VSZ    RSS WCHAN            ADDR S NAME
+u0_a123       1234   567 123456  78900 0                   0 S com.example.app
+system         222     1  12345   3000 0                   0 S surfaceflinger
+u0_a123       1235   567 123456  78900 0                   0 S com.example.app:remote
+"""
+
+        processes = parse_processes(output)
+
+        self.assertEqual(len(processes), 3)
+        self.assertEqual(processes[0].pid, "1234")
+        self.assertEqual(processes[0].package, "com.example.app")
+        self.assertEqual(processes[1].package, "")
+        self.assertEqual(processes[2].package, "com.example.app:remote")
 
 
 if __name__ == "__main__":

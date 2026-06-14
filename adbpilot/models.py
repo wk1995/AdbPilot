@@ -37,3 +37,11 @@ class DeviceInfo:
     abi: str = ""
     battery_level: str = ""
     battery_status: str = ""
+
+
+@dataclass(frozen=True)
+class RunningProcess:
+    pid: str
+    user: str
+    name: str
+    package: str = ""
