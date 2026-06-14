@@ -36,6 +36,7 @@ jobs:
       - name: Commit and tag release
         id: commit
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
           set -euo pipefail
@@ -53,7 +54,12 @@ jobs:
           git tag "$tag"
           git push origin HEAD:master
           git push origin "$tag"
-          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          release_sha="$(git rev-parse HEAD)"
+          gh release create "$tag" \
+            --target "$release_sha" \
+            --title "AdbPilot $tag" \
+            --notes "Automated desktop release for AdbPilot $VERSION."
+          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
 
   build-windows:
     name: Build Window ${{ matrix.systemos }}-bit
@@ -89,6 +95,24 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
           SYSTEMOS: ${{ matrix.systemos }}
         run: Compress-Archive -Path dist\AdbPilot -DestinationPath "AdbPilot-window-$env:VERSION-$env:SYSTEMOS.zip" -Force
+
+      - name: Upload Windows release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          SYSTEMOS: ${{ matrix.systemos }}
+        run: |
+          $asset = "AdbPilot-window-$env:VERSION-$env:SYSTEMOS.zip"
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            gh release upload $env:TAG $asset --clobber
+            if ($LASTEXITCODE -eq 0) {
+              exit 0
+            }
+            Start-Sleep -Seconds 10
+          }
+          exit $LASTEXITCODE
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -133,65 +157,25 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: ditto -c -k --sequesterRsrc --keepParent dist/AdbPilot.app "AdbPilot-mac-$VERSION-$ARCH.zip"
 
+      - name: Upload macOS release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          asset="AdbPilot-mac-$VERSION-$ARCH.zip"
+          for attempt in 1 2 3 4 5; do
+            if gh release upload "$TAG" "$asset" --clobber; then
+              exit 0
+            fi
+            sleep 10
+          done
+          exit 1
+
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
           name: adbpilot-mac-${{ needs.version.outputs.version }}-${{ matrix.arch }}
           path: AdbPilot-mac-${{ needs.version.outputs.version }}-${{ matrix.arch }}.zip
-
-  release:
-    name: Publish GitHub release
-    runs-on: ubuntu-latest
-    needs:
-      - version
-      - build-windows
-      - build-macos
-    steps:
-      - name: Download release artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-artifacts
-
-      - name: Write release manifest
-        env:
-          VERSION: ${{ needs.version.outputs.version }}
-          TAG: ${{ needs.version.outputs.tag }}
-          RELEASE_SHA: ${{ needs.version.outputs.release_sha }}
-        run: |
-          mkdir -p release-manifest
-          python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          files = sorted(str(path) for path in Path("release-artifacts").rglob("*.zip"))
-          manifest = {
-              "app": "adbpilot",
-              "version": os.environ["VERSION"],
-              "tag": os.environ["TAG"],
-              "commit": os.environ["RELEASE_SHA"],
-              "files": [Path(path).name for path in files],
-          }
-          Path("release-manifest/manifest.json").write_text(
-              json.dumps(manifest, indent=2) + "\n",
-              encoding="utf-8",
-          )
-          PY
-
-      - name: Upload release manifest artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: adbpilot-release-manifest-${{ needs.version.outputs.version }}
-          path: release-manifest/manifest.json
-
-      - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.version.outputs.tag }}
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          mapfile -t files < <(find release-artifacts -type f -name '*.zip' | sort)
-          gh release create "$TAG" "${files[@]}" \
-            --title "AdbPilot $TAG" \
-            --notes "Automated desktop release for AdbPilot $VERSION."
