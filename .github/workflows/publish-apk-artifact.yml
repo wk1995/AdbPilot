@@ -111,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$TARGET_REPO_TOKEN" ]; then
-            echo "Missing secret PUBLISH_APP_FROM_ADB_PILOT_TO_GITHUB_IO. It must allow write access to wk1995/wk1995.github.io." >&2
+            echo "Missing secret PUBLISH_APP_FROM_ADB_PILOT_TO_GITHUB_IO. It must be a fine-grained token with Contents: Read and write on wk1995/wk1995.github.io." >&2
             exit 1
           fi
 
@@ -143,7 +143,7 @@ jobs:
           target_site = workspace / "target-site"
           source_run_id = os.environ["SOURCE_RUN_ID"]
           pattern = re.compile(
-              r"^AdbPilot-(window|mac)-(\d+\.\d+\.\d+)-(32|64|arm64|x86_64)\.zip$"
+              r"^AdbPilot-(windows|macos)-(\d+\.\d+\.\d+)-(32|64|arm64|x86_64|universal2)\.zip$"
           )
 
           readme_file = next(
@@ -203,7 +203,7 @@ jobs:
           git config user.name "github-publish-actions[bot]"
           git config user.email "41898282+github-publish-actions[bot]@users.noreply.github.com"
 
-          git add apps/packages/window/adbPilot apps/packages/mac/adbPilot
+          git add apps/packages/windows/adbPilot apps/packages/macos/adbPilot
 
           if git diff --cached --quiet; then
             echo "No package file changes to commit."

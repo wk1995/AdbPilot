@@ -2,12 +2,10 @@
 
 from pathlib import Path
 
-from adbpilot import __version__
-
-
 ROOT = Path.cwd()
 ENTRY = ROOT / "packaging" / "entrypoints" / "adbpilot_gui.py"
 ICON = ROOT / "packaging" / "macos" / "AdbPilot.icns"
+VERSION = (ROOT / "packaging" / "macos" / "version.txt").read_text(encoding="utf-8").strip()
 
 
 datas = []
@@ -69,8 +67,8 @@ app = BUNDLE(
     info_plist={
         "CFBundleName": "AdbPilot",
         "CFBundleDisplayName": "AdbPilot",
-        "CFBundleShortVersionString": __version__,
-        "CFBundleVersion": __version__,
+        "CFBundleShortVersionString": VERSION,
+        "CFBundleVersion": VERSION,
         "NSHighResolutionCapable": True,
         "LSMinimumSystemVersion": "11.0",
     },

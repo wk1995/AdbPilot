@@ -29,7 +29,11 @@ The output is:
 dist/AdbPilot.app
 ```
 
-The current macOS app version is `0.0.3`. The bundle version is read from `adbpilot.__version__`.
+The current macOS app version is `0.0.1`. The bundle version is defined in:
+
+```text
+packaging/macos/version.txt
+```
 
 ## ADB
 

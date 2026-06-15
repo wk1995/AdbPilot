@@ -6,6 +6,9 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..\..")
 Set-Location $Root
+$Version = (Get-Content -Raw "packaging\windows\version.txt").Trim()
+
+Set-Content -Path "adbpilot\_packaged_version.py" -Value "__version__ = `"$Version`"" -Encoding UTF8
 
 python -m pip install --upgrade pip
 python -m pip install -e ".[build]"
@@ -33,4 +36,4 @@ elseif (Test-Path "tools\platform-tools") {
 }
 
 python -m PyInstaller @args
-Write-Host "Built dist\AdbPilot for Windows, version 0.0.3"
+Write-Host "Built dist\AdbPilot for Windows, version $Version"

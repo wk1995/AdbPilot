@@ -51,21 +51,23 @@ python -m pip install -e .
 
 | 平台 | 版本 |
 | --- | --- |
-| Windows | 0.0.3 |
-| macOS | 0.0.3 |
+| Windows | 0.0.1 |
+| macOS | 0.0.1 |
 
 ## Release automation
 
-Merging into `master` runs the `Build Release` workflow. It bumps the patch
-version, commits synchronized version files, creates the matching `vX.Y.Z` tag,
-builds Windows and macOS desktop packages, and publishes a GitHub release.
+Merging a pull request into `master` runs the `Build Release` workflow. It
+checks the PR file list and bumps only the platform version whose business code
+changed. Windows and macOS versions are isolated in
+`packaging/windows/version.txt` and `packaging/macos/version.txt`, and release
+tags use platform prefixes such as `windows-vX.Y.Z` and `macos-vX.Y.Z`.
 
 After packaging succeeds, `Publish Desktop Artifact` copies the release archives
 and README into `wk1995/wk1995.github.io` under these platform paths:
-`apps/packages/window/adbPilot/X.Y.Z/32`,
-`apps/packages/window/adbPilot/X.Y.Z/64`,
-`apps/packages/mac/adbPilot/X.Y.Z/x86_64`, and
-`apps/packages/mac/adbPilot/X.Y.Z/arm64`.
+`apps/packages/windows/adbPilot/X.Y.Z/32`,
+`apps/packages/windows/adbPilot/X.Y.Z/64`,
+`apps/packages/macos/adbPilot/X.Y.Z/x86_64`, and
+`apps/packages/macos/adbPilot/X.Y.Z/arm64`.
 
 ## Windows 可视化界面
 

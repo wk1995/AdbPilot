@@ -19,6 +19,9 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+VERSION="$(tr -d '[:space:]' < packaging/macos/version.txt)"
+
+printf '__version__ = "%s"\n' "$VERSION" > adbpilot/_packaged_version.py
 
 "$PYTHON_BIN" -m pip install --upgrade pip
 "$PYTHON_BIN" -m pip install -e ".[build]"
@@ -43,5 +46,5 @@ fi
 
 "$PYTHON_BIN" -m PyInstaller "${PYINSTALLER_ARGS[@]}"
 
-echo "Built dist/AdbPilot.app for $ARCH"
+echo "Built dist/AdbPilot.app for $ARCH, version $VERSION"
 echo "Run: open dist/AdbPilot.app"
