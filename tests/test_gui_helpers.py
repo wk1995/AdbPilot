@@ -17,10 +17,17 @@ class GuiHelperTests(unittest.TestCase):
     def test_device_connection_type(self):
         self.assertEqual(device_connection_type("emulator-5554"), "USB")
         self.assertEqual(device_connection_type("5ENDU19B01011261"), "USB")
+        self.assertEqual(device_connection_type("5ENDU19B01011261", {"usb": "1-1"}), "USB")
         self.assertEqual(device_connection_type("192.168.1.10:5555"), "Wi-Fi")
+        self.assertEqual(device_connection_type("adb-5ENDU19B01011261._adb-tls-connect._tcp."), "Wi-Fi")
+        self.assertEqual(device_connection_type("5ENDU19B01011261", {"local": "tcp"}), "Wi-Fi")
 
     def test_device_connection_summary(self):
-        self.assertEqual(device_connection_summary(["abc", "192.168.1.10:5555"]), "USB 1 · Wi-Fi 1")
+        rows = [
+            ("abc", {"details": {"usb": "1-1"}}),
+            ("adb-abc._adb-tls-connect._tcp.", {"details": {}}),
+        ]
+        self.assertEqual(device_connection_summary(rows), "USB 1 · Wi-Fi 1")
 
     def test_device_display_name_prefers_model(self):
         self.assertEqual(
