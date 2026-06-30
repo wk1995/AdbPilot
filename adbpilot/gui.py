@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import platform
 import queue
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -44,6 +46,144 @@ COLORS = {
     "danger": "#b91c1c",
 }
 
+MACOS_FLOATING_HELPER_NAME = "AdbPilotFloatingHelper"
+MACOS_FLOATING_HELPER_SOURCE = "macos_floating_helper.swift"
+
+
+def system_name() -> str:
+    return platform.system().lower()
+
+
+def ui_font(size: int, weight: str | None = None, *, platform_name: str | None = None) -> tuple[Any, ...]:
+    name = (platform_name or system_name()).lower()
+    if name == "darwin":
+        family = "SF Pro Text"
+    elif name == "windows":
+        family = "Microsoft YaHei UI"
+    else:
+        family = "Noto Sans CJK SC"
+    return (family, size, weight) if weight else (family, size)
+
+
+def mono_font(size: int, *, platform_name: str | None = None) -> tuple[str, int]:
+    name = (platform_name or system_name()).lower()
+    if name == "darwin":
+        return ("Menlo", size)
+    if name == "windows":
+        return ("Consolas", size)
+    return ("DejaVu Sans Mono", size)
+
+
+def floating_topmost_locked_from_config(config: dict[str, Any]) -> bool:
+    floating_window = config.get("floating_window", {})
+    if not isinstance(floating_window, dict):
+        return True
+    value = floating_window.get("topmost_locked", True)
+    return value if isinstance(value, bool) else True
+
+
+def floating_topmost_style(locked: bool, *, platform_name: str | None = None) -> tuple[str, str] | None:
+    if (platform_name or system_name()).lower() != "darwin":
+        return None
+    return ("floating", "noActivates canJoinAllSpaces doesNotHide") if locked else ("plain", "none")
+
+
+def floating_topmost_badge_text(locked: bool) -> str:
+    return "置顶" if locked else "普通"
+
+
+def macos_floating_helper_source_path() -> Path:
+    return Path(__file__).with_name(MACOS_FLOATING_HELPER_SOURCE)
+
+
+def macos_floating_helper_build_path() -> Path:
+    return Path.home() / ".adbpilot" / MACOS_FLOATING_HELPER_NAME
+
+
+def macos_floating_helper_needs_build(source: Path, binary: Path) -> bool:
+    if not binary.exists():
+        return True
+    return source.stat().st_mtime > binary.stat().st_mtime
+
+
+def packaged_macos_floating_helper_path() -> Path | None:
+    candidates: list[Path] = []
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        candidates.extend([
+            Path(bundle_root) / MACOS_FLOATING_HELPER_NAME,
+            Path(bundle_root) / "adbpilot" / MACOS_FLOATING_HELPER_NAME,
+        ])
+    executable_dir = Path(sys.executable).resolve().parent
+    candidates.extend([
+        executable_dir / MACOS_FLOATING_HELPER_NAME,
+        executable_dir.parent / "Resources" / MACOS_FLOATING_HELPER_NAME,
+    ])
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def floating_helper_payload(
+    connected: list[tuple[str, dict[str, Any]]],
+    disconnected: list[tuple[str, dict[str, Any]]],
+    *,
+    locked_serial: str,
+    topmost_locked: bool,
+    x: int | None,
+    y: int | None,
+    include_position: bool = True,
+) -> dict[str, Any]:
+    title, subtitle, footer = floating_text_lines(connected, disconnected, locked_serial=locked_serial)
+    state = "warning" if disconnected and not connected else "connected" if connected else "empty"
+    payload: dict[str, Any] = {
+        "type": "update",
+        "title": title,
+        "subtitle": subtitle,
+        "footer": footer,
+        "state": state,
+        "topmostLocked": topmost_locked,
+        "topmostLabel": floating_topmost_badge_text(topmost_locked),
+    }
+    if include_position:
+        payload["x"] = x
+        payload["y"] = y
+    return payload
+
+
+def floating_text_lines(
+    connected: list[tuple[str, dict[str, Any]]],
+    disconnected: list[tuple[str, dict[str, Any]]],
+    *,
+    locked_serial: str,
+) -> tuple[str, str, str]:
+    if connected:
+        if locked_serial:
+            serial, row = connected[0]
+            details = dict(row.get("details", {}))
+            return (
+                device_display_name(serial, details),
+                f"{device_connection_type(serial, details)} · 已锁定",
+                "设备在线",
+            )
+        names = [device_display_name(serial, dict(row.get("details", {}))) for serial, row in connected]
+        shown = " / ".join(names[:2])
+        if len(names) > 2:
+            shown += f" 等 {len(names)} 台"
+        return (f"{len(connected)} 台设备", shown, device_connection_summary(connected))
+
+    if disconnected:
+        serial, row = disconnected[0]
+        details = dict(row.get("details", {}))
+        return (
+            "警示：已断开",
+            device_display_name(serial, details),
+            f"{device_connection_type(serial, details)} · 保持锁定" if locked_serial else device_connection_type(serial, details),
+        )
+
+    return ("无设备", "等待连接", "右键刷新")
+
 
 class AdbPilotGui(BaseTk):
     """Windows-friendly visual interface backed by the existing AdbClient."""
@@ -68,6 +208,7 @@ class AdbPilotGui(BaseTk):
         self.floating_menu: tk.Menu | None = None
         self.floating_drag_start: tuple[int, int] | None = None
         self.floating_status_var = tk.StringVar(value="监听中")
+        self.macos_floating_process: subprocess.Popen[str] | None = None
         self.gui_config = load_gui_config()
         self.locked_serial_var = tk.StringVar()
         self.lock_status_var = tk.StringVar(value="未锁定")
@@ -91,7 +232,7 @@ class AdbPilotGui(BaseTk):
         self.after(500, self._poll_devices)
 
     def _configure_style(self) -> None:
-        self.option_add("*Font", ("Microsoft YaHei UI", 10))
+        self.option_add("*Font", ui_font(10))
         style = ttk.Style(self)
         if "clam" in style.theme_names():
             style.theme_use("clam")
@@ -105,9 +246,9 @@ class AdbPilotGui(BaseTk):
         style.configure("TLabel", background=COLORS["surface"], foreground=COLORS["text"], padding=(0, 2))
         style.configure("Muted.TLabel", background=COLORS["surface"], foreground=COLORS["muted"])
         style.configure("AppMuted.TLabel", background=COLORS["app"], foreground=COLORS["muted"])
-        style.configure("Header.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=("Microsoft YaHei UI", 13, "bold"))
-        style.configure("Title.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=("Microsoft YaHei UI", 18, "bold"))
-        style.configure("Section.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=("Microsoft YaHei UI", 11, "bold"))
+        style.configure("Header.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=ui_font(13, "bold"))
+        style.configure("Title.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=ui_font(18, "bold"))
+        style.configure("Section.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=ui_font(11, "bold"))
         style.configure("Status.TLabel", background=COLORS["surface"], foreground=COLORS["muted"])
         style.configure("TButton", padding=(12, 6), background=COLORS["surface_alt"], foreground=COLORS["text"], bordercolor=COLORS["border"])
         style.map("TButton", background=[("active", "#eef2f7"), ("pressed", "#e5e7eb")])
@@ -118,12 +259,12 @@ class AdbPilotGui(BaseTk):
         style.configure("TEntry", fieldbackground="#ffffff", bordercolor=COLORS["border"], lightcolor=COLORS["border"], darkcolor=COLORS["border"], padding=(6, 5))
         style.configure("TCombobox", fieldbackground="#ffffff", bordercolor=COLORS["border"], padding=(6, 5))
         style.configure("TLabelframe", background=COLORS["surface"], bordercolor=COLORS["border"], relief=tk.SOLID)
-        style.configure("TLabelframe.Label", background=COLORS["surface"], foreground=COLORS["text"], font=("Microsoft YaHei UI", 10, "bold"))
+        style.configure("TLabelframe.Label", background=COLORS["surface"], foreground=COLORS["text"], font=ui_font(10, "bold"))
         style.configure("TNotebook", background=COLORS["surface"], borderwidth=0)
         style.configure("TNotebook.Tab", padding=(14, 8), background=COLORS["surface_alt"], foreground=COLORS["muted"])
         style.map("TNotebook.Tab", background=[("selected", COLORS["surface"])], foreground=[("selected", COLORS["accent"])])
         style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff", foreground=COLORS["text"], rowheight=26, bordercolor=COLORS["border"], borderwidth=1)
-        style.configure("Treeview.Heading", background=COLORS["surface_alt"], foreground=COLORS["muted"], font=("Microsoft YaHei UI", 9, "bold"), padding=(4, 6))
+        style.configure("Treeview.Heading", background=COLORS["surface_alt"], foreground=COLORS["muted"], font=ui_font(9, "bold"), padding=(4, 6))
         style.map("Treeview", background=[("selected", COLORS["accent_soft"])], foreground=[("selected", COLORS["text"])])
         style.configure("TCheckbutton", background=COLORS["surface"], foreground=COLORS["text"])
 
@@ -481,7 +622,7 @@ class AdbPilotGui(BaseTk):
             borderwidth=0,
             padx=10,
             pady=8,
-            font=("Consolas", 10),
+            font=mono_font(10),
         )
 
     def _style_listbox(self, widget: tk.Listbox) -> None:
@@ -499,10 +640,14 @@ class AdbPilotGui(BaseTk):
         )
 
     def enter_floating_mode(self) -> None:
+        if self._show_macos_floating_window():
+            self.withdraw()
+            return
         self._show_floating_window()
         self.withdraw()
 
     def restore_main_window(self) -> None:
+        self._stop_macos_floating_window()
         self.deiconify()
         self.lift()
         self.focus_force()
@@ -513,23 +658,21 @@ class AdbPilotGui(BaseTk):
     def _show_floating_window(self) -> None:
         if self.floating_window is None or not self.floating_window.winfo_exists():
             self.floating_window = tk.Toplevel(self)
+            self.floating_window.withdraw()
             self.floating_window.title("AdbPilot 设备")
             self.floating_window.geometry(self._floating_window_geometry())
             self.floating_window.minsize(260, 76)
-            self.floating_window.configure(bg="#ff00ff")
-            self.floating_window.attributes("-topmost", True)
+            transparent_color = self._floating_transparent_color()
+            self.floating_window.configure(bg=transparent_color)
             self.floating_window.overrideredirect(True)
-            try:
-                self.floating_window.attributes("-transparentcolor", "#ff00ff")
-            except tk.TclError:
-                pass
+            self._apply_floating_window_chrome()
             self.floating_window.protocol("WM_DELETE_WINDOW", self.restore_main_window)
 
             self.floating_canvas = tk.Canvas(
                 self.floating_window,
                 width=300,
                 height=88,
-                bg="#ff00ff",
+                bg=transparent_color,
                 highlightthickness=0,
                 bd=0,
             )
@@ -543,15 +686,11 @@ class AdbPilotGui(BaseTk):
         else:
             self.floating_window.deiconify()
 
-        self.floating_window.lift()
+        self._apply_floating_topmost_lock()
+        self.floating_window.deiconify()
         self._render_floating_devices()
 
-    def _render_floating_devices(self) -> None:
-        if self.floating_window is None or not self.floating_window.winfo_exists():
-            return
-        if self.floating_canvas is None:
-            return
-
+    def _floating_device_groups(self) -> tuple[list[tuple[str, dict[str, Any]]], list[tuple[str, dict[str, Any]]], str]:
         connected = [
             (serial, row)
             for serial, row in self.device_rows.items()
@@ -574,12 +713,209 @@ class AdbPilotGui(BaseTk):
             else:
                 connected = [(locked_serial, locked_row)]
 
+        return connected, disconnected, locked_serial
+
+    def _render_floating_devices(self) -> None:
+        connected, disconnected, locked_serial = self._floating_device_groups()
+        if self._macos_floating_running():
+            if self._send_macos_floating_update(connected, disconnected, locked_serial):
+                return
+            self.macos_floating_process = None
+
+        if self.floating_window is None or not self.floating_window.winfo_exists():
+            return
+        if self.floating_canvas is None:
+            return
+
         self._draw_floating_sphere(connected, disconnected, locked_serial=locked_serial)
 
         if connected:
             self.floating_status_var.set(f"已锁定 1 台" if locked_serial else f"已连接 {len(connected)} 台")
         else:
             self.floating_status_var.set("锁定设备已断开" if locked_serial else "无在线设备")
+
+    def _show_macos_floating_window(self) -> bool:
+        if system_name() != "darwin":
+            return False
+        if not self._macos_floating_running():
+            helper = self._ensure_macos_floating_helper()
+            if helper is None:
+                return False
+            try:
+                self.macos_floating_process = subprocess.Popen(
+                    [str(helper)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    bufsize=1,
+                )
+            except OSError as exc:
+                self._append_output(f"macOS 原生悬浮窗启动失败，已回退 Tk：{exc}\n")
+                return False
+            threading.Thread(target=self._read_macos_floating_events, args=(self.macos_floating_process,), daemon=True).start()
+            threading.Thread(target=self._read_macos_floating_stderr, args=(self.macos_floating_process,), daemon=True).start()
+
+        if self.floating_window is not None and self.floating_window.winfo_exists():
+            self._save_floating_window_position()
+            self.floating_window.withdraw()
+        connected, disconnected, locked_serial = self._floating_device_groups()
+        return self._send_macos_floating_update(connected, disconnected, locked_serial, include_position=True)
+
+    def _ensure_macos_floating_helper(self) -> Path | None:
+        packaged = packaged_macos_floating_helper_path()
+        if packaged is not None:
+            return packaged
+
+        source = macos_floating_helper_source_path()
+        if not source.is_file():
+            self._append_output("macOS 原生悬浮窗 helper 缺失，已回退 Tk。\n")
+            return None
+
+        binary = macos_floating_helper_build_path()
+        try:
+            if macos_floating_helper_needs_build(source, binary):
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["swiftc", str(source), "-O", "-o", str(binary)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            return binary
+        except subprocess.CalledProcessError as exc:
+            details = (exc.stderr or exc.stdout or str(exc)).strip()
+            self._append_output(f"macOS 原生悬浮窗编译失败，已回退 Tk：{details}\n")
+        except OSError as exc:
+            self._append_output(f"macOS 原生悬浮窗不可用，已回退 Tk：{exc}\n")
+        return None
+
+    def _macos_floating_running(self) -> bool:
+        return self.macos_floating_process is not None and self.macos_floating_process.poll() is None
+
+    def _send_macos_floating_update(
+        self,
+        connected: list[tuple[str, dict[str, Any]]],
+        disconnected: list[tuple[str, dict[str, Any]]],
+        locked_serial: str,
+        *,
+        include_position: bool = False,
+    ) -> bool:
+        process = self.macos_floating_process
+        if process is None or process.poll() is not None or process.stdin is None:
+            return False
+        x, y = self._floating_window_position()
+        payload = floating_helper_payload(
+            connected,
+            disconnected,
+            locked_serial=locked_serial,
+            topmost_locked=self._floating_topmost_locked(),
+            x=x,
+            y=y,
+            include_position=include_position,
+        )
+        try:
+            process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+            return True
+        except (BrokenPipeError, OSError):
+            return False
+
+    def _read_macos_floating_events(self, process: subprocess.Popen[str]) -> None:
+        if process.stdout is None:
+            return
+        for line in process.stdout:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            self.result_queue.put(("ok", "设备监听", event, self._handle_macos_floating_event))
+
+    def _read_macos_floating_stderr(self, process: subprocess.Popen[str]) -> None:
+        if process.stderr is None:
+            return
+        for line in process.stderr:
+            text = line.strip()
+            if text:
+                self.result_queue.put(("ok", "设备监听", f"macOS 浮窗：{text}\n", self._append_output))
+
+    def _handle_macos_floating_event(self, event: Any) -> None:
+        if not isinstance(event, dict):
+            return
+        event_name = event.get("event")
+        if event_name == "restore":
+            self.restore_main_window()
+        elif event_name == "moved":
+            self._save_macos_floating_position(event.get("x"), event.get("y"))
+        elif event_name == "action":
+            self._handle_macos_floating_action(str(event.get("action", "")))
+
+    def _handle_macos_floating_action(self, action: str) -> None:
+        actions: dict[str, Callable[[], None]] = {
+            "restore": self.restore_main_window,
+            "toggle_topmost": self._toggle_floating_topmost_lock,
+            "refresh_devices": self.refresh_devices,
+            "device_info": self.show_device_info,
+            "lock_device": self.lock_current_device,
+            "unlock_device": self.unlock_device,
+            "foreground_package": self.use_foreground_package,
+            "refresh_processes": self.refresh_processes,
+            "dump_logcat": self.dump_logcat,
+            "save_logcat": self.save_logcat,
+            "clear_logcat": self.clear_logcat,
+            "screencap": self.screencap,
+            "screenrecord": self.screenrecord,
+            "quit_app": self._close_app,
+        }
+        callback = actions.get(action)
+        if callback is not None:
+            callback()
+
+    def _stop_macos_floating_window(self) -> None:
+        process = self.macos_floating_process
+        self.macos_floating_process = None
+        if process is None:
+            return
+        if process.poll() is not None:
+            return
+        try:
+            if process.stdin is not None:
+                process.stdin.write(json.dumps({"type": "quit"}) + "\n")
+                process.stdin.flush()
+                process.stdin.close()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    def _floating_window_position(self) -> tuple[int | None, int | None]:
+        position = self.gui_config.get("floating_window", {})
+        if not isinstance(position, dict):
+            return None, None
+        x = position.get("x")
+        y = position.get("y")
+        return (x if isinstance(x, int) else None, y if isinstance(y, int) else None)
+
+    def _save_macos_floating_position(self, x: Any, y: Any) -> None:
+        if not isinstance(x, int) or not isinstance(y, int):
+            return
+        floating_window = self.gui_config.get("floating_window", {})
+        if not isinstance(floating_window, dict):
+            floating_window = {}
+        floating_window.update({
+            "x": x,
+            "y": y,
+            "topmost_locked": self._floating_topmost_locked(),
+        })
+        self.gui_config["floating_window"] = floating_window
+        save_gui_config(self.gui_config)
 
     def _draw_floating_sphere(
         self,
@@ -598,21 +934,38 @@ class AdbPilotGui(BaseTk):
         if warning:
             bg, border, dot, title_color, subtitle_color = "#fef2f2", "#fca5a5", "#ef4444", "#991b1b", "#7f1d1d"
         elif connected:
-            bg, border, dot, title_color, subtitle_color = "#f8fafc", "#bfdbfe", "#22c55e", "#111827", "#475569"
+            bg, border, dot, title_color, subtitle_color = "#f8fafc", "#d7dee8", "#22c55e", "#111827", "#475569"
         else:
             bg, border, dot, title_color, subtitle_color = "#f8fafc", "#cbd5e1", "#f59e0b", "#334155", "#64748b"
 
+        topmost_locked = self._floating_topmost_locked()
+        lock_label = floating_topmost_badge_text(topmost_locked)
+        lock_bg = "#eff6ff" if topmost_locked else "#f1f5f9"
+        lock_fg = "#2563eb" if topmost_locked else "#64748b"
+
         margin = 4
-        radius = 18
-        canvas.create_rectangle(margin + 3, margin + 4, width - margin + 3, height - margin + 4, fill="#0f172a", outline="", stipple="gray50")
+        radius = 14
+        shadow_color = "#94a3b8" if system_name() == "darwin" else "#0f172a"
+        shadow_stipple = "gray25" if system_name() == "darwin" else "gray50"
+        canvas.create_rectangle(
+            margin + 3,
+            margin + 4,
+            width - margin + 3,
+            height - margin + 4,
+            fill=shadow_color,
+            outline="",
+            stipple=shadow_stipple,
+        )
         self._rounded_rect(canvas, margin, margin, width - margin, height - margin, radius, fill=bg, outline=border, width=1)
         canvas.create_oval(18, height // 2 - 8, 34, height // 2 + 8, fill=dot, outline="")
+        self._rounded_rect(canvas, width - 64, 14, width - 14, 33, 9, fill=lock_bg, outline="")
+        canvas.create_text(width - 39, 23, text=lock_label, fill=lock_fg, font=ui_font(8, "bold"), anchor=tk.CENTER)
 
         title, subtitle, footer = self._floating_text_lines(connected, disconnected, locked_serial=locked_serial)
-        canvas.create_text(46, 24, text=title, fill=title_color, font=("Microsoft YaHei UI", 10, "bold"), anchor=tk.W, width=width - 88)
-        canvas.create_text(46, 47, text=subtitle, fill=subtitle_color, font=("Microsoft YaHei UI", 8), anchor=tk.W, width=width - 88)
-        canvas.create_text(width - 14, 24, text=footer, fill=subtitle_color, font=("Microsoft YaHei UI", 8), anchor=tk.E)
-        canvas.create_text(width - 14, height - 18, text="右键菜单", fill="#94a3b8", font=("Microsoft YaHei UI", 8), anchor=tk.E)
+        canvas.create_text(46, 24, text=title, fill=title_color, font=ui_font(10, "bold"), anchor=tk.W, width=width - 118)
+        canvas.create_text(46, 47, text=subtitle, fill=subtitle_color, font=ui_font(8), anchor=tk.W, width=width - 128)
+        canvas.create_text(width - 14, 47, text=footer, fill=subtitle_color, font=ui_font(8), anchor=tk.E, width=82)
+        canvas.create_text(width - 14, height - 18, text="右键菜单", fill="#94a3b8", font=ui_font(8), anchor=tk.E)
 
     def _rounded_rect(
         self,
@@ -647,31 +1000,7 @@ class AdbPilotGui(BaseTk):
         *,
         locked_serial: str,
     ) -> tuple[str, str, str]:
-        if connected:
-            if locked_serial:
-                serial, row = connected[0]
-                details = dict(row.get("details", {}))
-                return (
-                    device_display_name(serial, details),
-                    f"{device_connection_type(serial, details)} · 已锁定",
-                    "设备在线",
-                )
-            names = [device_display_name(serial, dict(row.get("details", {}))) for serial, row in connected]
-            shown = " / ".join(names[:2])
-            if len(names) > 2:
-                shown += f" 等 {len(names)} 台"
-            return (f"{len(connected)} 台设备", shown, device_connection_summary(connected))
-
-        if disconnected:
-            serial, row = disconnected[0]
-            details = dict(row.get("details", {}))
-            return (
-                "警示：已断开",
-                device_display_name(serial, details),
-                f"{device_connection_type(serial, details)} · 保持锁定" if locked_serial else device_connection_type(serial, details),
-            )
-
-        return ("无设备", "等待连接", "右键刷新")
+        return floating_text_lines(connected, disconnected, locked_serial=locked_serial)
 
     def _build_floating_menu(self) -> None:
         self.floating_menu = tk.Menu(
@@ -683,9 +1012,10 @@ class AdbPilotGui(BaseTk):
             activeforeground=COLORS["text"],
             borderwidth=1,
             relief=tk.SOLID,
-            font=("Microsoft YaHei UI", 10),
+            font=ui_font(10),
         )
         self.floating_menu.add_command(label="打开主界面", command=self.restore_main_window)
+        self.floating_menu.add_command(label=self._floating_topmost_menu_label(), command=self._toggle_floating_topmost_lock)
         self.floating_menu.add_separator()
         self.floating_menu.add_command(label="刷新设备", command=self.refresh_devices)
         self.floating_menu.add_command(label="设备详情", command=self.show_device_info)
@@ -704,10 +1034,14 @@ class AdbPilotGui(BaseTk):
         self.floating_menu.add_separator()
         self.floating_menu.add_command(label="退出程序", command=self._close_app)
 
+    def _floating_topmost_menu_label(self) -> str:
+        return "取消置顶锁定" if self._floating_topmost_locked() else "置顶锁定"
+
     def _show_floating_menu(self, event: tk.Event[Any]) -> None:
         if self.floating_menu is None:
             return
         try:
+            self.floating_menu.entryconfigure(1, label=self._floating_topmost_menu_label())
             self.floating_menu.tk_popup(event.x_root, event.y_root)
         finally:
             self.floating_menu.grab_release()
@@ -728,6 +1062,7 @@ class AdbPilotGui(BaseTk):
         self._save_floating_window_position()
 
     def _close_app(self) -> None:
+        self._stop_macos_floating_window()
         if self.floating_window is not None and self.floating_window.winfo_exists():
             self._save_floating_window_position()
             self.floating_window.destroy()
@@ -741,13 +1076,82 @@ class AdbPilotGui(BaseTk):
             return f"300x88+{x}+{y}"
         return "300x88+80+80"
 
+    def _floating_topmost_locked(self) -> bool:
+        return floating_topmost_locked_from_config(self.gui_config)
+
+    def _set_floating_topmost_locked(self, locked: bool) -> None:
+        floating_window = self.gui_config.get("floating_window", {})
+        if not isinstance(floating_window, dict):
+            floating_window = {}
+        floating_window["topmost_locked"] = locked
+        self.gui_config["floating_window"] = floating_window
+        save_gui_config(self.gui_config)
+        if self._macos_floating_running():
+            connected, disconnected, locked_serial = self._floating_device_groups()
+            self._send_macos_floating_update(connected, disconnected, locked_serial)
+            return
+        if system_name() == "darwin" and self.floating_window is not None and self.floating_window.winfo_exists():
+            self._save_floating_window_position()
+            self.floating_window.destroy()
+            self.floating_window = None
+            self.floating_canvas = None
+            self.floating_menu = None
+            self._show_floating_window()
+            return
+        self._apply_floating_topmost_lock()
+        self._render_floating_devices()
+
+    def _toggle_floating_topmost_lock(self) -> None:
+        self._set_floating_topmost_locked(not self._floating_topmost_locked())
+
+    def _apply_floating_topmost_lock(self) -> None:
+        if self.floating_window is None or not self.floating_window.winfo_exists():
+            return
+        locked = self._floating_topmost_locked()
+        self._apply_macos_floating_window_style(locked)
+        try:
+            self.floating_window.attributes("-topmost", locked)
+        except tk.TclError:
+            return
+        if locked:
+            self.floating_window.lift()
+
+    def _apply_macos_floating_window_style(self, locked: bool) -> None:
+        if self.floating_window is None:
+            return
+        style = floating_topmost_style(locked)
+        if style is None:
+            return
+        try:
+            self.tk.call("::tk::unsupported::MacWindowStyle", "style", self.floating_window._w, style[0], style[1])
+        except tk.TclError:
+            pass
+
+    def _floating_transparent_color(self) -> str:
+        return "#f3f6fb" if system_name() == "darwin" else "#ff00ff"
+
+    def _apply_floating_window_chrome(self) -> None:
+        if self.floating_window is None:
+            return
+        transparent_color = self._floating_transparent_color()
+        self.floating_window.configure(bg=transparent_color)
+        try:
+            self.floating_window.attributes("-transparentcolor", transparent_color)
+        except tk.TclError:
+            pass
+
     def _save_floating_window_position(self) -> None:
         if self.floating_window is None or not self.floating_window.winfo_exists():
             return
-        self.gui_config["floating_window"] = {
+        floating_window = self.gui_config.get("floating_window", {})
+        if not isinstance(floating_window, dict):
+            floating_window = {}
+        floating_window.update({
             "x": int(self.floating_window.winfo_x()),
             "y": int(self.floating_window.winfo_y()),
-        }
+            "topmost_locked": self._floating_topmost_locked(),
+        })
+        self.gui_config["floating_window"] = floating_window
         save_gui_config(self.gui_config)
 
     def _register_file_drop(self, widget: tk.Widget, variable: tk.StringVar) -> None:
