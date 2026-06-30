@@ -14,7 +14,7 @@ powershell -ExecutionPolicy Bypass -File packaging/windows/build_windows.ps1 -Mo
 
 The generated executable uses GUI/windowed mode, so it does not show a Python console window.
 
-The current Windows app version is `0.0.1`. The release version is defined in:
+The current Windows app version is `0.0.2`. The release version is defined in:
 
 ```text
 packaging/windows/version.txt
