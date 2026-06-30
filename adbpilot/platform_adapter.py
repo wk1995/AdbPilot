@@ -16,7 +16,7 @@ class PlatformAdapter:
     """Finds an adb executable without making assumptions about the host OS."""
 
     def __init__(self, env: dict[str, str] | None = None) -> None:
-        self.env = env or os.environ
+        self.env = env if env is not None else os.environ
         self.system = platform.system().lower()
 
     @property

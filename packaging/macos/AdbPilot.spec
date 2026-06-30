@@ -16,11 +16,16 @@ for candidate in [
     if candidate.exists():
         datas.append((str(candidate), "platform-tools"))
 
+binaries = []
+helper = ROOT / "build" / "macos-helper" / "AdbPilotFloatingHelper"
+if helper.exists():
+    binaries.append((str(helper), "."))
+
 
 a = Analysis(
     [str(ENTRY)],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=["tkinter"],
     hookspath=[],
