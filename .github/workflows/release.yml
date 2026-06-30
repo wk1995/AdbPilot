@@ -1,27 +1,116 @@
 name: Build Release
 
 on:
-  push:
+  pull_request_target:
     branches:
       - master
+    types:
+      - closed
   workflow_dispatch:
+    inputs:
+      windows:
+        description: Build and bump the Windows desktop package.
+        required: true
+        default: true
+        type: boolean
+      macos:
+        description: Build and bump the macOS desktop package.
+        required: true
+        default: true
+        type: boolean
 
 permissions:
   contents: write
   actions: read
+  pull-requests: read
 
 jobs:
-  version:
-    name: Bump version and tag
+  changes:
+    name: Resolve platform changes
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.bump.outputs.version }}
-      tag: v${{ steps.bump.outputs.version }}
-      release_sha: ${{ steps.commit.outputs.release_sha }}
+      windows_changed: ${{ steps.resolve.outputs.windows_changed }}
+      macos_changed: ${{ steps.resolve.outputs.macos_changed }}
+    steps:
+      - name: Resolve changed platforms
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          INPUT_WINDOWS: ${{ github.event.inputs.windows || 'false' }}
+          INPUT_MACOS: ${{ github.event.inputs.macos || 'false' }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "windows_changed=$INPUT_WINDOWS" >> "$GITHUB_OUTPUT"
+            echo "macos_changed=$INPUT_MACOS" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh api --paginate "repos/$SOURCE_REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[].filename' > changed-files.txt
+
+          python - <<'PY'
+          from pathlib import Path
+
+          changed_files = [
+              line.strip()
+              for line in Path("changed-files.txt").read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+
+          def is_common_business(path: str) -> bool:
+              return path.startswith("adbpilot/") or path.startswith("packaging/entrypoints/")
+
+          def is_windows_business(path: str) -> bool:
+              if is_common_business(path):
+                  return True
+              if not path.startswith("packaging/windows/"):
+                  return False
+              return path not in {
+                  "packaging/windows/README.md",
+                  "packaging/windows/version.txt",
+                  "packaging/windows/file_version_info.txt",
+              }
+
+          def is_macos_business(path: str) -> bool:
+              if is_common_business(path):
+                  return True
+              if not path.startswith("packaging/macos/"):
+                  return False
+              return path not in {
+                  "packaging/macos/README.md",
+                  "packaging/macos/version.txt",
+              }
+
+          windows_changed = any(is_windows_business(path) for path in changed_files)
+          macos_changed = any(is_macos_business(path) for path in changed_files)
+
+          with Path(__import__("os").environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"windows_changed={str(windows_changed).lower()}\n")
+              output.write(f"macos_changed={str(macos_changed).lower()}\n")
+          PY
+
+  version:
+    name: Bump changed platform versions
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.windows_changed == 'true' || needs.changes.outputs.macos_changed == 'true'
+    outputs:
+      windows_version: ${{ steps.release.outputs.windows_version }}
+      macos_version: ${{ steps.release.outputs.macos_version }}
+      windows_tag: ${{ steps.release.outputs.windows_tag }}
+      macos_tag: ${{ steps.release.outputs.macos_tag }}
+      release_sha: ${{ steps.release.outputs.release_sha }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
+          ref: master
           fetch-depth: 0
 
       - name: Set up Python
@@ -29,42 +118,80 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Bump patch version
-        id: bump
-        run: python packaging/scripts/bump_version.py
+      - name: Bump Windows patch version
+        if: needs.changes.outputs.windows_changed == 'true'
+        run: python packaging/scripts/bump_version.py --platform windows
 
-      - name: Commit and tag release
-        id: commit
+      - name: Bump macOS patch version
+        if: needs.changes.outputs.macos_changed == 'true'
+        run: python packaging/scripts/bump_version.py --platform macos
+
+      - name: Commit, tag, and create platform releases
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.bump.outputs.version }}
+          WINDOWS_CHANGED: ${{ needs.changes.outputs.windows_changed }}
+          MACOS_CHANGED: ${{ needs.changes.outputs.macos_changed }}
         run: |
           set -euo pipefail
-          tag="v$VERSION"
 
-          if git rev-parse "$tag" >/dev/null 2>&1; then
-            echo "Tag $tag already exists." >&2
-            exit 1
-          fi
+          windows_version="$(tr -d '[:space:]' < packaging/windows/version.txt)"
+          macos_version="$(tr -d '[:space:]' < packaging/macos/version.txt)"
 
+          git fetch --tags
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add adbpilot/__init__.py pyproject.toml readme.md packaging tests
-          git commit -m "chore: release $tag [skip ci]"
-          git tag "$tag"
-          git push origin HEAD:master
-          git push origin "$tag"
+          git add readme.md packaging/windows packaging/macos
+
+          if git diff --cached --quiet; then
+            echo "No version file changes to commit."
+          else
+            git commit -m "[codex] chore: release desktop platform versions [skip ci]"
+            git push origin HEAD:master
+          fi
+
           release_sha="$(git rev-parse HEAD)"
-          gh release create "$tag" \
-            --target "$release_sha" \
-            --title "AdbPilot $tag" \
-            --notes "Automated desktop release for AdbPilot $VERSION."
+
+          create_release() {
+            local platform="$1"
+            local version="$2"
+            local tag="$platform-v$version"
+            local title_platform="$3"
+
+            if git rev-parse "$tag" >/dev/null 2>&1; then
+              echo "Tag $tag already exists." >&2
+              exit 1
+            fi
+
+            git tag "$tag"
+            git push origin "$tag"
+            gh release create "$tag" \
+              --target "$release_sha" \
+              --title "AdbPilot $title_platform $tag" \
+              --notes "Automated $title_platform desktop release for AdbPilot $version."
+          }
+
+          if [ "$WINDOWS_CHANGED" = "true" ]; then
+            create_release "windows" "$windows_version" "Windows"
+          fi
+
+          if [ "$MACOS_CHANGED" = "true" ]; then
+            create_release "macos" "$macos_version" "macOS"
+          fi
+
+          echo "windows_version=$windows_version" >> "$GITHUB_OUTPUT"
+          echo "macos_version=$macos_version" >> "$GITHUB_OUTPUT"
+          echo "windows_tag=windows-v$windows_version" >> "$GITHUB_OUTPUT"
+          echo "macos_tag=macos-v$macos_version" >> "$GITHUB_OUTPUT"
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
 
   build-windows:
-    name: Build Window ${{ matrix.systemos }}-bit
+    name: Build Windows ${{ matrix.systemos }}-bit
     runs-on: windows-latest
-    needs: version
+    needs:
+      - changes
+      - version
+    if: needs.changes.outputs.windows_changed == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -92,19 +219,19 @@ jobs:
       - name: Package Windows app
         shell: pwsh
         env:
-          VERSION: ${{ needs.version.outputs.version }}
+          VERSION: ${{ needs.version.outputs.windows_version }}
           SYSTEMOS: ${{ matrix.systemos }}
-        run: Compress-Archive -Path dist\AdbPilot -DestinationPath "AdbPilot-window-$env:VERSION-$env:SYSTEMOS.zip" -Force
+        run: Compress-Archive -Path dist\AdbPilot -DestinationPath "AdbPilot-windows-$env:VERSION-$env:SYSTEMOS.zip" -Force
 
       - name: Upload Windows release asset
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.version.outputs.tag }}
-          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.windows_tag }}
+          VERSION: ${{ needs.version.outputs.windows_version }}
           SYSTEMOS: ${{ matrix.systemos }}
         run: |
-          $asset = "AdbPilot-window-$env:VERSION-$env:SYSTEMOS.zip"
+          $asset = "AdbPilot-windows-$env:VERSION-$env:SYSTEMOS.zip"
           for ($attempt = 1; $attempt -le 5; $attempt++) {
             gh release upload $env:TAG $asset --clobber
             if ($LASTEXITCODE -eq 0) {
@@ -117,13 +244,16 @@ jobs:
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: adbpilot-window-${{ needs.version.outputs.version }}-${{ matrix.systemos }}
-          path: AdbPilot-window-${{ needs.version.outputs.version }}-${{ matrix.systemos }}.zip
+          name: adbpilot-windows-${{ needs.version.outputs.windows_version }}-${{ matrix.systemos }}
+          path: AdbPilot-windows-${{ needs.version.outputs.windows_version }}-${{ matrix.systemos }}.zip
 
   build-macos:
-    name: Build Mac ${{ matrix.arch }}
+    name: Build macOS ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
-    needs: version
+    needs:
+      - changes
+      - version
+    if: needs.changes.outputs.macos_changed == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -153,19 +283,19 @@ jobs:
 
       - name: Package macOS app
         env:
-          VERSION: ${{ needs.version.outputs.version }}
+          VERSION: ${{ needs.version.outputs.macos_version }}
           ARCH: ${{ matrix.arch }}
-        run: ditto -c -k --sequesterRsrc --keepParent dist/AdbPilot.app "AdbPilot-mac-$VERSION-$ARCH.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent dist/AdbPilot.app "AdbPilot-macos-$VERSION-$ARCH.zip"
 
       - name: Upload macOS release asset
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.version.outputs.tag }}
-          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.macos_tag }}
+          VERSION: ${{ needs.version.outputs.macos_version }}
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          asset="AdbPilot-mac-$VERSION-$ARCH.zip"
+          asset="AdbPilot-macos-$VERSION-$ARCH.zip"
           for attempt in 1 2 3 4 5; do
             if gh release upload "$TAG" "$asset" --clobber; then
               exit 0
@@ -177,5 +307,5 @@ jobs:
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: adbpilot-mac-${{ needs.version.outputs.version }}-${{ matrix.arch }}
-          path: AdbPilot-mac-${{ needs.version.outputs.version }}-${{ matrix.arch }}.zip
+          name: adbpilot-macos-${{ needs.version.outputs.macos_version }}-${{ matrix.arch }}
+          path: AdbPilot-macos-${{ needs.version.outputs.macos_version }}-${{ matrix.arch }}.zip

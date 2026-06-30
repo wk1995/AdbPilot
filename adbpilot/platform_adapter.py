@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,6 +32,10 @@ class PlatformAdapter:
         path_hit = shutil.which(self.executable_name) or shutil.which("adb")
         if path_hit:
             return Path(path_hit)
+
+        shell_path_hit = self._which_from_login_shell()
+        if shell_path_hit:
+            return shell_path_hit
 
         searched = "\n".join(f"- {path}" for path in candidates)
         raise AdbNotFoundError(
@@ -77,6 +82,37 @@ class PlatformAdapter:
             )
 
         return [Path(value).expanduser() for value in values if value]
+
+    def _which_from_login_shell(self) -> Path | None:
+        if self.system != "darwin":
+            return None
+
+        shell_values = [
+            self.env.get("SHELL"),
+            "/bin/zsh",
+            "/bin/bash",
+        ]
+        for shell in dict.fromkeys(value for value in shell_values if value):
+            shell_path = Path(shell)
+            if not shell_path.exists():
+                continue
+            try:
+                result = subprocess.run(
+                    [str(shell_path), "-lc", "command -v adb"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+
+            adb_path = result.stdout.strip().splitlines()[0] if result.stdout.strip() else ""
+            if result.returncode == 0 and adb_path:
+                candidate = Path(adb_path).expanduser()
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+        return None
 
     def _packaged_adb_candidates(self) -> list[Path]:
         roots: list[Path] = []

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import platform
 import queue
 import subprocess
 import threading
@@ -16,6 +17,7 @@ from . import __version__
 from .client import AdbClient
 from .errors import AdbPilotError
 from .models import Device, RunningProcess
+from .platform_adapter import PlatformAdapter
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -79,9 +81,13 @@ class AdbPilotGui(BaseTk):
         self._configure_style()
         self.protocol("WM_DELETE_WINDOW", self._close_app)
         self._build_ui()
+        saved_adb_path = str(self.gui_config.get("adb_path", "")).strip()
+        if saved_adb_path and Path(saved_adb_path).expanduser().is_file():
+            self.adb_path_var.set(saved_adb_path)
         if DND_FILES is None:
             self._append_output("提示：安装 tkinterdnd2 后可将文件拖到路径输入框。\n")
         self.after(100, self._process_results)
+        self.after(150, self._resolve_initial_adb_path)
         self.after(500, self._poll_devices)
 
     def _configure_style(self) -> None:
@@ -440,9 +446,19 @@ class AdbPilotGui(BaseTk):
         self.output.pack(fill=tk.BOTH, expand=False, pady=(4, 0))
 
     def _browse_adb(self) -> None:
-        path = filedialog.askopenfilename(title="选择 adb.exe", filetypes=[("ADB", "adb.exe"), ("所有文件", "*.*")])
+        if platform.system().lower() == "windows":
+            title = "选择 adb.exe"
+            filetypes = [("ADB", "adb.exe"), ("所有文件", "*.*")]
+        else:
+            title = "选择 adb"
+            filetypes = [("ADB", "adb"), ("所有文件", "*")]
+        try:
+            path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+        except tk.TclError:
+            path = filedialog.askopenfilename(title=title)
         if path:
             self.adb_path_var.set(path)
+            self._remember_adb_path(path)
 
     def _browse_apk(self) -> None:
         path = filedialog.askopenfilename(title="选择 APK", filetypes=[("APK", "*.apk"), ("所有文件", "*.*")])
@@ -637,14 +653,14 @@ class AdbPilotGui(BaseTk):
                 details = dict(row.get("details", {}))
                 return (
                     device_display_name(serial, details),
-                    f"{device_connection_type(serial)} · 已锁定",
+                    f"{device_connection_type(serial, details)} · 已锁定",
                     "设备在线",
                 )
             names = [device_display_name(serial, dict(row.get("details", {}))) for serial, row in connected]
             shown = " / ".join(names[:2])
             if len(names) > 2:
                 shown += f" 等 {len(names)} 台"
-            return (f"{len(connected)} 台设备", shown, device_connection_summary(serial for serial, _ in connected))
+            return (f"{len(connected)} 台设备", shown, device_connection_summary(connected))
 
         if disconnected:
             serial, row = disconnected[0]
@@ -652,7 +668,7 @@ class AdbPilotGui(BaseTk):
             return (
                 "警示：已断开",
                 device_display_name(serial, details),
-                f"{device_connection_type(serial)} · 保持锁定" if locked_serial else device_connection_type(serial),
+                f"{device_connection_type(serial, details)} · 保持锁定" if locked_serial else device_connection_type(serial, details),
             )
 
         return ("无设备", "等待连接", "右键刷新")
@@ -746,7 +762,25 @@ class AdbPilotGui(BaseTk):
             return
         path = str(paths[0]).removeprefix("file:///")
         variable.set(path)
+        if variable is self.adb_path_var:
+            self._remember_adb_path(path)
         self._append_output(f"已拖入文件：{path}\n")
+
+    def _resolve_initial_adb_path(self) -> None:
+        if self.adb_path_var.get().strip():
+            return
+        try:
+            adb_path = PlatformAdapter().resolve_adb()
+        except AdbPilotError as exc:
+            self._append_output(f"未自动找到 adb：{exc}\n")
+            return
+        self.adb_path_var.set(str(adb_path))
+        self._remember_adb_path(str(adb_path))
+        self._append_output(f"已自动找到 adb：{adb_path}\n")
+
+    def _remember_adb_path(self, path: str) -> None:
+        self.gui_config["adb_path"] = path
+        save_gui_config(self.gui_config)
 
     def _get_client(self) -> AdbClient:
         timeout = self._int_value(self.timeout_var, default=30)
@@ -754,6 +788,7 @@ class AdbPilotGui(BaseTk):
         if self.client is None or str(self.client.adb_path) != str(adb_path or self.client.adb_path) or self.client.timeout != timeout:
             self.client = AdbClient(adb_path=adb_path, timeout=timeout)
             self.adb_path_var.set(str(self.client.adb_path))
+            self._remember_adb_path(str(self.client.adb_path))
         return self.client
 
     def _selected_serial(self) -> str | None:
@@ -933,7 +968,7 @@ class AdbPilotGui(BaseTk):
                     details.get("product", ""),
                     details.get("model", ""),
                     details.get("device", ""),
-                    details.get("transport_id", ""),
+                    device_connection_type(device.serial, details),
                 ),
             )
 
@@ -952,7 +987,7 @@ class AdbPilotGui(BaseTk):
                         details.get("product", ""),
                         details.get("model", ""),
                         details.get("device", ""),
-                        details.get("transport_id", ""),
+                        device_connection_type(serial, details),
                     ),
                     tags=("disconnected",),
                 )
@@ -1268,16 +1303,32 @@ def main() -> int:
         return 2
 
 
-def device_connection_type(serial: str) -> str:
+def device_connection_type(serial: str, details: dict[str, str] | None = None) -> str:
+    normalized_serial = serial.lower()
+    normalized_details = {key.lower(): value.lower() for key, value in (details or {}).items()}
+    if "usb" in normalized_details:
+        return "USB"
+    if any(key in normalized_details for key in ("local", "tcp", "tcpip", "wifi", "wireless")):
+        return "Wi-Fi"
     if ":" in serial:
+        return "Wi-Fi"
+    if "_adb-tls-" in normalized_serial or "._adb" in normalized_serial or normalized_serial.endswith(".local"):
         return "Wi-Fi"
     return "USB"
 
 
 def device_connection_summary(serials: Any) -> str:
     counts = {"USB": 0, "Wi-Fi": 0}
-    for serial in serials:
-        counts[device_connection_type(str(serial))] += 1
+    for item in serials:
+        details: dict[str, str] | None = None
+        serial = item
+        if isinstance(item, tuple) and len(item) == 2:
+            serial, row = item
+            if isinstance(row, dict):
+                row_details = row.get("details", {})
+                if isinstance(row_details, dict):
+                    details = row_details
+        counts[device_connection_type(str(serial), details)] += 1
     parts = [f"{name} {count}" for name, count in counts.items() if count]
     return " · ".join(parts) if parts else "无设备"
 
