@@ -138,6 +138,25 @@ bash packaging/macos/build_macos.sh x86_64
 dist/AdbPilot.app
 ```
 
+### macOS 未验证开发者提示
+
+如果直接运行本地打包或从浏览器下载的 `.app`，macOS 可能会提示：
+
+```text
+Apple 无法验证“AdbPilot”是否包含可能危害 Mac 安全或泄漏隐私的恶意软件。
+```
+
+这通常表示应用没有使用 Apple Developer ID 签名并完成 notarization，不等同于确认应用含有恶意软件。对于自己构建、确认来源可信的本地版本，可以移除 quarantine 属性后再打开：
+
+```bash
+xattr -dr com.apple.quarantine dist/AdbPilot.app
+open dist/AdbPilot.app
+```
+
+也可以在系统设置的“隐私与安全性”中选择“仍要打开”。不要对来源不可信的 `.app` 执行上述放行操作。
+
+如果要把 macOS 安装包分发给其他用户，建议使用 Apple Developer ID 对 `.app` 签名并提交 Apple notarization。该能力通常需要付费加入 Apple Developer Program，费用以 Apple 官方说明为准；notarization 本身没有单独按次收费。
+
 更多细节见 [packaging/macos/README.md](./packaging/macos/README.md)。
 
 ## AI/自动化 CLI
