@@ -1,9 +1,40 @@
 import unittest
 
-from adbpilot.client import parse_devices, parse_foreground_package, parse_key_value_lines, parse_package_dump, parse_processes
+from adbpilot.client import (
+    find_mdns_service,
+    parse_devices,
+    parse_foreground_package,
+    parse_key_value_lines,
+    parse_mdns_services,
+    parse_package_dump,
+    parse_processes,
+)
 
 
 class ClientParsingTests(unittest.TestCase):
+    def test_parse_mdns_services(self):
+        output = """List of discovered mdns services
+adb-14141FDF600081-QXjCrW  _adb-tls-pairing._tcp  192.168.86.38:33861
+studio-abc123XYZ9          _adb-tls-pairing._tcp  192.168.86.39:55861
+adb-14141FDF600081-TnSdi9  _adb-tls-connect._tcp  192.168.86.38:33015
+"""
+
+        services = parse_mdns_services(output)
+        service = find_mdns_service(
+            services,
+            name="studio-abc123XYZ9",
+            service_type="_adb-tls-pairing._tcp",
+        )
+        connect = find_mdns_service(
+            services,
+            service_type="_adb-tls-connect._tcp",
+            host="192.168.86.38",
+        )
+
+        self.assertEqual(len(services), 3)
+        self.assertEqual(service["address"], "192.168.86.39:55861")
+        self.assertEqual(connect["name"], "adb-14141FDF600081-TnSdi9")
+
     def test_parse_devices_with_details(self):
         output = """List of devices attached
 emulator-5554 device product:sdk_gphone64 model:sdk_gphone64_x86_64 device:emu64x transport_id:1

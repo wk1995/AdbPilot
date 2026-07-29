@@ -17,6 +17,9 @@ class FakeClient:
     def connect(self, address):
         return f"connected to {address}"
 
+    def pair(self, address, code):
+        return f"paired {address} with {code}"
+
     def foreground_package(self, serial=None):
         return "com.example.app"
 
@@ -36,6 +39,7 @@ class AiCliTests(unittest.TestCase):
         self.assertIn("foreground", schema["operations"])
         self.assertIn("processes", schema["operations"])
         self.assertIn("logcat-dump", schema["operations"])
+        self.assertIn("pair", schema["operations"])
 
     def test_schema_command_outputs_json_without_adb(self):
         output = io.StringIO()
@@ -61,6 +65,11 @@ class AiCliTests(unittest.TestCase):
 
         self.assertEqual(string_result["stdout"], "abc:getprop ro.product.model")
         self.assertEqual(array_result["stdout"], "abc:getprop ro.product.model")
+
+    def test_pair_operation_returns_message(self):
+        data = ai_cli.op_pair(FakeClient(), {"address": "192.168.1.10:37123", "code": "123456"})
+
+        self.assertEqual(data["message"], "paired 192.168.1.10:37123 with 123456")
 
     def test_foreground_and_process_operations(self):
         client = FakeClient()

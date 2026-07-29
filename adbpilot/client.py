@@ -43,7 +43,7 @@ class AdbClient:
         result = CommandResult(tuple(command), completed.returncode, completed.stdout, completed.stderr)
         if check and completed.returncode != 0:
             raise AdbCommandError(
-                self._format_failure(command, completed.returncode, completed.stderr),
+                self._format_failure(command, completed.returncode, completed.stderr, completed.stdout),
                 completed.returncode,
                 completed.stdout,
                 completed.stderr,
@@ -340,11 +340,62 @@ class AdbClient:
     def connect(self, address: str) -> str:
         return self.run(["connect", address], timeout=60).stdout.strip()
 
+    def pair(self, address: str, pairing_code: str) -> str:
+        return self.run(["pair", address, pairing_code], timeout=60).stdout.strip()
+
     def disconnect(self, address: str | None = None) -> str:
         args = ["disconnect"]
         if address:
             args.append(address)
         return self.run(args, timeout=60).stdout.strip()
+
+    def mdns_services(self) -> str:
+        return self.run(["mdns", "services"], timeout=20).stdout
+
+    def pair_by_qr(self, service_name: str, password: str, *, timeout: int = 120) -> str:
+        deadline = time.monotonic() + timeout
+        pairing_service: dict[str, str] | None = None
+        last_services = ""
+
+        while time.monotonic() < deadline:
+            last_services = self.mdns_services()
+            pairing_service = find_mdns_service(
+                parse_mdns_services(last_services),
+                name=service_name,
+                service_type="_adb-tls-pairing._tcp",
+            )
+            if pairing_service:
+                break
+            time.sleep(1)
+
+        if not pairing_service:
+            raise DeviceSelectionError(
+                "未发现扫码后的 ADB 配对服务。请确认手机和电脑在同一个 Wi-Fi，"
+                "并在手机无线调试中选择“使用二维码配对设备”。\n"
+                f"最近一次 mdns services 输出：\n{last_services.strip() or '<empty>'}"
+            )
+
+        pair_address = pairing_service["address"]
+        pair_output = self.pair(pair_address, password)
+        host = pair_address.rsplit(":", 1)[0]
+
+        connect_service: dict[str, str] | None = None
+        connect_deadline = time.monotonic() + 30
+        while time.monotonic() < connect_deadline:
+            connect_service = find_mdns_service(
+                parse_mdns_services(self.mdns_services()),
+                service_type="_adb-tls-connect._tcp",
+                host=host,
+            )
+            if connect_service:
+                break
+            time.sleep(1)
+
+        if not connect_service:
+            return f"{pair_output}\n配对成功，但未发现连接端口；请稍后刷新设备或手动连接手机上显示的连接地址。"
+
+        connect_output = self.connect(connect_service["address"])
+        return f"{pair_output}\n{connect_output}"
 
     def logcat(
         self,
@@ -378,10 +429,40 @@ class AdbClient:
         return command
 
     @staticmethod
-    def _format_failure(command: list[str], returncode: int, stderr: str) -> str:
+    def _format_failure(command: list[str], returncode: int, stderr: str, stdout: str = "") -> str:
         rendered = " ".join(command)
-        detail = stderr.strip() or "无 stderr 输出"
+        if stdout.strip():
+            stderr = f"{stderr.strip()}\nstdout:\n{stdout.strip()}".strip()
+        detail = stderr.strip() or "无 stdout/stderr 输出"
         return f"ADB 命令执行失败，退出码 {returncode}: {rendered}\n{detail}"
+
+
+def parse_mdns_services(output: str) -> list[dict[str, str]]:
+    services: list[dict[str, str]] = []
+    for raw_line in output.splitlines():
+        parts = raw_line.split()
+        if len(parts) < 3 or not parts[1].startswith("_adb"):
+            continue
+        services.append({"name": parts[0], "type": parts[1], "address": parts[2]})
+    return services
+
+
+def find_mdns_service(
+    services: list[dict[str, str]],
+    *,
+    service_type: str,
+    name: str | None = None,
+    host: str | None = None,
+) -> dict[str, str] | None:
+    for service in services:
+        if service.get("type") != service_type:
+            continue
+        if name is not None and service.get("name") != name:
+            continue
+        if host is not None and service.get("address", "").rsplit(":", 1)[0] != host:
+            continue
+        return service
+    return None
 
 
 def parse_devices(output: str) -> list[Device]:

@@ -163,6 +163,7 @@ def operation_schema() -> JsonMap:
             "devices": {"description": "List connected devices", "params": {}},
             "info": {"description": "Get device info", "params": {"serial": "optional string"}},
             "connect": {"description": "Connect wireless adb device", "params": {"address": "host:port string"}},
+            "pair": {"description": "Pair Android 11+ wireless adb device", "params": {"address": "pairing host:port string", "code": "pairing code string"}},
             "disconnect": {"description": "Disconnect wireless adb device", "params": {"address": "optional host:port string"}},
             "install": {
                 "description": "Install APK",
@@ -234,6 +235,10 @@ def op_info(client: AdbClient, params: JsonMap) -> JsonMap:
 
 def op_connect(client: AdbClient, params: JsonMap) -> JsonMap:
     return {"message": client.connect(required_str(params, "address"))}
+
+
+def op_pair(client: AdbClient, params: JsonMap) -> JsonMap:
+    return {"message": client.pair(required_str(params, "address"), required_str(params, "code"))}
 
 
 def op_disconnect(client: AdbClient, params: JsonMap) -> JsonMap:
@@ -463,6 +468,7 @@ OPERATIONS: dict[str, Operation] = {
     "devices": op_devices,
     "info": op_info,
     "connect": op_connect,
+    "pair": op_pair,
     "disconnect": op_disconnect,
     "install": op_install,
     "uninstall": op_uninstall,
