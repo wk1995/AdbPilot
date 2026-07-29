@@ -6,6 +6,8 @@ import json
 import os
 import platform
 import queue
+import secrets
+import string
 import subprocess
 import sys
 import threading
@@ -185,6 +187,13 @@ def floating_text_lines(
     return ("无设备", "等待连接", "右键刷新")
 
 
+def generate_adb_qr_pairing_payload() -> tuple[str, str, str]:
+    alphabet = string.ascii_letters + string.digits
+    service_name = "studio-" + "".join(secrets.choice(alphabet) for _ in range(10))
+    password = "".join(secrets.choice(alphabet) for _ in range(12))
+    return service_name, password, f"WIFI:T:ADB;S:{service_name};P:{password};;"
+
+
 class AdbPilotGui(BaseTk):
     """Windows-friendly visual interface backed by the existing AdbClient."""
 
@@ -209,6 +218,8 @@ class AdbPilotGui(BaseTk):
         self.floating_menu: tk.Menu | None = None
         self.floating_drag_start: tuple[int, int] | None = None
         self.floating_status_var = tk.StringVar(value="监听中")
+        self.qr_pair_window: tk.Toplevel | None = None
+        self.qr_pair_image: Any = None
         self.macos_floating_process: subprocess.Popen[str] | None = None
         self.gui_config = load_gui_config()
         self.locked_serial_var = tk.StringVar()
@@ -378,8 +389,17 @@ class AdbPilotGui(BaseTk):
 
         wireless = ttk.LabelFrame(side, text="无线调试")
         wireless.pack(fill=tk.X, pady=(14, 0))
+        self.pair_addr_var = tk.StringVar(value="192.168.1.10:37123")
+        self.pair_code_var = tk.StringVar()
         self.connect_addr_var = tk.StringVar(value="192.168.1.10:5555")
-        ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(6, 4))
+        ttk.Label(wireless, text="配对地址").pack(anchor=tk.W, padx=6, pady=(6, 0))
+        ttk.Entry(wireless, textvariable=self.pair_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Label(wireless, text="配对码").pack(anchor=tk.W, padx=6, pady=(2, 0))
+        ttk.Entry(wireless, textvariable=self.pair_code_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Button(wireless, text="配对", command=self.pair_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(2, 6))
+        ttk.Button(wireless, text="扫码配对", command=self.qr_pair_device, style="Primary.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Label(wireless, text="连接地址").pack(anchor=tk.W, padx=6, pady=(2, 0))
+        ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
         wireless_actions = ttk.Frame(wireless, style="Surface.TFrame")
         wireless_actions.pack(fill=tk.X, padx=6, pady=(2, 6))
         ttk.Button(wireless_actions, text="连接", command=self.connect_device, style="Primary.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
@@ -1454,9 +1474,6 @@ class AdbPilotGui(BaseTk):
         if noisy or connected or disconnected:
             self._append_output(f"检测到 {len(devices)} 台在线设备\n")
         self._update_lock_status()
-        selected_for_logs = self.selected_serial_var.get().strip()
-        if selected_for_logs in current_serials and not self.log_package_var.get().strip():
-            self.use_foreground_package(default_only=True)
         self._render_floating_devices()
 
     def show_device_info(self) -> None:
@@ -1469,6 +1486,69 @@ class AdbPilotGui(BaseTk):
             messagebox.showwarning("AdbPilot", "请输入 host:port 地址")
             return
         self._run_async(f"连接 {address}", lambda: self._get_client().connect(address))
+
+    def pair_device(self) -> None:
+        address = self.pair_addr_var.get().strip()
+        code = self.pair_code_var.get().strip()
+        if not address:
+            messagebox.showwarning("AdbPilot", "请输入配对 host:port 地址")
+            return
+        if not code:
+            messagebox.showwarning("AdbPilot", "请输入无线调试配对码")
+            return
+        self._run_async(f"配对 {address}", lambda: self._get_client().pair(address, code))
+
+    def qr_pair_device(self) -> None:
+        service_name, password, payload = generate_adb_qr_pairing_payload()
+        if not self._show_qr_pairing_window(payload):
+            return
+        self._append_output(
+            "请在手机进入“开发者选项 > 无线调试 > 使用二维码配对设备”并扫描弹窗二维码。\n"
+        )
+
+        def done(result: str) -> None:
+            self._append_output(f"{result}\n")
+            self.refresh_devices()
+
+        self._run_async(
+            f"扫码配对 {service_name}",
+            lambda: self._get_client().pair_by_qr(service_name, password),
+            done,
+        )
+
+    def _show_qr_pairing_window(self, payload: str) -> bool:
+        try:
+            import qrcode
+            from PIL import ImageTk
+        except ImportError:
+            messagebox.showerror("AdbPilot", "缺少二维码依赖，请安装 qrcode[pil] 后重试。")
+            return False
+
+        if self.qr_pair_window is not None and self.qr_pair_window.winfo_exists():
+            self.qr_pair_window.destroy()
+
+        window = tk.Toplevel(self)
+        window.title("扫码配对")
+        window.resizable(False, False)
+        window.configure(bg=COLORS["surface"])
+        window.transient(self)
+        window.grab_set()
+
+        ttk.Label(window, text="无线调试扫码配对", style="Header.TLabel").pack(anchor=tk.W, padx=16, pady=(14, 4))
+        ttk.Label(
+            window,
+            text="手机打开无线调试，选择“使用二维码配对设备”后扫描此码。",
+            style="Muted.TLabel",
+            wraplength=340,
+        ).pack(anchor=tk.W, padx=16, pady=(0, 10))
+
+        image = qrcode.make(payload).resize((300, 300))
+        self.qr_pair_image = ImageTk.PhotoImage(image)
+        ttk.Label(window, image=self.qr_pair_image).pack(padx=18, pady=(0, 12))
+        ttk.Button(window, text="关闭", command=window.destroy, style="Quiet.TButton").pack(pady=(0, 14))
+
+        self.qr_pair_window = window
+        return True
 
     def disconnect_device(self) -> None:
         address = self.connect_addr_var.get().strip() or None
