@@ -387,6 +387,8 @@ adb executable
 
 无线设备 IP／端口变化后的自动重连设计：[PRD](./doc/wireless-auto-reconnect/prd.md) · [技术方案](./doc/wireless-auto-reconnect/technical-design.md)（设计稿，尚未实现）。
 
+无线调试扫码后一直显示“正在配对设备”时，参见 [Android 无线调试配对卡住排查](./docs/troubleshooting/android-wireless-debugging-pairing-stuck.md)。
+
 ## 开发和测试
 
 运行单元测试：
