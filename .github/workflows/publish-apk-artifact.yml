@@ -45,14 +45,20 @@ jobs:
           mkdir -p "$artifact_root"
 
           run_ids=()
+          explicit_run_id=false
           if [ "$EVENT_NAME" = "workflow_run" ]; then
             run_ids=("$WORKFLOW_RUN_ID")
           elif [ -n "$INPUT_RUN_ID" ]; then
             run_ids=("$INPUT_RUN_ID")
+            explicit_run_id=true
           else
-            mapfile -t run_ids < <(gh api \
-              "repos/$SOURCE_REPOSITORY/actions/workflows/release.yml/runs?status=success&branch=master&per_page=10" \
-              --jq '.workflow_runs[].id')
+            run_id_output="$(gh api --paginate \
+              "repos/$SOURCE_REPOSITORY/actions/workflows/release.yml/runs?status=success&per_page=100" \
+              --jq '.workflow_runs[].id')"
+            while IFS= read -r run_id; do
+              [ -n "$run_id" ] || continue
+              run_ids+=("$run_id")
+            done <<< "$run_id_output"
           fi
 
           if [ "${#run_ids[@]}" -eq 0 ] || [ -z "${run_ids[0]}" ]; then
@@ -65,12 +71,42 @@ jobs:
           selected_artifacts=()
           for run_id in "${run_ids[@]}"; do
             [ -n "$run_id" ] || continue
-            mapfile -t artifact_names < <(gh api \
-              "repos/$SOURCE_REPOSITORY/actions/runs/$run_id/artifacts" \
-              --jq '.artifacts[] | select(.expired == false and (.name | startswith("adbpilot-"))) | .name')
+            if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
+              echo "Invalid Build Release run ID: $run_id" >&2
+              if [ "$explicit_run_id" = true ]; then
+                exit 1
+              fi
+              continue
+            fi
+
+            IFS=$'\t' read -r run_name run_status run_conclusion < <(
+              gh api "repos/$SOURCE_REPOSITORY/actions/runs/$run_id" \
+                --jq '[.name, .status, .conclusion] | @tsv'
+            )
+            if [ "$run_name" != "Build Release" ] || \
+              [ "$run_status" != "completed" ] || \
+              [ "$run_conclusion" != "success" ]; then
+              echo "Run $run_id is not a successful completed Build Release run." >&2
+              if [ "$explicit_run_id" = true ]; then
+                exit 1
+              fi
+              continue
+            fi
+
+            artifact_names=()
+            artifact_name_output="$(gh api \
+              "repos/$SOURCE_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired == false and (.name | startswith("adbpilot-"))) | .name')"
+            while IFS= read -r artifact_name; do
+              [ -n "$artifact_name" ] || continue
+              artifact_names+=("$artifact_name")
+            done <<< "$artifact_name_output"
 
             if [ "${#artifact_names[@]}" -eq 0 ]; then
-              echo "Run $run_id has no non-expired adbpilot-* desktop artifact."
+              echo "Run $run_id has no non-expired adbpilot-* desktop artifact." >&2
+              if [ "$explicit_run_id" = true ]; then
+                exit 1
+              fi
               continue
             fi
 
@@ -80,6 +116,10 @@ jobs:
           done
 
           if [ -z "$selected_run_id" ]; then
+            if [ "$explicit_run_id" = true ]; then
+              echo "The requested Build Release run could not be published." >&2
+              exit 1
+            fi
             echo "No desktop artifact found; publish step will end without changes."
             echo "has_artifact=false" >> "$GITHUB_OUTPUT"
             exit 0
@@ -130,21 +170,36 @@ jobs:
         run: |
           set -euo pipefail
 
-          python - <<'PY'
+          python3 - <<'PY'
           import json
           import os
           import re
           import shutil
           from pathlib import Path
 
-          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          workspace = Path(os.environ["GITHUB_WORKSPACE"]).resolve()
           source = workspace / "source"
           artifacts = workspace / "desktop-artifacts"
-          target_site = workspace / "target-site"
+          target_site = (workspace / "target-site").resolve()
           source_run_id = os.environ["SOURCE_RUN_ID"]
           pattern = re.compile(
               r"^AdbPilot-(windows|macos)-(\d+\.\d+\.\d+)-(32|64|arm64|x86_64|universal2)\.zip$"
           )
+          allowed_systemos = {
+              "windows": {"32", "64"},
+              "macos": {"arm64", "x86_64", "universal2"},
+          }
+
+          def validate_segment(name: str, value: str, expected: str) -> None:
+              if (
+                  not value
+                  or value in {".", ".."}
+                  or ".." in value
+                  or "/" in value
+                  or "\\" in value
+                  or re.fullmatch(expected, value) is None
+              ):
+                  raise SystemExit(f"Invalid {name} path segment: {value!r}")
 
           readme_file = next(
               (
@@ -162,9 +217,39 @@ jobs:
                   raise SystemExit(f"Unsupported desktop package name: {package_file.name}")
 
               platform, version, systemos = match.groups()
-              target_path = Path("apps") / "packages" / platform / "adbPilot" / version / systemos
-              target_dir = target_site / target_path
+              app_name = "adbPilot"
+              validate_segment("platform", platform, r"windows|macos")
+              validate_segment("app name", app_name, r"[A-Za-z0-9_-]+")
+              validate_segment("version", version, r"\d+\.\d+\.\d+")
+              validate_segment("system OS", systemos, r"[A-Za-z0-9_]+")
+              if systemos not in allowed_systemos[platform]:
+                  raise SystemExit(
+                      f"Unsupported {platform} system OS in package name: {systemos}"
+                  )
+
+              packages_root = (target_site / "apps" / "packages").resolve()
+              if target_site not in packages_root.parents:
+                  raise SystemExit(
+                      f"Resolved packages root escapes target repository: {packages_root}"
+                  )
+
+              platform_root = (packages_root / platform).resolve()
+              if packages_root not in platform_root.parents:
+                  raise SystemExit(
+                      f"Resolved platform root escapes packages root: {platform_root}"
+                  )
+              if not platform_root.is_dir():
+                  raise SystemExit(
+                      f"Required target platform root does not exist: {platform_root}"
+                  )
+
+              target_dir = (platform_root / app_name / version / systemos).resolve()
+              if platform_root not in target_dir.parents:
+                  raise SystemExit(
+                      f"Resolved target path escapes platform root: {target_dir}"
+                  )
               target_dir.mkdir(parents=True, exist_ok=True)
+              target_path = target_dir.relative_to(target_site)
 
               shutil.copy2(package_file, target_dir / package_file.name)
               if readme_file:
@@ -187,8 +272,14 @@ jobs:
           if not copied_paths:
               raise SystemExit("No desktop packages copied.")
 
+          publish_paths_file = Path(os.environ["RUNNER_TEMP"]) / "adbpilot-publish-paths.txt"
+          publish_paths_file.write_text(
+              "\n".join(sorted(set(copied_paths))) + "\n",
+              encoding="utf-8",
+          )
+
           print("Copied packages to:")
-          for target_path in copied_paths:
+          for target_path in sorted(set(copied_paths)):
               print(f"- {target_path}")
           PY
 
@@ -197,13 +288,41 @@ jobs:
         working-directory: target-site
         env:
           SOURCE_RUN_ID: ${{ steps.artifact.outputs.source_run_id }}
+          PUBLISH_PATHS_FILE: ${{ runner.temp }}/adbpilot-publish-paths.txt
         run: |
           set -euo pipefail
 
           git config user.name "github-publish-actions[bot]"
           git config user.email "41898282+github-publish-actions[bot]@users.noreply.github.com"
 
-          git add apps/packages/windows/adbPilot apps/packages/macos/adbPilot
+          if [ ! -s "$PUBLISH_PATHS_FILE" ]; then
+            echo "Publish path list is missing or empty: $PUBLISH_PATHS_FILE" >&2
+            exit 1
+          fi
+
+          publish_paths=()
+          while IFS= read -r publish_path; do
+            [ -n "$publish_path" ] || continue
+            if ! [[ "$publish_path" =~ ^apps/packages/windows/adbPilot/[0-9]+\.[0-9]+\.[0-9]+/(32|64)$ ]] && \
+              ! [[ "$publish_path" =~ ^apps/packages/macos/adbPilot/[0-9]+\.[0-9]+\.[0-9]+/(arm64|x86_64|universal2)$ ]]; then
+              echo "Refusing to stage unexpected publish path: $publish_path" >&2
+              exit 1
+            fi
+
+            if [ ! -d "$publish_path" ]; then
+              echo "Publish path does not exist: $publish_path" >&2
+              exit 1
+            fi
+
+            publish_paths+=("$publish_path")
+          done < "$PUBLISH_PATHS_FILE"
+
+          if [ "${#publish_paths[@]}" -eq 0 ]; then
+            echo "Publish path list contains no usable paths." >&2
+            exit 1
+          fi
+
+          git add -- "${publish_paths[@]}"
 
           if git diff --cached --quiet; then
             echo "No package file changes to commit."
