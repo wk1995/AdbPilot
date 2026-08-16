@@ -45,14 +45,20 @@ jobs:
           mkdir -p "$artifact_root"
 
           run_ids=()
+          explicit_run_id=false
           if [ "$EVENT_NAME" = "workflow_run" ]; then
             run_ids=("$WORKFLOW_RUN_ID")
           elif [ -n "$INPUT_RUN_ID" ]; then
             run_ids=("$INPUT_RUN_ID")
+            explicit_run_id=true
           else
-            mapfile -t run_ids < <(gh api \
-              "repos/$SOURCE_REPOSITORY/actions/workflows/release.yml/runs?status=success&branch=master&per_page=10" \
-              --jq '.workflow_runs[].id')
+            run_id_output="$(gh api --paginate \
+              "repos/$SOURCE_REPOSITORY/actions/workflows/release.yml/runs?status=success&per_page=100" \
+              --jq '.workflow_runs[].id')"
+            while IFS= read -r run_id; do
+              [ -n "$run_id" ] || continue
+              run_ids+=("$run_id")
+            done <<< "$run_id_output"
           fi
 
           if [ "${#run_ids[@]}" -eq 0 ] || [ -z "${run_ids[0]}" ]; then
@@ -66,7 +72,10 @@ jobs:
           for run_id in "${run_ids[@]}"; do
             [ -n "$run_id" ] || continue
             if ! [[ "$run_id" =~ ^[0-9]+$ ]]; then
-              echo "Ignoring invalid Build Release run ID: $run_id"
+              echo "Invalid Build Release run ID: $run_id" >&2
+              if [ "$explicit_run_id" = true ]; then
+                exit 1
+              fi
               continue
             fi
 
@@ -77,16 +86,27 @@ jobs:
             if [ "$run_name" != "Build Release" ] || \
               [ "$run_status" != "completed" ] || \
               [ "$run_conclusion" != "success" ]; then
-              echo "Run $run_id is not a successful completed Build Release run."
+              echo "Run $run_id is not a successful completed Build Release run." >&2
+              if [ "$explicit_run_id" = true ]; then
+                exit 1
+              fi
               continue
             fi
 
-            mapfile -t artifact_names < <(gh api \
-              "repos/$SOURCE_REPOSITORY/actions/runs/$run_id/artifacts" \
-              --jq '.artifacts[] | select(.expired == false and (.name | startswith("adbpilot-"))) | .name')
+            artifact_names=()
+            artifact_name_output="$(gh api \
+              "repos/$SOURCE_REPOSITORY/actions/runs/$run_id/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.expired == false and (.name | startswith("adbpilot-"))) | .name')"
+            while IFS= read -r artifact_name; do
+              [ -n "$artifact_name" ] || continue
+              artifact_names+=("$artifact_name")
+            done <<< "$artifact_name_output"
 
             if [ "${#artifact_names[@]}" -eq 0 ]; then
-              echo "Run $run_id has no non-expired adbpilot-* desktop artifact."
+              echo "Run $run_id has no non-expired adbpilot-* desktop artifact." >&2
+              if [ "$explicit_run_id" = true ]; then
+                exit 1
+              fi
               continue
             fi
 
@@ -96,6 +116,10 @@ jobs:
           done
 
           if [ -z "$selected_run_id" ]; then
+            if [ "$explicit_run_id" = true ]; then
+              echo "The requested Build Release run could not be published." >&2
+              exit 1
+            fi
             echo "No desktop artifact found; publish step will end without changes."
             echo "has_artifact=false" >> "$GITHUB_OUTPUT"
             exit 0
