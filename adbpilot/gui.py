@@ -275,10 +275,11 @@ class AdbPilotGui(BaseTk):
         self._build_toolbar(root)
 
         body = ttk.Frame(root, style="App.TFrame")
-        body.pack(fill=tk.BOTH, expand=True)
         self._build_device_panel(body)
         self._build_tabs(body)
+        # Reserve feedback space before the expandable content consumes the height.
         self._build_output(root)
+        body.pack(fill=tk.BOTH, expand=True)
 
     def _build_toolbar(self, parent: ttk.Frame) -> None:
         toolbar = ttk.Frame(parent, padding=(16, 14), style="Toolbar.TFrame")
@@ -575,7 +576,7 @@ class AdbPilotGui(BaseTk):
 
     def _build_output(self, parent: ttk.Frame) -> None:
         footer = ttk.Frame(parent, padding=(14, 10), style="Surface.TFrame")
-        footer.pack(fill=tk.BOTH, pady=(12, 0))
+        footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
 
         header = ttk.Frame(footer, style="Surface.TFrame")
         header.pack(fill=tk.X)
