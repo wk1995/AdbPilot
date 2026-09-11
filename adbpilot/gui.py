@@ -286,12 +286,15 @@ class AdbPilotGui(BaseTk):
         toolbar = ttk.Frame(parent, padding=(16, 14), style="Toolbar.TFrame")
         toolbar.pack(fill=tk.X, pady=(0, 12))
 
-        title_area = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        header = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        header.pack(fill=tk.X)
+
+        title_area = ttk.Frame(header, style="Toolbar.TFrame")
         title_area.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(title_area, text="AdbPilot", style="Title.TLabel").pack(anchor=tk.W)
         ttk.Label(title_area, text="Android 设备调试、日志和文件操作工作台", style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 0))
 
-        commands = ttk.Frame(toolbar, style="CommandBar.TFrame")
+        commands = ttk.Frame(header, style="CommandBar.TFrame")
         commands.pack(side=tk.RIGHT, anchor=tk.NE)
 
         ttk.Button(commands, text="检测版本", command=self.show_version, style="Quiet.TButton").pack(side=tk.LEFT, padx=(0, 6))
@@ -303,8 +306,23 @@ class AdbPilotGui(BaseTk):
         path_row.pack(fill=tk.X, pady=(12, 0))
 
         ttk.Label(path_row, text="ADB 路径", style="Muted.TLabel").pack(side=tk.LEFT)
-        adb_entry = ttk.Entry(path_row, textvariable=self.adb_path_var, width=48)
-        adb_entry.pack(side=tk.LEFT, padx=(8, 4), fill=tk.X, expand=True)
+        # Explicit classic-entry colors keep the path readable with macOS themes.
+        adb_entry = tk.Entry(
+            path_row,
+            textvariable=self.adb_path_var,
+            width=48,
+            background=COLORS["surface"],
+            foreground=COLORS["text"],
+            insertbackground=COLORS["text"],
+            selectbackground=COLORS["accent"],
+            selectforeground="#ffffff",
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["accent"],
+        )
+        adb_entry.pack(side=tk.LEFT, padx=(8, 4), ipady=5, fill=tk.X, expand=True)
         self._register_file_drop(adb_entry, self.adb_path_var)
         ttk.Button(path_row, text="浏览", command=self._browse_adb, style="Quiet.TButton").pack(side=tk.LEFT, padx=4)
 
