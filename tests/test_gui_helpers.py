@@ -1,10 +1,13 @@
 import os
+import threading
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from adbpilot.gui import (
+    AdbPilotGui,
     device_connection_summary,
     device_connection_type,
     device_display_name,
@@ -24,6 +27,42 @@ from adbpilot.gui import (
 
 
 class GuiHelperTests(unittest.TestCase):
+    def test_device_query_waits_until_server_restart_finishes(self):
+        restart_started = threading.Event()
+        finish_restart = threading.Event()
+        query_attempted = threading.Event()
+        query_started = threading.Event()
+
+        def restart():
+            restart_started.set()
+            finish_restart.wait(2)
+
+        client = Mock()
+        client.restart_server.side_effect = restart
+        client.devices.side_effect = lambda: query_started.set() or []
+        gui = SimpleNamespace(adb_service_lock=threading.Lock(), _get_client=lambda: client)
+
+        def query():
+            query_attempted.set()
+            AdbPilotGui._read_devices(gui)
+
+        restart_thread = threading.Thread(target=AdbPilotGui._restart_adb_server, args=(gui,))
+        query_thread = threading.Thread(target=query)
+        restart_thread.start()
+        try:
+            self.assertTrue(restart_started.wait(1))
+            query_thread.start()
+            self.assertTrue(query_attempted.wait(1))
+            self.assertFalse(query_started.wait(0.1))
+        finally:
+            finish_restart.set()
+            restart_thread.join(2)
+            if query_thread.ident is not None:
+                query_thread.join(2)
+        self.assertTrue(query_started.is_set())
+        client.restart_server.assert_called_once()
+        client.devices.assert_called_once()
+
     def test_device_connection_type(self):
         self.assertEqual(device_connection_type("emulator-5554"), "USB")
         self.assertEqual(device_connection_type("5ENDU19B01011261"), "USB")

@@ -198,6 +198,7 @@ class AdbPilotGui(BaseTk):
         self.configure(bg=COLORS["app"])
 
         self.client: AdbClient | None = None
+        self.adb_service_lock = threading.Lock()
         self.devices: list[Device] = []
         self.device_rows: dict[str, dict[str, Any]] = {}
         self.device_poll_running = False
@@ -1311,7 +1312,17 @@ class AdbPilotGui(BaseTk):
         self._run_async("检测 ADB 版本", lambda: self._get_client().version())
 
     def restart_server(self) -> None:
-        self._run_async("重启 ADB 服务", lambda: self._get_client().restart_server() or "adb server 已重启")
+        self._run_async("重启 ADB 服务", self._restart_adb_server)
+
+    def _restart_adb_server(self) -> str:
+        # Device queries can auto-start ADB; keep them out of the kill/start gap.
+        with self.adb_service_lock:
+            self._get_client().restart_server()
+        return "adb server 已重启"
+
+    def _read_devices(self) -> list[Device]:
+        with self.adb_service_lock:
+            return self._get_client().devices()
 
     def refresh_devices(self) -> None:
         self.manual_refresh_in_progress = True
@@ -1320,7 +1331,7 @@ class AdbPilotGui(BaseTk):
             self.manual_refresh_in_progress = False
             self._render_devices(devices, mark_disconnected=True, noisy=True)
 
-        self._run_async("刷新设备", lambda: self._get_client().devices(), done)
+        self._run_async("刷新设备", self._read_devices, done)
 
     def _poll_devices(self) -> None:
         if self.device_poll_running:
@@ -1331,7 +1342,7 @@ class AdbPilotGui(BaseTk):
 
         def worker() -> None:
             try:
-                devices = self._get_client().devices()
+                devices = self._read_devices()
                 self.result_queue.put(("ok", "设备监听", devices, self._render_polled_devices))
             except Exception as exc:  # noqa: BLE001 - listener should surface failures but keep retrying.
                 self.result_queue.put(("err", "设备监听", exc, self._finish_device_poll))
