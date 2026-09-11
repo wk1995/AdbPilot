@@ -57,10 +57,30 @@ python -m pip install -e .
 ## Release automation
 
 Merging a pull request into `master` runs the `Build Release` workflow. It
-checks the PR file list and bumps only the platform version whose business code
-changed. Windows and macOS versions are isolated in
+compares the current `master` business files with each platform's current release
+tag, then bumps and builds only platforms with unreleased business changes.
+Windows and macOS versions are isolated in
 `packaging/windows/version.txt` and `packaging/macos/version.txt`, and release
 tags use platform prefixes such as `windows-vX.Y.Z` and `macos-vX.Y.Z`.
+
+Business files are runtime code and assets under `adbpilot/` and
+`packaging/entrypoints/`. Shared changes affect both platforms; the macOS Swift
+helper and `adbpilot/macos/` affect only macOS, and `adbpilot/windows/` affects
+only Windows. Documentation, tests, generated version modules, CI, packaging
+scripts/specs, and files outside these runtime directories do not bump versions.
+
+For a manual run, the Windows/macOS checkboxes select which packages to build.
+Each selected platform bumps only if its business files changed; otherwise it
+rebuilds with the existing version, tag, and GitHub Release. Existing release
+assets are replaced. Unselected platforms retain their versions and pending
+changes. A documentation-only merge skips both builds. A change that has been
+fully reverted since the release also does not bump the version.
+
+Release runs are serialized to avoid competing version updates. If a platform's
+current tag is missing, the last commit changing its `version.txt` is the
+comparison baseline. This supports an initial release and a manual retry after
+a run committed a version but failed before tagging. A manual run can also
+rebuild missing assets after a packaging failure without another version bump.
 
 After packaging succeeds, `Publish Desktop Artifact` copies the release archives
 and README into `wk1995/wk1995.github.io` under these platform paths:
