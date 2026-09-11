@@ -607,16 +607,18 @@ class AdbPilotGui(BaseTk):
         self.output.pack(fill=tk.BOTH, expand=False, pady=(4, 0))
 
     def _browse_adb(self) -> None:
+        options: dict[str, Any] = {"parent": self, "title": "选择 adb"}
         if platform.system().lower() == "windows":
-            title = "选择 adb.exe"
-            filetypes = [("ADB", "adb.exe"), ("所有文件", "*.*")]
-        else:
-            title = "选择 adb"
-            filetypes = [("ADB", "adb"), ("所有文件", "*")]
+            options.update(title="选择 adb.exe", filetypes=[("ADB", "*.exe"), ("所有文件", "*.*")])
+        # Extensionless filters can abort inside macOS Tk's native file dialog.
+        # Omit filetypes on Unix so executables such as adb remain selectable.
         try:
-            path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+            path = filedialog.askopenfilename(**options)
         except tk.TclError:
-            path = filedialog.askopenfilename(title=title)
+            if "filetypes" not in options:
+                raise
+            options.pop("filetypes")
+            path = filedialog.askopenfilename(**options)
         if path:
             self.adb_path_var.set(path)
             self._remember_adb_path(path)

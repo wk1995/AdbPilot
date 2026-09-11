@@ -1,5 +1,6 @@
 import os
 import threading
+import tkinter as tk
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,6 +28,46 @@ from adbpilot.gui import (
 
 
 class GuiHelperTests(unittest.TestCase):
+    def test_adb_browser_omits_extensionless_filter_on_unix(self):
+        for system in ("Darwin", "Linux"):
+            with self.subTest(system=system):
+                gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
+                with patch("adbpilot.gui.platform.system", return_value=system), patch(
+                    "adbpilot.gui.filedialog.askopenfilename", return_value="/sdk/platform-tools/adb"
+                ) as dialog:
+                    AdbPilotGui._browse_adb(gui)
+                dialog.assert_called_once_with(parent=gui, title="选择 adb")
+                gui.adb_path_var.set.assert_called_once_with("/sdk/platform-tools/adb")
+                gui._remember_adb_path.assert_called_once_with("/sdk/platform-tools/adb")
+
+    def test_adb_browser_cancel_preserves_path(self):
+        gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
+        with patch("adbpilot.gui.platform.system", return_value="Darwin"), patch(
+            "adbpilot.gui.filedialog.askopenfilename", return_value=""
+        ):
+            AdbPilotGui._browse_adb(gui)
+        gui.adb_path_var.set.assert_not_called()
+        gui._remember_adb_path.assert_not_called()
+
+    def test_windows_adb_browser_filters_executables(self):
+        gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
+        with patch("adbpilot.gui.platform.system", return_value="Windows"), patch(
+            "adbpilot.gui.filedialog.askopenfilename", return_value=""
+        ) as dialog:
+            AdbPilotGui._browse_adb(gui)
+        dialog.assert_called_once_with(
+            parent=gui, title="选择 adb.exe", filetypes=[("ADB", "*.exe"), ("所有文件", "*.*")]
+        )
+
+    def test_windows_adb_browser_retries_without_filter_on_tcl_error(self):
+        gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
+        with patch("adbpilot.gui.platform.system", return_value="Windows"), patch(
+            "adbpilot.gui.filedialog.askopenfilename", side_effect=[tk.TclError("filter error"), ""]
+        ) as dialog:
+            AdbPilotGui._browse_adb(gui)
+        self.assertEqual(dialog.call_count, 2)
+        self.assertEqual(dialog.call_args.kwargs, {"parent": gui, "title": "选择 adb.exe"})
+
     def test_device_query_waits_until_server_restart_finishes(self):
         restart_started = threading.Event()
         finish_restart = threading.Event()
