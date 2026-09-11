@@ -58,7 +58,8 @@ python -m pip install -e .
 
 Merging a pull request into `master` runs the `Build Release` workflow. It
 compares the current `master` business files with each platform's current release
-tag, then bumps and builds only platforms with unreleased business changes.
+tag, then bumps only platforms with unreleased business changes. It also resumes
+incomplete platform releases without bumping their versions again.
 Windows and macOS versions are isolated in
 `packaging/windows/version.txt` and `packaging/macos/version.txt`, and release
 tags use platform prefixes such as `windows-vX.Y.Z` and `macos-vX.Y.Z`.
@@ -73,14 +74,31 @@ For a manual run, the Windows/macOS checkboxes select which packages to build.
 Each selected platform bumps only if its business files changed; otherwise it
 rebuilds with the existing version, tag, and GitHub Release. Existing release
 assets are replaced. Unselected platforms retain their versions and pending
-changes. A documentation-only merge skips both builds. A change that has been
-fully reverted since the release also does not bump the version.
+changes. A documentation-only merge skips builds when the current releases are
+complete. A change that has been fully reverted since the release also does not
+bump the version.
 
-Release runs are serialized to avoid competing version updates. If a platform's
+Release runs are serialized with `queue: max`, retaining up to 100 pending runs
+instead of replacing an earlier request with a later platform selection. If a platform's
 current tag is missing, the last commit changing its `version.txt` is the
-comparison baseline. This supports an initial release and a manual retry after
-a run committed a version but failed before tagging. A manual run can also
-rebuild missing assets after a packaging failure without another version bump.
+comparison baseline. This supports an initial release and retries after a run
+committed a version but failed before tagging.
+
+A platform is complete only when both architecture ZIPs and its
+`AdbPilot-<platform>-<version>-complete.json` marker exist as nonempty uploaded
+Release assets. The marker is written after both architectures finish uploading
+their Release assets and Actions artifacts; it records the source commit and
+workflow run. Automatic retries (including **Re-run all jobs**) and later merges
+recover missing tags, Releases, packages, or markers using the current version
+when its business code has not changed. Actions artifacts can be replaced during
+a retry of the same run. API errors other than a missing Release stop resolution.
+Existing releases created before completion markers were introduced are rebuilt
+once at their existing version if their business code has not changed.
+
+A version bump must target a new tag. If a version rollback would reuse a tag,
+the workflow fails before committing or uploading; an existing tag may be reused
+only for a rebuild with matching platform business code. Tags are checked again
+after fetching, before the version commit.
 
 After packaging succeeds, `Publish Desktop Artifact` copies the release archives
 and README into `wk1995/wk1995.github.io` under these platform paths:
