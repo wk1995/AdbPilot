@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,7 +13,10 @@ SCRIPTS = ROOT / "packaging" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 try:
     from bump_version import sync_version
-    from resolve_release import is_business_file, resolve_release
+    from resolve_release import is_business_file, resolve_release, validate_release_tag
+    from release_status import (
+        github_release_complete, mark_complete, marker_name, package_names,
+    )
 finally:
     sys.path.pop(0)
 
@@ -33,6 +37,7 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.commit()
         for platform in ("windows", "macos"):
             self.git("tag", self.tag(platform))
+        self.complete_tags = {self.tag(platform) for platform in ("windows", "macos")}
 
     def git(self, *args):
         return subprocess.run(
@@ -55,7 +60,10 @@ class ReleaseResolutionTests(unittest.TestCase):
     def resolve(self, event="workflow_dispatch", selected=None):
         if selected is None:
             selected = {"windows", "macos"}
-        return resolve_release(event, selected, self.root)
+        return resolve_release(
+            event, selected, self.root,
+            lambda platform, version: f"{platform}-v{version}" in self.complete_tags,
+        )
 
     def test_manual_rebuild_uses_existing_versions(self):
         result = self.resolve()
@@ -118,6 +126,7 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.commit()
         for platform in ("windows", "macos"):
             self.git("tag", self.tag(platform))
+            self.complete_tags.add(self.tag(platform))
         repeated = self.resolve()
         for platform in ("windows", "macos"):
             self.assertEqual(repeated[f"{platform}_version"], result[f"{platform}_version"])
@@ -202,6 +211,148 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertFalse(is_business_file("adbpilot/__pycache__/gui.pyc", "windows"))
         with self.assertRaises(ValueError):
             is_business_file("adbpilot/gui.py", "linux")
+
+    def test_automatic_retry_recovers_committed_version_before_tagging(self):
+        self.write("adbpilot/gui.py", "changed\n")
+        self.commit()
+        first = self.resolve("pull_request_target")
+        for platform in ("windows", "macos"):
+            sync_version(platform, first[f"{platform}_version"], self.root)
+        self.commit()
+        retried = self.resolve("pull_request_target")
+        for platform in ("windows", "macos"):
+            self.assertEqual(retried[f"{platform}_version"], first[f"{platform}_version"])
+            self.assertEqual(retried[f"{platform}_bump"], "false")
+            self.assertEqual(retried[f"{platform}_build"], "true")
+
+    def test_automatic_retry_builds_only_incomplete_platform(self):
+        self.write("adbpilot/gui.py", "changed\n")
+        self.commit()
+        first = self.resolve("pull_request_target")
+        for platform in ("windows", "macos"):
+            sync_version(platform, first[f"{platform}_version"], self.root)
+        self.commit()
+        for platform in ("windows", "macos"):
+            self.git("tag", self.tag(platform))
+        self.complete_tags.add(self.tag("windows"))
+        retried = self.resolve("pull_request_target")
+        self.assertEqual(retried["windows_build"], "false")
+        self.assertEqual(retried["macos_build"], "true")
+        self.assertEqual(retried["macos_bump"], "false")
+        self.assertEqual(retried["macos_version"], first["macos_version"])
+
+    def test_version_rollback_cannot_overwrite_existing_release_tag(self):
+        self.write("adbpilot/gui.py", "release A\n")
+        self.commit()
+        first = self.resolve(selected={"windows"})
+        sync_version("windows", first["windows_version"], self.root)
+        self.commit()
+        self.git("tag", self.tag("windows"))
+        sync_version("windows", "0.0.3", self.root)
+        self.write("adbpilot/gui.py", "release B\n")
+        self.commit()
+        with self.assertRaisesRegex(RuntimeError, "already exists"):
+            self.resolve(selected={"windows"})
+        completed = subprocess.run(
+            [sys.executable, str(self.root / "packaging/scripts/resolve_release.py"),
+             "--event", "workflow_dispatch", "--windows", "true", "--apply"],
+            cwd=self.root, capture_output=True, text=True,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("already exists", completed.stderr)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_tag_recheck_rejects_collision_created_after_planning(self):
+        self.write("adbpilot/gui.py", "changed\n")
+        self.commit()
+        result = self.resolve(selected={"windows"})
+        sync_version("windows", result["windows_version"], self.root)
+        self.git("tag", result["windows_tag"])
+        completed = subprocess.run(
+            [sys.executable, str(self.root / "packaging/scripts/resolve_release.py"), "--validate-tags"],
+            cwd=self.root, capture_output=True, text=True,
+            env={**os.environ, "WINDOWS_BUILD": "true", "WINDOWS_BUMP": "true", "MACOS_BUILD": "false"},
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("already exists", completed.stderr)
+
+    def test_existing_tag_reuse_requires_matching_business_code(self):
+        validate_release_tag("windows", "0.0.3", False, self.root)
+        self.write("adbpilot/gui.py", "changed\n")
+        self.commit()
+        with self.assertRaisesRegex(RuntimeError, "business code differs"):
+            validate_release_tag("windows", "0.0.3", False, self.root)
+
+
+class ReleaseStatusTests(unittest.TestCase):
+    def release(self, platform="windows", version="0.0.3", complete=True):
+        names = package_names(platform, version)
+        if complete:
+            names.add(marker_name(platform, version))
+        return {"draft": False, "assets": [
+            {"name": name, "state": "uploaded", "size": 123} for name in names
+        ]}
+
+    def test_missing_release_and_partial_uploads_require_recovery(self):
+        complete = self.release()
+        cases = [None, {"assets": []}, self.release(complete=False)]
+        for asset in complete["assets"]:
+            cases.append({"assets": [item for item in complete["assets"] if item != asset]})
+            cases.append({"assets": [
+                {**item, "size": 0} if item == asset else item for item in complete["assets"]
+            ]})
+            cases.append({"assets": [
+                {**item, "state": "starter"} if item == asset else item for item in complete["assets"]
+            ]})
+        cases.append({**complete, "draft": True})
+        for release in cases:
+            with self.subTest(release=release), patch("release_status.get_release", return_value=release):
+                self.assertFalse(github_release_complete("windows", "0.0.3"))
+
+    def test_both_architectures_and_marker_are_required_for_each_platform(self):
+        for platform in ("windows", "macos"):
+            with self.subTest(platform=platform), patch("release_status.get_release", return_value=self.release(platform)):
+                self.assertTrue(github_release_complete(platform, "0.0.3"))
+                self.assertFalse(github_release_complete(platform, "0.0.4"))
+
+    def test_only_http_404_is_treated_as_missing(self):
+        with patch.dict(os.environ, {"GH_REPO": "example/repo"}):
+            for status in ("404", "403", "500"):
+                response = subprocess.CompletedProcess([], 1, '{"status": "' + status + '"}', 'API error')
+                with self.subTest(status=status), patch("release_status.subprocess.run", return_value=response):
+                    if status == "404":
+                        self.assertFalse(github_release_complete("windows", "0.0.3"))
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "Cannot inspect"):
+                            github_release_complete("windows", "0.0.3")
+            response = subprocess.CompletedProcess([], 1, "", "Network error")
+            with patch("release_status.subprocess.run", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, "Network error"):
+                    github_release_complete("windows", "0.0.3")
+
+    def test_completion_marker_is_not_uploaded_if_packages_are_missing(self):
+        with patch("release_status.get_release", return_value=None), patch("release_status.subprocess.run") as run:
+            with self.assertRaisesRegex(RuntimeError, "packages are missing"):
+                mark_complete("windows", "0.0.3", "abc123")
+            run.assert_not_called()
+
+    def test_completion_marker_records_source_and_run(self):
+        import json
+
+        def upload(command, **kwargs):
+            self.assertEqual(command[:4], ["gh", "release", "upload", "windows-v0.0.3"])
+            marker = json.loads(Path(command[4]).read_text())
+            self.assertEqual(marker["source_sha"], "abc123")
+            self.assertEqual(marker["run_id"], "24")
+            self.assertEqual(marker["run_attempt"], "2")
+            self.assertEqual(set(marker["packages"]), package_names("windows", "0.0.3"))
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("release_status.get_release", return_value=self.release(complete=False)), patch(
+            "release_status.subprocess.run", side_effect=upload,
+        ) as run, patch.dict(os.environ, {"GH_REPO": "example/repo", "GITHUB_RUN_ID": "24", "GITHUB_RUN_ATTEMPT": "2"}):
+            mark_complete("windows", "0.0.3", "abc123")
+            run.assert_called_once()
 
 
 if __name__ == "__main__":

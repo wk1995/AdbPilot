@@ -6,8 +6,10 @@ import argparse
 import os
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from bump_version import PLATFORMS, ROOT, bump_patch, read_version, sync_version
+from release_status import github_release_complete
 
 
 def git(root: Path, *args: str) -> str:
@@ -36,18 +38,40 @@ def is_business_file(path: str, platform: str) -> bool:
     return True
 
 
-def release_baseline(platform: str, root: Path) -> str:
-    tag = f"refs/tags/{platform}-v{read_version(platform, root)}"
+def tag_exists(platform: str, version: str, root: Path) -> bool:
+    tag = f"refs/tags/{platform}-v{version}"
     exists = subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", tag], cwd=root, check=False,
     )
-    if exists.returncode == 0:
+    if exists.returncode not in (0, 1):
+        raise RuntimeError(f"Cannot check release tag: {tag}")
+    return exists.returncode == 0
+
+
+def business_changed(platform: str, baseline: str, root: Path) -> bool:
+    # Renames out of the business tree must count as deletions.
+    paths = git(root, "diff", "--name-only", "--no-renames", "-z", baseline, "HEAD").split("\0")
+    return any(is_business_file(path, platform) for path in paths if path)
+
+
+def validate_release_tag(platform: str, version: str, bump: bool, root: Path = ROOT) -> None:
+    if not tag_exists(platform, version, root):
+        return
+    tag = f"refs/tags/{platform}-v{version}"
+    if bump:
+        raise RuntimeError(f"Refusing version bump: release tag {tag} already exists")
+    if business_changed(platform, tag, root):
+        raise RuntimeError(f"Refusing to reuse {tag}: business code differs from HEAD")
+
+
+def release_baseline(platform: str, root: Path) -> str:
+    version = read_version(platform, root)
+    tag = f"refs/tags/{platform}-v{version}"
+    if tag_exists(platform, version, root):
         baseline = git(root, "rev-parse", f"{tag}^{{commit}}")
         # A tag from a different history must never silently suppress a bump.
         git(root, "merge-base", "--is-ancestor", baseline, "HEAD")
         return baseline
-    if exists.returncode != 1:
-        raise RuntimeError(f"Cannot check release tag: {tag}")
 
     # Recover a run interrupted after committing the version but before tagging.
     # Also provides the baseline for a platform that has no release tag yet.
@@ -57,7 +81,10 @@ def release_baseline(platform: str, root: Path) -> str:
     return baseline
 
 
-def resolve_release(event: str, selected: set[str], root: Path = ROOT) -> dict[str, str]:
+def resolve_release(
+    event: str, selected: set[str], root: Path = ROOT,
+    release_complete: Callable[[str, str], bool] = github_release_complete,
+) -> dict[str, str]:
     if event not in {"workflow_dispatch", "pull_request_target"}:
         raise ValueError(f"Unsupported release event: {event}")
     if not selected.issubset(PLATFORMS):
@@ -67,15 +94,19 @@ def resolve_release(event: str, selected: set[str], root: Path = ROOT) -> dict[s
     for platform in PLATFORMS:
         version = read_version(platform, root)
         changed = False
+        build = False
         if event != "workflow_dispatch" or platform in selected:
             baseline = release_baseline(platform, root)
-            # Disable rename detection so moving code out of the business tree
-            # still counts as a deletion, including paths containing newlines.
-            paths = git(root, "diff", "--name-only", "--no-renames", "-z", baseline, "HEAD").split("\0")
-            changed = any(is_business_file(path, platform) for path in paths if path)
-        build = platform in selected if event == "workflow_dispatch" else changed
+            changed = business_changed(platform, baseline, root)
+            build = (
+                event == "workflow_dispatch" or changed
+                or not tag_exists(platform, version, root)
+                or not release_complete(platform, version)
+            )
         if changed:
             version = bump_patch(version)
+        if build:
+            validate_release_tag(platform, version, changed, root)
         outputs[f"{platform}_build"] = str(build).lower()
         outputs[f"{platform}_bump"] = str(changed).lower()
         outputs[f"{platform}_version"] = version
@@ -85,11 +116,22 @@ def resolve_release(event: str, selected: set[str], root: Path = ROOT) -> dict[s
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--event", required=True, choices=("workflow_dispatch", "pull_request_target"))
+    parser.add_argument("--event", choices=("workflow_dispatch", "pull_request_target"))
     parser.add_argument("--windows", choices=("true", "false"), default="false")
     parser.add_argument("--macos", choices=("true", "false"), default="false")
     parser.add_argument("--apply", action="store_true", help="Apply the resolved version changes.")
+    parser.add_argument("--validate-tags", action="store_true", help="Recheck planned tags after fetching.")
     args = parser.parse_args()
+    if args.validate_tags:
+        for platform in PLATFORMS:
+            if os.environ[f"{platform.upper()}_BUILD"] == "true":
+                validate_release_tag(
+                    platform, read_version(platform),
+                    os.environ[f"{platform.upper()}_BUMP"] == "true",
+                )
+        return 0
+    if args.event is None:
+        parser.error("--event is required unless --validate-tags is used")
     selected = {platform for platform in PLATFORMS if getattr(args, platform) == "true"}
     outputs = resolve_release(args.event, selected)
     if args.apply:

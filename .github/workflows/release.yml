@@ -28,6 +28,7 @@ permissions:
 concurrency:
   group: desktop-release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   version:
@@ -57,6 +58,8 @@ jobs:
       - name: Resolve builds and apply business code version changes
         id: resolve
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           INPUT_WINDOWS: ${{ github.event.inputs.windows || 'false' }}
           INPUT_MACOS: ${{ github.event.inputs.macos || 'false' }}
@@ -74,6 +77,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           WINDOWS_BUILD: ${{ steps.resolve.outputs.windows_build }}
           MACOS_BUILD: ${{ steps.resolve.outputs.macos_build }}
+          WINDOWS_BUMP: ${{ steps.resolve.outputs.windows_bump }}
+          MACOS_BUMP: ${{ steps.resolve.outputs.macos_bump }}
         run: |
           set -euo pipefail
 
@@ -81,6 +86,7 @@ jobs:
           macos_version="$(tr -d '[:space:]' < packaging/macos/version.txt)"
 
           git fetch --tags
+          python packaging/scripts/resolve_release.py --validate-tags
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add readme.md packaging/windows/version.txt packaging/windows/README.md \
@@ -183,6 +189,7 @@ jobs:
         with:
           name: adbpilot-windows-${{ needs.version.outputs.windows_version }}-${{ matrix.systemos }}
           path: AdbPilot-windows-${{ needs.version.outputs.windows_version }}-${{ matrix.systemos }}.zip
+          overwrite: true
 
   build-macos:
     name: Build macOS ${{ matrix.arch }}
@@ -244,3 +251,42 @@ jobs:
         with:
           name: adbpilot-macos-${{ needs.version.outputs.macos_version }}-${{ matrix.arch }}
           path: AdbPilot-macos-${{ needs.version.outputs.macos_version }}-${{ matrix.arch }}.zip
+          overwrite: true
+
+  complete:
+    name: Mark completed platform releases
+    runs-on: ubuntu-latest
+    needs: [version, build-windows, build-macos]
+    if: >-
+      always() && needs.version.result == 'success' &&
+      (needs.build-windows.result == 'success' || needs.build-macos.result == 'success')
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_SHA: ${{ needs.version.outputs.release_sha }}
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.release_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Mark Windows uploads complete
+        if: needs.build-windows.result == 'success'
+        env:
+          VERSION: ${{ needs.version.outputs.windows_version }}
+        run: >-
+          python packaging/scripts/release_status.py
+          --platform windows --version "$VERSION" --source-sha "$RELEASE_SHA"
+
+      - name: Mark macOS uploads complete
+        if: needs.build-macos.result == 'success'
+        env:
+          VERSION: ${{ needs.version.outputs.macos_version }}
+        run: >-
+          python packaging/scripts/release_status.py
+          --platform macos --version "$VERSION" --source-sha "$RELEASE_SHA"
