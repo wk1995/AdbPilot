@@ -1,10 +1,14 @@
 import os
+import threading
+import tkinter as tk
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from adbpilot.gui import (
+    AdbPilotGui,
     device_connection_summary,
     device_connection_type,
     device_display_name,
@@ -24,6 +28,82 @@ from adbpilot.gui import (
 
 
 class GuiHelperTests(unittest.TestCase):
+    def test_adb_browser_omits_extensionless_filter_on_unix(self):
+        for system in ("Darwin", "Linux"):
+            with self.subTest(system=system):
+                gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
+                with patch("adbpilot.gui.platform.system", return_value=system), patch(
+                    "adbpilot.gui.filedialog.askopenfilename", return_value="/sdk/platform-tools/adb"
+                ) as dialog:
+                    AdbPilotGui._browse_adb(gui)
+                dialog.assert_called_once_with(parent=gui, title="选择 adb")
+                gui.adb_path_var.set.assert_called_once_with("/sdk/platform-tools/adb")
+                gui._remember_adb_path.assert_called_once_with("/sdk/platform-tools/adb")
+
+    def test_adb_browser_cancel_preserves_path(self):
+        gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
+        with patch("adbpilot.gui.platform.system", return_value="Darwin"), patch(
+            "adbpilot.gui.filedialog.askopenfilename", return_value=""
+        ):
+            AdbPilotGui._browse_adb(gui)
+        gui.adb_path_var.set.assert_not_called()
+        gui._remember_adb_path.assert_not_called()
+
+    def test_windows_adb_browser_filters_executables(self):
+        gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
+        with patch("adbpilot.gui.platform.system", return_value="Windows"), patch(
+            "adbpilot.gui.filedialog.askopenfilename", return_value=""
+        ) as dialog:
+            AdbPilotGui._browse_adb(gui)
+        dialog.assert_called_once_with(
+            parent=gui, title="选择 adb.exe", filetypes=[("ADB", "*.exe"), ("所有文件", "*.*")]
+        )
+
+    def test_windows_adb_browser_retries_without_filter_on_tcl_error(self):
+        gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
+        with patch("adbpilot.gui.platform.system", return_value="Windows"), patch(
+            "adbpilot.gui.filedialog.askopenfilename", side_effect=[tk.TclError("filter error"), ""]
+        ) as dialog:
+            AdbPilotGui._browse_adb(gui)
+        self.assertEqual(dialog.call_count, 2)
+        self.assertEqual(dialog.call_args.kwargs, {"parent": gui, "title": "选择 adb.exe"})
+
+    def test_device_query_waits_until_server_restart_finishes(self):
+        restart_started = threading.Event()
+        finish_restart = threading.Event()
+        query_attempted = threading.Event()
+        query_started = threading.Event()
+
+        def restart():
+            restart_started.set()
+            finish_restart.wait(2)
+
+        client = Mock()
+        client.restart_server.side_effect = restart
+        client.devices.side_effect = lambda: query_started.set() or []
+        gui = SimpleNamespace(adb_service_lock=threading.Lock(), _get_client=lambda: client)
+
+        def query():
+            query_attempted.set()
+            AdbPilotGui._read_devices(gui)
+
+        restart_thread = threading.Thread(target=AdbPilotGui._restart_adb_server, args=(gui,))
+        query_thread = threading.Thread(target=query)
+        restart_thread.start()
+        try:
+            self.assertTrue(restart_started.wait(1))
+            query_thread.start()
+            self.assertTrue(query_attempted.wait(1))
+            self.assertFalse(query_started.wait(0.1))
+        finally:
+            finish_restart.set()
+            restart_thread.join(2)
+            if query_thread.ident is not None:
+                query_thread.join(2)
+        self.assertTrue(query_started.is_set())
+        client.restart_server.assert_called_once()
+        client.devices.assert_called_once()
+
     def test_device_connection_type(self):
         self.assertEqual(device_connection_type("emulator-5554"), "USB")
         self.assertEqual(device_connection_type("5ENDU19B01011261"), "USB")

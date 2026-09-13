@@ -198,6 +198,7 @@ class AdbPilotGui(BaseTk):
         self.configure(bg=COLORS["app"])
 
         self.client: AdbClient | None = None
+        self.adb_service_lock = threading.Lock()
         self.devices: list[Device] = []
         self.device_rows: dict[str, dict[str, Any]] = {}
         self.device_poll_running = False
@@ -275,21 +276,25 @@ class AdbPilotGui(BaseTk):
         self._build_toolbar(root)
 
         body = ttk.Frame(root, style="App.TFrame")
-        body.pack(fill=tk.BOTH, expand=True)
         self._build_device_panel(body)
         self._build_tabs(body)
+        # Reserve feedback space before the expandable content consumes the height.
         self._build_output(root)
+        body.pack(fill=tk.BOTH, expand=True)
 
     def _build_toolbar(self, parent: ttk.Frame) -> None:
         toolbar = ttk.Frame(parent, padding=(16, 14), style="Toolbar.TFrame")
         toolbar.pack(fill=tk.X, pady=(0, 12))
 
-        title_area = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        header = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        header.pack(fill=tk.X)
+
+        title_area = ttk.Frame(header, style="Toolbar.TFrame")
         title_area.pack(side=tk.LEFT, fill=tk.X, expand=True)
         ttk.Label(title_area, text="AdbPilot", style="Title.TLabel").pack(anchor=tk.W)
         ttk.Label(title_area, text="Android 设备调试、日志和文件操作工作台", style="Muted.TLabel").pack(anchor=tk.W, pady=(2, 0))
 
-        commands = ttk.Frame(toolbar, style="CommandBar.TFrame")
+        commands = ttk.Frame(header, style="CommandBar.TFrame")
         commands.pack(side=tk.RIGHT, anchor=tk.NE)
 
         ttk.Button(commands, text="检测版本", command=self.show_version, style="Quiet.TButton").pack(side=tk.LEFT, padx=(0, 6))
@@ -301,8 +306,23 @@ class AdbPilotGui(BaseTk):
         path_row.pack(fill=tk.X, pady=(12, 0))
 
         ttk.Label(path_row, text="ADB 路径", style="Muted.TLabel").pack(side=tk.LEFT)
-        adb_entry = ttk.Entry(path_row, textvariable=self.adb_path_var, width=48)
-        adb_entry.pack(side=tk.LEFT, padx=(8, 4), fill=tk.X, expand=True)
+        # Explicit classic-entry colors keep the path readable with macOS themes.
+        adb_entry = tk.Entry(
+            path_row,
+            textvariable=self.adb_path_var,
+            width=48,
+            background=COLORS["surface"],
+            foreground=COLORS["text"],
+            insertbackground=COLORS["text"],
+            selectbackground=COLORS["accent"],
+            selectforeground="#ffffff",
+            relief=tk.FLAT,
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["accent"],
+        )
+        adb_entry.pack(side=tk.LEFT, padx=(8, 4), ipady=5, fill=tk.X, expand=True)
         self._register_file_drop(adb_entry, self.adb_path_var)
         ttk.Button(path_row, text="浏览", command=self._browse_adb, style="Quiet.TButton").pack(side=tk.LEFT, padx=4)
 
@@ -575,7 +595,7 @@ class AdbPilotGui(BaseTk):
 
     def _build_output(self, parent: ttk.Frame) -> None:
         footer = ttk.Frame(parent, padding=(14, 10), style="Surface.TFrame")
-        footer.pack(fill=tk.BOTH, pady=(12, 0))
+        footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
 
         header = ttk.Frame(footer, style="Surface.TFrame")
         header.pack(fill=tk.X)
@@ -587,16 +607,18 @@ class AdbPilotGui(BaseTk):
         self.output.pack(fill=tk.BOTH, expand=False, pady=(4, 0))
 
     def _browse_adb(self) -> None:
+        options: dict[str, Any] = {"parent": self, "title": "选择 adb"}
         if platform.system().lower() == "windows":
-            title = "选择 adb.exe"
-            filetypes = [("ADB", "adb.exe"), ("所有文件", "*.*")]
-        else:
-            title = "选择 adb"
-            filetypes = [("ADB", "adb"), ("所有文件", "*")]
+            options.update(title="选择 adb.exe", filetypes=[("ADB", "*.exe"), ("所有文件", "*.*")])
+        # Extensionless filters can abort inside macOS Tk's native file dialog.
+        # Omit filetypes on Unix so executables such as adb remain selectable.
         try:
-            path = filedialog.askopenfilename(title=title, filetypes=filetypes)
+            path = filedialog.askopenfilename(**options)
         except tk.TclError:
-            path = filedialog.askopenfilename(title=title)
+            if "filetypes" not in options:
+                raise
+            options.pop("filetypes")
+            path = filedialog.askopenfilename(**options)
         if path:
             self.adb_path_var.set(path)
             self._remember_adb_path(path)
@@ -1310,7 +1332,17 @@ class AdbPilotGui(BaseTk):
         self._run_async("检测 ADB 版本", lambda: self._get_client().version())
 
     def restart_server(self) -> None:
-        self._run_async("重启 ADB 服务", lambda: self._get_client().restart_server() or "adb server 已重启")
+        self._run_async("重启 ADB 服务", self._restart_adb_server)
+
+    def _restart_adb_server(self) -> str:
+        # Device queries can auto-start ADB; keep them out of the kill/start gap.
+        with self.adb_service_lock:
+            self._get_client().restart_server()
+        return "adb server 已重启"
+
+    def _read_devices(self) -> list[Device]:
+        with self.adb_service_lock:
+            return self._get_client().devices()
 
     def refresh_devices(self) -> None:
         self.manual_refresh_in_progress = True
@@ -1319,7 +1351,7 @@ class AdbPilotGui(BaseTk):
             self.manual_refresh_in_progress = False
             self._render_devices(devices, mark_disconnected=True, noisy=True)
 
-        self._run_async("刷新设备", lambda: self._get_client().devices(), done)
+        self._run_async("刷新设备", self._read_devices, done)
 
     def _poll_devices(self) -> None:
         if self.device_poll_running:
@@ -1330,7 +1362,7 @@ class AdbPilotGui(BaseTk):
 
         def worker() -> None:
             try:
-                devices = self._get_client().devices()
+                devices = self._read_devices()
                 self.result_queue.put(("ok", "设备监听", devices, self._render_polled_devices))
             except Exception as exc:  # noqa: BLE001 - listener should surface failures but keep retrying.
                 self.result_queue.put(("err", "设备监听", exc, self._finish_device_poll))
