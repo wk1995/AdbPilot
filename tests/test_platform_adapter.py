@@ -59,7 +59,8 @@ class PlatformAdapterTests(unittest.TestCase):
 
             adapter = PlatformAdapter(env={"SHELL": str(shell)})
             completed = subprocess.CompletedProcess([str(shell), "-lc", "command -v adb"], 0, stdout=f"{adb}\n", stderr="")
-            with patch("adbpilot.platform_adapter.platform.system", return_value="Darwin"), patch(
+            # This exercises the shell fallback, regardless of ADB installations on the host.
+            with patch.object(adapter, "_candidate_paths", return_value=[]), patch(
                 "adbpilot.platform_adapter.shutil.which", return_value=None
             ), patch("adbpilot.platform_adapter.subprocess.run", return_value=completed):
                 adapter.system = "darwin"
