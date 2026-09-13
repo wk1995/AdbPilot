@@ -338,7 +338,17 @@ class AdbClient:
         return self.run(["shell", *command], serial=target, timeout=120).stdout
 
     def connect(self, address: str) -> str:
-        return self.run(["connect", address], timeout=60).stdout.strip()
+        result = self.run(["connect", address])
+        output = result.stdout.strip()
+        # adb can report connection failures on stdout with exit status 0.
+        if not output.lower().startswith(("connected to ", "already connected to ")):
+            raise AdbCommandError(
+                output or result.stderr.strip() or "ADB 未返回连接成功信息",
+                result.returncode,
+                result.stdout,
+                result.stderr,
+            )
+        return output
 
     def disconnect(self, address: str | None = None) -> str:
         args = ["disconnect"]

@@ -336,6 +336,19 @@ class AdbPilotGui(BaseTk):
         panel.pack_propagate(False)
         panel.configure(width=360)
 
+        # The device controls are taller than the minimum window once the
+        # output footer is reserved. Keep them reachable with a small window.
+        viewport = tk.Canvas(panel, highlightthickness=0, bd=0, background=COLORS["surface"])
+        scrollbar = ttk.Scrollbar(panel, orient=tk.VERTICAL, command=viewport.yview)
+        viewport.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        viewport.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        content = ttk.Frame(viewport, style="Sidebar.TFrame")
+        window_id = viewport.create_window((0, 0), window=content, anchor=tk.NW)
+        content.bind("<Configure>", lambda _event: viewport.configure(scrollregion=viewport.bbox("all")))
+        viewport.bind("<Configure>", lambda event: viewport.itemconfigure(window_id, width=event.width))
+        panel = content
+
         header = ttk.Frame(panel, style="Sidebar.TFrame")
         header.pack(fill=tk.X, pady=(0, 10))
         ttk.Label(header, text="设备中心", style="Header.TLabel").pack(side=tk.LEFT)
@@ -379,11 +392,16 @@ class AdbPilotGui(BaseTk):
         wireless = ttk.LabelFrame(side, text="无线调试")
         wireless.pack(fill=tk.X, pady=(14, 0))
         self.connect_addr_var = tk.StringVar(value="192.168.1.10:5555")
+        self.wireless_status_var = tk.StringVar(value="请输入设备的无线调试连接地址")
+        self.wireless_busy = False
         ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(6, 4))
         wireless_actions = ttk.Frame(wireless, style="Surface.TFrame")
         wireless_actions.pack(fill=tk.X, padx=6, pady=(2, 6))
-        ttk.Button(wireless_actions, text="连接", command=self.connect_device, style="Primary.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ttk.Button(wireless_actions, text="断开", command=self.disconnect_device, style="Quiet.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        self.connect_button = ttk.Button(wireless_actions, text="连接", command=self.connect_device, style="Primary.TButton")
+        self.connect_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.disconnect_button = ttk.Button(wireless_actions, text="断开", command=self.disconnect_device, style="Quiet.TButton")
+        self.disconnect_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        ttk.Label(wireless, textvariable=self.wireless_status_var, wraplength=300).pack(fill=tk.X, padx=6, pady=(0, 6))
 
     def _build_tabs(self, parent: ttk.Frame) -> None:
         self.tabs = ttk.Notebook(parent)
@@ -1256,7 +1274,13 @@ class AdbPilotGui(BaseTk):
         state = row.get("state", "未知")
         self.lock_status_var.set(f"已锁定：{locked}（{state}）")
 
-    def _run_async(self, label: str, func: Callable[[], Any], on_success: ResultCallback | None = None) -> None:
+    def _run_async(
+        self,
+        label: str,
+        func: Callable[[], Any],
+        on_success: ResultCallback | None = None,
+        on_error: ResultCallback | None = None,
+    ) -> None:
         self.status_var.set(f"执行中：{label}")
         self._append_output(f"$ {label}\n")
 
@@ -1265,7 +1289,7 @@ class AdbPilotGui(BaseTk):
                 result = func()
                 self.result_queue.put(("ok", label, result, on_success))
             except Exception as exc:  # noqa: BLE001 - GUI must show unexpected worker failures.
-                self.result_queue.put(("err", label, exc, None))
+                self.result_queue.put(("err", label, exc, on_error))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1464,15 +1488,61 @@ class AdbPilotGui(BaseTk):
         self._run_async("读取设备详情", lambda: self._get_client().device_info(serial), self._display_mapping)
 
     def connect_device(self) -> None:
+        if self.wireless_busy:
+            return
         address = self.connect_addr_var.get().strip()
         if not address:
+            self.wireless_status_var.set("请输入 host:port 地址")
             messagebox.showwarning("AdbPilot", "请输入 host:port 地址")
             return
-        self._run_async(f"连接 {address}", lambda: self._get_client().connect(address))
+        self._run_wireless_action(address, connect=True)
 
     def disconnect_device(self) -> None:
+        if self.wireless_busy:
+            return
         address = self.connect_addr_var.get().strip() or None
-        self._run_async("断开无线设备", lambda: self._get_client().disconnect(address))
+        self._run_wireless_action(address, connect=False)
+
+    def _set_wireless_busy(self, busy: bool, *, connect: bool = True) -> None:
+        self.wireless_busy = busy
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.connect_button.configure(state=state, text="连接中…" if busy and connect else "连接")
+        self.disconnect_button.configure(state=state, text="断开中…" if busy and not connect else "断开")
+
+    def _run_wireless_action(self, address: str | None, *, connect: bool) -> None:
+        action = "连接" if connect else "断开"
+        target = address or "所有无线设备"
+
+        def failed(exc: Exception) -> None:
+            self._set_wireless_busy(False)
+            if isinstance(exc, subprocess.TimeoutExpired):
+                detail = f"操作超时（{exc.timeout} 秒），请检查设备地址、端口及网络后重试"
+            else:
+                detail = str(exc)
+            self.wireless_status_var.set(f"{action}失败：{detail}")
+
+        # Capture Tk settings on the UI thread before starting the ADB worker.
+        try:
+            client = self._get_client()
+        except Exception as exc:
+            failed(exc)
+            self._append_output(f"错误：{exc}\n")
+            return
+
+        def done(output: str) -> None:
+            self._set_wireless_busy(False)
+            self.wireless_status_var.set(f"{action}成功：{target}")
+            self._append_output(f"{output}\n")
+            self.refresh_devices()
+
+        self._set_wireless_busy(True, connect=connect)
+        self.wireless_status_var.set(f"正在{action} {target}，请稍候…")
+        self._run_async(
+            f"{action} {target}",
+            lambda: client.connect(address) if connect else client.disconnect(address),
+            done,
+            failed,
+        )
 
     def use_foreground_package(self, default_only: bool = False) -> None:
         if default_only and self.log_package_var.get().strip():
