@@ -1,6 +1,9 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 from adbpilot.client import (
+    AdbClient,
     find_mdns_service,
     parse_devices,
     parse_foreground_package,
@@ -10,6 +13,7 @@ from adbpilot.client import (
     parse_package_dump,
     parse_processes,
 )
+from adbpilot.models import Device
 
 
 class ClientParsingTests(unittest.TestCase):
@@ -18,6 +22,7 @@ class ClientParsingTests(unittest.TestCase):
 adb-14141FDF600081-QXjCrW  _adb-tls-pairing._tcp  192.168.86.38:33861
 studio-abc123XYZ9          _adb-tls-pairing._tcp  192.168.86.39:55861
 adb-14141FDF600081-TnSdi9  _adb-tls-connect._tcp.  192.168.86.38:33015
+adb-e8d3d34b-1grL4          adb-tls-connect._tcp   192.168.1.71:44177
 """
 
         services = parse_mdns_services(output)
@@ -32,9 +37,15 @@ adb-14141FDF600081-TnSdi9  _adb-tls-connect._tcp.  192.168.86.38:33015
             host="192.168.86.38",
         )
 
-        self.assertEqual(len(services), 3)
+        self.assertEqual(len(services), 4)
         self.assertEqual(service["address"], "192.168.86.39:55861")
         self.assertEqual(connect["name"], "adb-14141FDF600081-TnSdi9")
+        connect_without_leading_underscore = find_mdns_service(
+            services,
+            service_type="_adb-tls-connect._tcp",
+            host="192.168.1.71",
+        )
+        self.assertEqual(connect_without_leading_underscore["address"], "192.168.1.71:44177")
 
     def test_mdns_address_host(self):
         self.assertEqual(mdns_address_host("192.168.86.38:33015"), "192.168.86.38")
@@ -57,6 +68,25 @@ ZYX987 no permissions usb:2-1
         self.assertEqual(devices[1].state, "offline")
         self.assertEqual(devices[2].state, "unauthorized")
         self.assertEqual(devices[3].state, "no permissions")
+
+    def test_deduplicate_devices_by_hardware_serial(self):
+        client = AdbClient("adb")
+        client.run = Mock(
+            side_effect=lambda args, **kwargs: SimpleNamespace(
+                stdout={"adb-phone._adb-tls-connect._tcp.": "PHONE-001", "192.168.1.71:44177": "PHONE-001"}[
+                    kwargs["serial"]
+                ]
+            )
+        )
+        devices = [
+            Device("adb-phone._adb-tls-connect._tcp.", "device"),
+            Device("192.168.1.71:44177", "device"),
+        ]
+
+        result = client._deduplicate_devices(devices)
+
+        self.assertEqual([device.serial for device in result], ["192.168.1.71:44177"])
+        self.assertEqual(client.run.call_count, 2)
 
     def test_parse_key_value_lines(self):
         output = """AC powered: false

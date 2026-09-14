@@ -6,7 +6,7 @@ import subprocess
 import time
 import re
 from pathlib import Path
-from typing import BinaryIO, Iterable, TextIO
+from typing import BinaryIO, Callable, Iterable, TextIO
 
 from .errors import AdbCommandError, DeviceSelectionError, suggestion_for_device_state
 from .models import CommandResult, Device, DeviceInfo, RunningProcess
@@ -119,7 +119,57 @@ class AdbClient:
 
     def devices(self) -> list[Device]:
         result = self.run(["devices", "-l"])
-        return parse_devices(result.stdout)
+        return self._deduplicate_devices(parse_devices(result.stdout))
+
+    def _deduplicate_devices(self, devices: list[Device]) -> list[Device]:
+        """Collapse multiple ADB transports that point to the same handset."""
+        ready_devices = [device for device in devices if device.is_ready]
+        if len(ready_devices) < 2:
+            return devices
+
+        deduplicated: list[Device] = []
+        hardware_indexes: dict[str, int] = {}
+        for device in devices:
+            if not device.is_ready:
+                deduplicated.append(device)
+                continue
+
+            hardware_serial = self._hardware_serial(device)
+            if not hardware_serial:
+                deduplicated.append(device)
+                continue
+
+            existing_index = hardware_indexes.get(hardware_serial)
+            if existing_index is None:
+                hardware_indexes[hardware_serial] = len(deduplicated)
+                deduplicated.append(device)
+                continue
+
+            if self._device_preference(device) > self._device_preference(deduplicated[existing_index]):
+                deduplicated[existing_index] = device
+
+        return deduplicated
+
+    def _hardware_serial(self, device: Device) -> str | None:
+        result = self.run(
+            ["shell", "getprop", "ro.serialno"],
+            serial=device.serial,
+            timeout=5,
+            check=False,
+        )
+        value = result.stdout.strip()
+        if not value or value.lower() in {"unknown", "<unknown>"}:
+            return None
+        return value
+
+    @staticmethod
+    def _device_preference(device: Device) -> int:
+        serial = device.serial.lower()
+        if "._adb-tls-" in serial or "_adb-tls-" in serial:
+            return 0
+        if ":" in serial:
+            return 2
+        return 1
 
     def require_serial(self, serial: str | None = None) -> str:
         if serial:
@@ -381,44 +431,121 @@ class AdbClient:
             )
         return self.connect(connect_service["address"])
 
-    def pair_by_qr(self, service_name: str, password: str, *, timeout: int = 120) -> str:
+    def pair_by_qr(
+        self,
+        service_name: str,
+        password: str,
+        *,
+        timeout: int = 120,
+        progress: Callable[[str], None] | None = None,
+    ) -> str:
+        """Complete a QR pairing session and connect every newly discovered device.
+
+        Android versions differ in what they advertise after a QR scan. Some
+        expose a pairing service first, while others expose the TLS connect
+        service immediately after the scan. The connect service is authoritative
+        for this GUI, so it must be accepted as a successful scan result.
+        """
+
+        def report(message: str) -> None:
+            if progress:
+                progress(message)
+
+        report("扫码配对：进入等待扫码状态")
+        initial_services = parse_mdns_services(self.mdns_services())
+        known_connect_addresses = {
+            service["address"]
+            for service in initial_services
+            if is_mdns_service_type(service.get("type", ""), "adb-tls-connect._tcp")
+        }
+        report(f"扫码配对：当前已发现 {len(known_connect_addresses)} 个连接服务")
+
         deadline = time.monotonic() + timeout
-        pairing_service: dict[str, str] | None = None
+        pairing_attempted = False
+        pairing_output = ""
+        discovered: dict[str, dict[str, str]] = {}
         last_services = ""
+        collect_until: float | None = None
+        post_pair_deadline: float | None = None
 
         while time.monotonic() < deadline:
             last_services = self.mdns_services()
+            services = parse_mdns_services(last_services)
+
             pairing_service = find_mdns_service(
-                parse_mdns_services(last_services),
+                services,
                 name=service_name,
-                service_type="_adb-tls-pairing._tcp",
+                service_type="adb-tls-pairing._tcp",
             )
-            if pairing_service:
+            if pairing_service and not pairing_attempted:
+                pairing_attempted = True
+                pair_address = pairing_service["address"]
+                report(f"扫码配对：发现配对服务 {pair_address}，正在执行 adb pair")
+                pairing_output = self.pair(pair_address, password)
+                report(f"扫码配对：adb pair 完成{f'：{pairing_output}' if pairing_output else ''}")
+                post_pair_deadline = min(deadline, time.monotonic() + 45)
+
+            for service in services:
+                if not is_mdns_service_type(service.get("type", ""), "adb-tls-connect._tcp"):
+                    continue
+                address = service["address"]
+                if address in known_connect_addresses or address in discovered:
+                    continue
+                discovered[address] = service
+                collect_until = time.monotonic() + 3
+                report(f"扫码配对：发现连接服务 {service['name']} -> {address}")
+
+            if discovered and collect_until is not None and time.monotonic() >= collect_until:
                 break
+            if pairing_attempted and not discovered and post_pair_deadline is not None:
+                if time.monotonic() >= post_pair_deadline:
+                    break
             time.sleep(1)
 
-        if not pairing_service:
-            raise DeviceSelectionError(
-                "未发现扫码后的 ADB 配对服务。请确认手机和电脑在同一个 Wi-Fi，"
-                "并在手机无线调试中选择“使用二维码配对设备”。\n"
-                f"最近一次 mdns services 输出：\n{last_services.strip() or '<empty>'}"
+        if not discovered:
+            detail = last_services.strip() or "<empty>"
+            message = (
+                "扫码配对：超时，未发现新的 ADB 连接服务。\n"
+                "请确认手机和电脑在同一个 Wi-Fi，并在手机无线调试中选择“使用二维码配对设备”。\n"
+                f"最近一次 mdns services 输出：\n{detail}"
             )
+            report(message)
+            report("扫码配对：退出扫码匹配状态（失败）")
+            raise DeviceSelectionError(message)
 
-        pair_address = pairing_service["address"]
-        pair_output = self.pair(pair_address, password)
-        host = mdns_address_host(pair_address)
-        connect_service = self.wait_for_mdns_connect_service(host=host, timeout=45)
+        if len(discovered) > 1:
+            report(f"扫码配对：本次发现 {len(discovered)} 台设备，将分别建立连接")
+        else:
+            report("扫码配对：已发现 1 台设备，正在建立连接")
 
-        if not connect_service:
-            return (
-                f"{pair_output}\n"
-                "配对成功，但未发现可自动连接的 ADB 连接服务（_adb-tls-connect）。\n"
-                "请返回手机“无线调试”主页面，保持该页面打开后点击“连接已配对”；"
-                "如果仍不出现，请把主页面显示的 IP 地址和端口填入“连接地址”后点击连接。"
-            )
+        outputs: list[str] = []
+        failures: list[str] = []
+        for service in discovered.values():
+            address = service["address"]
+            report(f"扫码配对：正在连接 {address}")
+            try:
+                connect_output = self.connect(address)
+            except AdbCommandError as exc:
+                failures.append(f"{address}: {exc}")
+                report(f"扫码配对：连接失败 {address}")
+                continue
+            outputs.append(f"{address}: {connect_output}" if connect_output else address)
+            report(f"扫码配对：连接完成 {address}")
 
-        connect_output = self.connect(connect_service["address"])
-        return f"{pair_output}\n{connect_output}"
+        if not outputs:
+            message = "扫码配对：发现设备，但所有 ADB 连接均失败。\n" + "\n".join(failures)
+            report("扫码配对：退出扫码匹配状态（失败）")
+            raise DeviceSelectionError(message)
+
+        result_lines = []
+        if pairing_output:
+            result_lines.append(pairing_output)
+        result_lines.extend(outputs)
+        if failures:
+            result_lines.append("部分设备连接失败：\n" + "\n".join(failures))
+        report(f"扫码配对：完成，成功连接 {len(outputs)} 台设备")
+        report("扫码配对：退出扫码匹配状态（完成）")
+        return "\n".join(result_lines)
 
     def logcat(
         self,
@@ -464,7 +591,7 @@ def parse_mdns_services(output: str) -> list[dict[str, str]]:
     services: list[dict[str, str]] = []
     for raw_line in output.splitlines():
         parts = raw_line.split()
-        if len(parts) < 3 or not parts[1].startswith("_adb"):
+        if len(parts) < 3 or not is_mdns_service_type(parts[1]):
             continue
         services.append({"name": parts[0], "type": parts[1], "address": parts[2]})
     return services
@@ -477,9 +604,9 @@ def find_mdns_service(
     name: str | None = None,
     host: str | None = None,
 ) -> dict[str, str] | None:
-    normalized_service_type = service_type.rstrip(".")
+    normalized_service_type = normalize_mdns_service_type(service_type)
     for service in services:
-        if service.get("type", "").rstrip(".") != normalized_service_type:
+        if normalize_mdns_service_type(service.get("type", "")) != normalized_service_type:
             continue
         if name is not None and service.get("name") != name:
             continue
@@ -487,6 +614,18 @@ def find_mdns_service(
             continue
         return service
     return None
+
+
+def normalize_mdns_service_type(service_type: str) -> str:
+    return service_type.strip().lower().lstrip("_").rstrip(".")
+
+
+def is_mdns_service_type(service_type: str, expected: str | None = None) -> bool:
+    normalized = normalize_mdns_service_type(service_type)
+    known_types = {"adb-tls-pairing._tcp", "adb-tls-connect._tcp"}
+    if expected is None:
+        return normalized in known_types
+    return normalized == normalize_mdns_service_type(expected)
 
 
 def mdns_address_host(address: str) -> str:
