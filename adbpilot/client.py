@@ -438,6 +438,7 @@ class AdbClient:
         *,
         timeout: int = 120,
         progress: Callable[[str], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> str:
         """Complete a QR pairing session and connect every newly discovered device.
 
@@ -451,8 +452,15 @@ class AdbClient:
             if progress:
                 progress(message)
 
+        def is_cancelled() -> bool:
+            return cancelled is not None and cancelled()
+
         report("扫码配对：进入等待扫码状态")
-        initial_services = parse_mdns_services(self.mdns_services())
+        try:
+            initial_services = parse_mdns_services(self.mdns_services())
+        except Exception:
+            report("扫码配对：退出扫码匹配状态（异常）")
+            raise
         known_connect_addresses = {
             service["address"]
             for service in initial_services
@@ -469,6 +477,9 @@ class AdbClient:
         post_pair_deadline: float | None = None
 
         while time.monotonic() < deadline:
+            if is_cancelled():
+                report("扫码配对：退出扫码匹配状态（已取消）")
+                raise DeviceSelectionError("扫码配对已取消")
             last_services = self.mdns_services()
             services = parse_mdns_services(last_services)
 
@@ -481,7 +492,11 @@ class AdbClient:
                 pairing_attempted = True
                 pair_address = pairing_service["address"]
                 report(f"扫码配对：发现配对服务 {pair_address}，正在执行 adb pair")
-                pairing_output = self.pair(pair_address, password)
+                try:
+                    pairing_output = self.pair(pair_address, password)
+                except Exception:
+                    report("扫码配对：退出扫码匹配状态（异常）")
+                    raise
                 report(f"扫码配对：adb pair 完成{f'：{pairing_output}' if pairing_output else ''}")
                 post_pair_deadline = min(deadline, time.monotonic() + 45)
 

@@ -14,6 +14,7 @@ from adbpilot.client import (
     parse_processes,
 )
 from adbpilot.models import Device
+from adbpilot.errors import DeviceSelectionError
 
 
 class ClientParsingTests(unittest.TestCase):
@@ -87,6 +88,33 @@ ZYX987 no permissions usb:2-1
 
         self.assertEqual([device.serial for device in result], ["192.168.1.71:44177"])
         self.assertEqual(client.run.call_count, 2)
+
+    def test_pair_by_qr_can_be_cancelled_and_logs_exit(self):
+        client = AdbClient("adb")
+        client.mdns_services = Mock(return_value="List of discovered mdns services\n")
+        progress = []
+
+        with self.assertRaises(DeviceSelectionError):
+            client.pair_by_qr(
+                "studio-test",
+                "password",
+                timeout=120,
+                cancelled=lambda: True,
+                progress=progress.append,
+            )
+
+        self.assertEqual(progress[0], "扫码配对：进入等待扫码状态")
+        self.assertEqual(progress[-1], "扫码配对：退出扫码匹配状态（已取消）")
+
+    def test_pair_by_qr_logs_exit_when_initial_mdns_fails(self):
+        client = AdbClient("adb")
+        client.mdns_services = Mock(side_effect=RuntimeError("mdns unavailable"))
+        progress = []
+
+        with self.assertRaises(RuntimeError):
+            client.pair_by_qr("studio-test", "password", progress=progress.append)
+
+        self.assertEqual(progress[-1], "扫码配对：退出扫码匹配状态（异常）")
 
     def test_parse_key_value_lines(self):
         output = """AC powered: false
