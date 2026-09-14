@@ -385,6 +385,8 @@ adb executable
 
 详细需求和阶段规划见 [plant.md](./plant.md)。
 
+无线设备 IP／端口变化后的自动重连设计：[PRD](./doc/wireless-auto-reconnect/prd.md) · [技术方案](./doc/wireless-auto-reconnect/technical-design.md)（设计稿，尚未实现）。
+
 ## 开发和测试
 
 运行单元测试：
