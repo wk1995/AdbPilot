@@ -220,6 +220,7 @@ class AdbPilotGui(BaseTk):
         self.floating_status_var = tk.StringVar(value="监听中")
         self.qr_pair_window: tk.Toplevel | None = None
         self.qr_pair_image: Any = None
+        self.qr_pair_status_var = tk.StringVar(value="等待手机扫描")
         self.macos_floating_process: subprocess.Popen[str] | None = None
         self.gui_config = load_gui_config()
         self.locked_serial_var = tk.StringVar()
@@ -1297,6 +1298,12 @@ class AdbPilotGui(BaseTk):
             except queue.Empty:
                 break
 
+            if kind == "progress":
+                self._append_output(f"{payload}\n")
+                if label.startswith("扫码配对"):
+                    self.qr_pair_status_var.set(str(payload).split("\n", 1)[0])
+                continue
+
             if kind == "ok":
                 if label != "设备监听":
                     self.status_var.set(f"完成：{label}")
@@ -1310,7 +1317,9 @@ class AdbPilotGui(BaseTk):
                 if label != "设备监听":
                     self.status_var.set(f"失败：{label}")
                     self._append_output(f"错误：{payload}\n")
-                if label != "设备监听" and isinstance(payload, AdbPilotError):
+                if label.startswith("扫码配对"):
+                    self.qr_pair_status_var.set("扫码配对失败，请查看输出日志")
+                if label != "设备监听" and not label.startswith("扫码配对") and isinstance(payload, AdbPilotError):
                     messagebox.showerror("AdbPilot", str(payload))
 
         self.after(100, self._process_results)
@@ -1404,6 +1413,12 @@ class AdbPilotGui(BaseTk):
             for serial, row in self.device_rows.items()
             if row.get("state") != "已断开"
         }
+        unique_devices: dict[str, Device] = {}
+        for device in devices:
+            previous = unique_devices.get(device.serial)
+            if previous is None or (not previous.is_ready and device.is_ready):
+                unique_devices[device.serial] = device
+        devices = list(unique_devices.values())
         self.devices = devices
         current_serials = {device.serial for device in devices}
         for item in self.device_table.get_children():
@@ -1435,19 +1450,6 @@ class AdbPilotGui(BaseTk):
                     continue
                 details = dict(row.get("details", {}))
                 next_rows[serial] = {"state": "已断开", "details": details}
-                self.device_table.insert(
-                    "",
-                    tk.END,
-                    values=(
-                        serial,
-                        "已断开",
-                        details.get("product", ""),
-                        details.get("model", ""),
-                        details.get("device", ""),
-                        device_connection_type(serial, details),
-                    ),
-                    tags=("disconnected",),
-                )
 
         self.device_table.tag_configure("disconnected", foreground="#9ca3af")
         self.device_rows = next_rows
@@ -1506,24 +1508,24 @@ class AdbPilotGui(BaseTk):
         service_name, password, payload = generate_adb_qr_pairing_payload()
         if not self._show_qr_pairing_window(payload):
             return
+        self.qr_pair_status_var.set("等待手机扫描")
         self._append_output(
+            "扫码配对：进入扫码匹配状态，等待手机扫描。\n"
             "请在手机进入“开发者选项 > 无线调试 > 使用二维码配对设备”并扫描弹窗二维码。\n"
         )
 
         def done(result: str) -> None:
+            self.qr_pair_status_var.set("扫码配对完成")
             self._append_output(f"{result}\n")
-            if "未发现可自动连接" in result:
-                messagebox.showinfo(
-                    "AdbPilot",
-                    "配对成功，但电脑没有发现手机广播的连接端口。\n\n"
-                    "请返回手机“无线调试”主页面并保持该页面打开，然后点击“连接已配对”。\n"
-                    "如果仍然不行，把主页面显示的 IP 地址和端口填到“连接地址”后点击连接。",
-                )
             self.refresh_devices()
 
         self._run_async(
             f"扫码配对 {service_name}",
-            lambda: self._get_client().pair_by_qr(service_name, password),
+            lambda: self._get_client().pair_by_qr(
+                service_name,
+                password,
+                progress=lambda message: self.result_queue.put(("progress", "扫码配对", message, None)),
+            ),
             done,
         )
 
@@ -1550,6 +1552,12 @@ class AdbPilotGui(BaseTk):
             window,
             text="手机打开无线调试，选择“使用二维码配对设备”后扫描此码。",
             style="Muted.TLabel",
+            wraplength=340,
+        ).pack(anchor=tk.W, padx=16, pady=(0, 10))
+        ttk.Label(
+            window,
+            textvariable=self.qr_pair_status_var,
+            style="Status.TLabel",
             wraplength=340,
         ).pack(anchor=tk.W, padx=16, pady=(0, 10))
 
