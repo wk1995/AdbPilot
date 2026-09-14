@@ -362,6 +362,8 @@ adb executable
 
 详细需求和阶段规划见 [plant.md](./plant.md)。
 
+无线调试扫码后一直显示“正在配对设备”时，参见 [Android 无线调试配对卡住排查](./docs/troubleshooting/android-wireless-debugging-pairing-stuck.md)。
+
 ## 开发和测试
 
 运行单元测试：
