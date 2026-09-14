@@ -280,9 +280,13 @@ adbpilot info -s emulator-5554
 连接无线调试设备：
 
 ```bash
+adbpilot pair 192.168.1.10:37123 123456
 adbpilot connect 192.168.1.10:5555
 adbpilot disconnect 192.168.1.10:5555
 ```
+
+Android 11+ 首次无线调试通常需要先用手机上显示的配对地址和配对码执行 `pair`，再用连接地址执行 `connect`；这两个端口经常不同。
+桌面 GUI 也支持“扫码配对”：点击无线调试区域的“扫码配对”，在手机无线调试中选择“使用二维码配对设备”并扫描弹窗二维码即可。
 
 安装和卸载应用：
 
@@ -380,6 +384,8 @@ adb executable
 ## 文档
 
 详细需求和阶段规划见 [plant.md](./plant.md)。
+
+无线设备 IP／端口变化后的自动重连设计：[PRD](./doc/wireless-auto-reconnect/prd.md) · [技术方案](./doc/wireless-auto-reconnect/technical-design.md)（设计稿，尚未实现）。
 
 ## 开发和测试
 
