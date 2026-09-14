@@ -221,6 +221,8 @@ class AdbPilotGui(BaseTk):
         self.qr_pair_window: tk.Toplevel | None = None
         self.qr_pair_image: Any = None
         self.qr_pair_status_var = tk.StringVar(value="等待手机扫描")
+        self.qr_pair_session = 0
+        self.qr_pair_cancel_event: threading.Event | None = None
         self.macos_floating_process: subprocess.Popen[str] | None = None
         self.gui_config = load_gui_config()
         self.locked_serial_var = tk.StringVar()
@@ -1299,6 +1301,8 @@ class AdbPilotGui(BaseTk):
                 break
 
             if kind == "progress":
+                if label.startswith("扫码配对:") and label.split(":", 2)[1] != str(self.qr_pair_session):
+                    continue
                 self._append_output(f"{payload}\n")
                 if label.startswith("扫码配对"):
                     self.qr_pair_status_var.set(str(payload).split("\n", 1)[0])
@@ -1312,6 +1316,8 @@ class AdbPilotGui(BaseTk):
                 elif payload is not None:
                     self._append_output(f"{payload}\n")
             else:
+                if label.startswith("扫码配对:") and label.split(":", 2)[1] != str(self.qr_pair_session):
+                    continue
                 if callback:
                     callback(payload)
                 if label != "设备监听":
@@ -1505,6 +1511,12 @@ class AdbPilotGui(BaseTk):
         self._run_async(f"配对 {address}", lambda: self._get_client().pair(address, code))
 
     def qr_pair_device(self) -> None:
+        if self.qr_pair_cancel_event is not None:
+            self.qr_pair_cancel_event.set()
+        self.qr_pair_session += 1
+        session = self.qr_pair_session
+        cancel_event = threading.Event()
+        self.qr_pair_cancel_event = cancel_event
         service_name, password, payload = generate_adb_qr_pairing_payload()
         if not self._show_qr_pairing_window(payload):
             return
@@ -1515,16 +1527,21 @@ class AdbPilotGui(BaseTk):
         )
 
         def done(result: str) -> None:
+            if session != self.qr_pair_session:
+                return
             self.qr_pair_status_var.set("扫码配对完成")
             self._append_output(f"{result}\n")
             self.refresh_devices()
 
         self._run_async(
-            f"扫码配对 {service_name}",
+            f"扫码配对:{session}:{service_name}",
             lambda: self._get_client().pair_by_qr(
                 service_name,
                 password,
-                progress=lambda message: self.result_queue.put(("progress", "扫码配对", message, None)),
+                cancelled=cancel_event.is_set,
+                progress=lambda message: self.result_queue.put(
+                    ("progress", f"扫码配对:{session}", message, None)
+                ),
             ),
             done,
         )
@@ -1546,6 +1563,7 @@ class AdbPilotGui(BaseTk):
         window.configure(bg=COLORS["surface"])
         window.transient(self)
         window.grab_set()
+        window.protocol("WM_DELETE_WINDOW", self._close_qr_pairing_window)
 
         ttk.Label(window, text="无线调试扫码配对", style="Header.TLabel").pack(anchor=tk.W, padx=16, pady=(14, 4))
         ttk.Label(
@@ -1564,10 +1582,16 @@ class AdbPilotGui(BaseTk):
         image = qrcode.make(payload).resize((300, 300))
         self.qr_pair_image = ImageTk.PhotoImage(image)
         ttk.Label(window, image=self.qr_pair_image).pack(padx=18, pady=(0, 12))
-        ttk.Button(window, text="关闭", command=window.destroy, style="Quiet.TButton").pack(pady=(0, 14))
+        ttk.Button(window, text="关闭", command=self._close_qr_pairing_window, style="Quiet.TButton").pack(pady=(0, 14))
 
         self.qr_pair_window = window
         return True
+
+    def _close_qr_pairing_window(self) -> None:
+        if self.qr_pair_cancel_event is not None:
+            self.qr_pair_cancel_event.set()
+        if self.qr_pair_window is not None and self.qr_pair_window.winfo_exists():
+            self.qr_pair_window.destroy()
 
     def disconnect_device(self) -> None:
         address = self.connect_addr_var.get().strip() or None
