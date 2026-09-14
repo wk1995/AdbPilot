@@ -6,6 +6,7 @@ from adbpilot.client import (
     parse_foreground_package,
     parse_key_value_lines,
     parse_mdns_services,
+    mdns_address_host,
     parse_package_dump,
     parse_processes,
 )
@@ -16,7 +17,7 @@ class ClientParsingTests(unittest.TestCase):
         output = """List of discovered mdns services
 adb-14141FDF600081-QXjCrW  _adb-tls-pairing._tcp  192.168.86.38:33861
 studio-abc123XYZ9          _adb-tls-pairing._tcp  192.168.86.39:55861
-adb-14141FDF600081-TnSdi9  _adb-tls-connect._tcp  192.168.86.38:33015
+adb-14141FDF600081-TnSdi9  _adb-tls-connect._tcp.  192.168.86.38:33015
 """
 
         services = parse_mdns_services(output)
@@ -34,6 +35,10 @@ adb-14141FDF600081-TnSdi9  _adb-tls-connect._tcp  192.168.86.38:33015
         self.assertEqual(len(services), 3)
         self.assertEqual(service["address"], "192.168.86.39:55861")
         self.assertEqual(connect["name"], "adb-14141FDF600081-TnSdi9")
+
+    def test_mdns_address_host(self):
+        self.assertEqual(mdns_address_host("192.168.86.38:33015"), "192.168.86.38")
+        self.assertEqual(mdns_address_host("[fe80::abcd]:33015"), "fe80::abcd")
 
     def test_parse_devices_with_details(self):
         output = """List of devices attached

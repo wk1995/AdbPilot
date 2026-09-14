@@ -352,6 +352,35 @@ class AdbClient:
     def mdns_services(self) -> str:
         return self.run(["mdns", "services"], timeout=20).stdout
 
+    def wait_for_mdns_connect_service(self, *, host: str | None = None, timeout: int = 30) -> dict[str, str] | None:
+        deadline = time.monotonic() + timeout
+        last_match: dict[str, str] | None = None
+        while time.monotonic() < deadline:
+            services = parse_mdns_services(self.mdns_services())
+            last_match = find_mdns_service(
+                services,
+                service_type="_adb-tls-connect._tcp",
+                host=host,
+            )
+            if last_match:
+                return last_match
+            if host is not None:
+                last_match = find_mdns_service(services, service_type="_adb-tls-connect._tcp")
+                if last_match:
+                    return last_match
+            time.sleep(1)
+        return None
+
+    def connect_paired_by_mdns(self, *, timeout: int = 15) -> str:
+        connect_service = self.wait_for_mdns_connect_service(timeout=timeout)
+        if not connect_service:
+            raise DeviceSelectionError(
+                "未发现已配对设备的 ADB 连接服务（_adb-tls-connect）。"
+                "请确认手机和电脑在同一个 Wi-Fi，并保持手机“无线调试”页面打开；"
+                "如果仍然没有发现，请在手机无线调试主页面查看 IP 地址和端口，填到“连接地址”后点击连接。"
+            )
+        return self.connect(connect_service["address"])
+
     def pair_by_qr(self, service_name: str, password: str, *, timeout: int = 120) -> str:
         deadline = time.monotonic() + timeout
         pairing_service: dict[str, str] | None = None
@@ -377,22 +406,16 @@ class AdbClient:
 
         pair_address = pairing_service["address"]
         pair_output = self.pair(pair_address, password)
-        host = pair_address.rsplit(":", 1)[0]
-
-        connect_service: dict[str, str] | None = None
-        connect_deadline = time.monotonic() + 30
-        while time.monotonic() < connect_deadline:
-            connect_service = find_mdns_service(
-                parse_mdns_services(self.mdns_services()),
-                service_type="_adb-tls-connect._tcp",
-                host=host,
-            )
-            if connect_service:
-                break
-            time.sleep(1)
+        host = mdns_address_host(pair_address)
+        connect_service = self.wait_for_mdns_connect_service(host=host, timeout=45)
 
         if not connect_service:
-            return f"{pair_output}\n配对成功，但未发现连接端口；请稍后刷新设备或手动连接手机上显示的连接地址。"
+            return (
+                f"{pair_output}\n"
+                "配对成功，但未发现可自动连接的 ADB 连接服务（_adb-tls-connect）。\n"
+                "请返回手机“无线调试”主页面，保持该页面打开后点击“连接已配对”；"
+                "如果仍不出现，请把主页面显示的 IP 地址和端口填入“连接地址”后点击连接。"
+            )
 
         connect_output = self.connect(connect_service["address"])
         return f"{pair_output}\n{connect_output}"
@@ -454,15 +477,22 @@ def find_mdns_service(
     name: str | None = None,
     host: str | None = None,
 ) -> dict[str, str] | None:
+    normalized_service_type = service_type.rstrip(".")
     for service in services:
-        if service.get("type") != service_type:
+        if service.get("type", "").rstrip(".") != normalized_service_type:
             continue
         if name is not None and service.get("name") != name:
             continue
-        if host is not None and service.get("address", "").rsplit(":", 1)[0] != host:
+        if host is not None and mdns_address_host(service.get("address", "")) != host:
             continue
         return service
     return None
+
+
+def mdns_address_host(address: str) -> str:
+    if address.startswith("[") and "]" in address:
+        return address[1:].split("]", 1)[0]
+    return address.rsplit(":", 1)[0]
 
 
 def parse_devices(output: str) -> list[Device]:

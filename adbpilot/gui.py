@@ -398,6 +398,7 @@ class AdbPilotGui(BaseTk):
         ttk.Entry(wireless, textvariable=self.pair_code_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
         ttk.Button(wireless, text="配对", command=self.pair_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(2, 6))
         ttk.Button(wireless, text="扫码配对", command=self.qr_pair_device, style="Primary.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Button(wireless, text="连接已配对", command=self.connect_paired_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(wireless, text="连接地址").pack(anchor=tk.W, padx=6, pady=(2, 0))
         ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
         wireless_actions = ttk.Frame(wireless, style="Surface.TFrame")
@@ -1487,6 +1488,9 @@ class AdbPilotGui(BaseTk):
             return
         self._run_async(f"连接 {address}", lambda: self._get_client().connect(address))
 
+    def connect_paired_device(self) -> None:
+        self._run_async("连接已配对设备", lambda: self._get_client().connect_paired_by_mdns())
+
     def pair_device(self) -> None:
         address = self.pair_addr_var.get().strip()
         code = self.pair_code_var.get().strip()
@@ -1508,6 +1512,13 @@ class AdbPilotGui(BaseTk):
 
         def done(result: str) -> None:
             self._append_output(f"{result}\n")
+            if "未发现可自动连接" in result:
+                messagebox.showinfo(
+                    "AdbPilot",
+                    "配对成功，但电脑没有发现手机广播的连接端口。\n\n"
+                    "请返回手机“无线调试”主页面并保持该页面打开，然后点击“连接已配对”。\n"
+                    "如果仍然不行，把主页面显示的 IP 地址和端口填到“连接地址”后点击连接。",
+                )
             self.refresh_devices()
 
         self._run_async(
