@@ -17,6 +17,8 @@ SKIP_PREFIXES = (
 )
 SKIP_FILES = {
     "packaging/scripts/privacy_scan.py",
+    # Fixtures intentionally contain the patterns this scanner rejects.
+    "tests/test_privacy_scan.py",
 }
 
 TEXT_SUFFIXES = {
