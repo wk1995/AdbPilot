@@ -21,6 +21,7 @@ from . import __version__
 from .client import AdbClient
 from .errors import AdbPilotError
 from .models import Device, RunningProcess
+from .packages import DependencyRequest, install_dependency
 from .platform_adapter import PlatformAdapter
 
 try:
@@ -219,7 +220,9 @@ class AdbPilotGui(BaseTk):
         self.floating_drag_start: tuple[int, int] | None = None
         self.floating_status_var = tk.StringVar(value="监听中")
         self.qr_pair_window: tk.Toplevel | None = None
+        self.qr_pair_content: ttk.Frame | None = None
         self.qr_pair_image: Any = None
+        self._pending_qr_payload = ""
         self.qr_pair_status_var = tk.StringVar(value="等待手机扫描")
         self.qr_pair_session = 0
         self.qr_pair_cancel_event: threading.Event | None = None
@@ -1304,8 +1307,10 @@ class AdbPilotGui(BaseTk):
                 if label.startswith("扫码配对:") and label.split(":", 2)[1] != str(self.qr_pair_session):
                     continue
                 self._append_output(f"{payload}\n")
-                if label.startswith("扫码配对"):
-                    self.qr_pair_status_var.set(str(payload).split("\n", 1)[0])
+                if label.startswith("扫码配对") or label == "安装依赖":
+                    message = str(payload).split("\n", 1)[0]
+                    self.qr_pair_status_var.set(message)
+                    self._update_dependency_progress(message)
                 continue
 
             if kind == "ok":
@@ -1325,6 +1330,8 @@ class AdbPilotGui(BaseTk):
                     self._append_output(f"错误：{payload}\n")
                 if label.startswith("扫码配对"):
                     self.qr_pair_status_var.set("扫码配对失败，请查看输出日志")
+                if label == "安装依赖":
+                    self.qr_pair_status_var.set("依赖安装失败，请查看输出日志")
                 if label != "设备监听" and not label.startswith("扫码配对") and isinstance(payload, AdbPilotError):
                     messagebox.showerror("AdbPilot", str(payload))
 
@@ -1547,13 +1554,7 @@ class AdbPilotGui(BaseTk):
         )
 
     def _show_qr_pairing_window(self, payload: str) -> bool:
-        try:
-            import qrcode
-            from PIL import ImageTk
-        except ImportError:
-            messagebox.showerror("AdbPilot", "缺少二维码依赖，请安装 qrcode[pil] 后重试。")
-            return False
-
+        self._pending_qr_payload = payload
         if self.qr_pair_window is not None and self.qr_pair_window.winfo_exists():
             self.qr_pair_window.destroy()
 
@@ -1579,13 +1580,102 @@ class AdbPilotGui(BaseTk):
             wraplength=340,
         ).pack(anchor=tk.W, padx=16, pady=(0, 10))
 
+        content = ttk.Frame(window, style="Surface.TFrame")
+        content.pack(fill=tk.BOTH, padx=16, pady=(0, 8))
+        self.qr_pair_content = content
+        actions = ttk.Frame(window, style="Surface.TFrame")
+        actions.pack(fill=tk.X, padx=16, pady=(0, 14))
+        ttk.Button(actions, text="关闭", command=self._close_qr_pairing_window, style="Quiet.TButton").pack(side=tk.RIGHT)
+        self.qr_pair_window = window
+
+        if not self._render_qr_code(payload, content):
+            self._show_qr_dependency_prompt(content)
+        return True
+
+    def _render_qr_code(self, payload: str, parent: ttk.Frame) -> bool:
+        try:
+            import qrcode
+            from PIL import ImageTk
+        except ImportError:
+            return False
+        for child in parent.winfo_children():
+            child.destroy()
         image = qrcode.make(payload).resize((300, 300))
         self.qr_pair_image = ImageTk.PhotoImage(image)
-        ttk.Label(window, image=self.qr_pair_image).pack(padx=18, pady=(0, 12))
-        ttk.Button(window, text="关闭", command=self._close_qr_pairing_window, style="Quiet.TButton").pack(pady=(0, 14))
-
-        self.qr_pair_window = window
+        ttk.Label(parent, image=self.qr_pair_image).pack(pady=(0, 8))
         return True
+
+    def _show_qr_dependency_prompt(self, parent: ttk.Frame) -> None:
+        for child in parent.winfo_children():
+            child.destroy()
+        self.qr_pair_status_var.set("缺少二维码依赖")
+        ttk.Label(
+            parent,
+            text="生成二维码需要 qrcode。点击后会下载并自动安装，完成后显示二维码。",
+            style="Muted.TLabel",
+            wraplength=320,
+        ).pack(anchor=tk.W, pady=(8, 12))
+        self.qr_dependency_progress = ttk.Progressbar(parent, mode="determinate", maximum=100)
+        self.qr_dependency_progress.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(
+            parent,
+            text="下载并安装 qrcode",
+            command=self.install_qrcode_dependency,
+            style="Primary.TButton",
+        ).pack(fill=tk.X, pady=(0, 8))
+
+    def _update_dependency_progress(self, message: str) -> None:
+        bar = getattr(self, "qr_dependency_progress", None)
+        if bar is None or not bar.winfo_exists():
+            return
+        if message.startswith("下载进度") and "%" in message:
+            percent = message.split("%", 1)[0].rsplit(" ", 1)[-1]
+            try:
+                bar.stop()
+                bar.configure(mode="determinate", maximum=100)
+                bar["value"] = int(percent)
+            except ValueError:
+                pass
+            return
+        if message.startswith(("准备下载", "正在下载")):
+            bar.configure(mode="indeterminate")
+            bar.start(12)
+            return
+        if message.startswith(("开始安装", "正在安装")):
+            bar.stop()
+            bar.configure(mode="indeterminate")
+            bar.start(12)
+            return
+        if message == "安装完成":
+            bar.stop()
+            bar.configure(mode="determinate", maximum=100)
+            bar["value"] = 100
+
+    def install_qrcode_dependency(self) -> None:
+        self.qr_pair_status_var.set("准备下载 qrcode")
+        self._update_dependency_progress("准备下载 qrcode")
+
+        def report(message: str) -> None:
+            self.result_queue.put(("progress", "安装依赖", message, None))
+
+        def done(result: str) -> None:
+            payload = getattr(self, "_pending_qr_payload", "")
+            content = getattr(self, "qr_pair_content", None)
+            if content is not None and content.winfo_exists() and self._render_qr_code(payload, content):
+                self.qr_pair_status_var.set("等待手机扫描")
+                self._append_output(f"{result}\n二维码已生成。\n")
+                return
+            self.qr_pair_status_var.set("依赖已安装，但二维码仍无法生成")
+            self._append_output(f"{result}\n")
+
+        self._run_async(
+            "安装依赖",
+            lambda: install_dependency(
+                DependencyRequest(requirement="qrcode[pil]", import_names=("qrcode", "PIL")),
+                progress=report,
+            ),
+            done,
+        )
 
     def _close_qr_pairing_window(self) -> None:
         if self.qr_pair_cancel_event is not None:
