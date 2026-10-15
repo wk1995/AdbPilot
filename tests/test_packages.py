@@ -61,6 +61,7 @@ class PackageTests(unittest.TestCase):
             "Progress 46080 of 46080",
             "Installing collected packages: qrcode",
             "Installing qrcode...",
+            "Progress 1 of 2",
             "Successfully installed qrcode-8.2",
             "Requirement already satisfied: pillow",
         ]
@@ -74,6 +75,7 @@ class PackageTests(unittest.TestCase):
                 "下载进度 100%（45.0 KB / 45.0 KB）",
                 "开始安装",
                 "正在安装 qrcode",
+                "正在安装 50%（1 / 2）",
                 "安装完成",
                 None,
             ],
