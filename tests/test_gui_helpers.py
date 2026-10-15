@@ -16,6 +16,7 @@ from adbpilot.gui import (
     floating_topmost_badge_text,
     floating_topmost_locked_from_config,
     floating_topmost_style,
+    generate_adb_qr_pairing_payload,
     gui_config_path,
     load_gui_config,
     macos_floating_helper_build_path,
@@ -103,6 +104,13 @@ class GuiHelperTests(unittest.TestCase):
         self.assertTrue(query_started.is_set())
         client.restart_server.assert_called_once()
         client.devices.assert_called_once()
+    def test_generate_adb_qr_pairing_payload(self):
+        service_name, password, payload = generate_adb_qr_pairing_payload()
+
+        self.assertTrue(service_name.startswith("studio-"))
+        self.assertEqual(len(service_name), len("studio-") + 10)
+        self.assertEqual(len(password), 12)
+        self.assertEqual(payload, f"WIFI:T:ADB;S:{service_name};P:{password};;")
 
     def test_device_connection_type(self):
         self.assertEqual(device_connection_type("emulator-5554"), "USB")

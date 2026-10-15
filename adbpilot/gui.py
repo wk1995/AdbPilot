@@ -6,6 +6,8 @@ import json
 import os
 import platform
 import queue
+import secrets
+import string
 import subprocess
 import sys
 import threading
@@ -19,6 +21,7 @@ from . import __version__
 from .client import AdbClient
 from .errors import AdbPilotError
 from .models import Device, RunningProcess
+from .packages import DependencyRequest, install_dependency
 from .platform_adapter import PlatformAdapter
 
 try:
@@ -185,6 +188,13 @@ def floating_text_lines(
     return ("无设备", "等待连接", "右键刷新")
 
 
+def generate_adb_qr_pairing_payload() -> tuple[str, str, str]:
+    alphabet = string.ascii_letters + string.digits
+    service_name = "studio-" + "".join(secrets.choice(alphabet) for _ in range(10))
+    password = "".join(secrets.choice(alphabet) for _ in range(12))
+    return service_name, password, f"WIFI:T:ADB;S:{service_name};P:{password};;"
+
+
 class AdbPilotGui(BaseTk):
     """Windows-friendly visual interface backed by the existing AdbClient."""
 
@@ -209,6 +219,13 @@ class AdbPilotGui(BaseTk):
         self.floating_menu: tk.Menu | None = None
         self.floating_drag_start: tuple[int, int] | None = None
         self.floating_status_var = tk.StringVar(value="监听中")
+        self.qr_pair_window: tk.Toplevel | None = None
+        self.qr_pair_content: ttk.Frame | None = None
+        self.qr_pair_image: Any = None
+        self._pending_qr_payload = ""
+        self.qr_pair_status_var = tk.StringVar(value="等待手机扫描")
+        self.qr_pair_session = 0
+        self.qr_pair_cancel_event: threading.Event | None = None
         self.macos_floating_process: subprocess.Popen[str] | None = None
         self.gui_config = load_gui_config()
         self.locked_serial_var = tk.StringVar()
@@ -378,8 +395,18 @@ class AdbPilotGui(BaseTk):
 
         wireless = ttk.LabelFrame(side, text="无线调试")
         wireless.pack(fill=tk.X, pady=(14, 0))
+        self.pair_addr_var = tk.StringVar(value="192.168.1.10:37123")
+        self.pair_code_var = tk.StringVar()
         self.connect_addr_var = tk.StringVar(value="192.168.1.10:5555")
-        ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(6, 4))
+        ttk.Label(wireless, text="配对地址").pack(anchor=tk.W, padx=6, pady=(6, 0))
+        ttk.Entry(wireless, textvariable=self.pair_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Label(wireless, text="配对码").pack(anchor=tk.W, padx=6, pady=(2, 0))
+        ttk.Entry(wireless, textvariable=self.pair_code_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
+        ttk.Button(wireless, text="配对", command=self.pair_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(2, 6))
+        ttk.Button(wireless, text="扫码配对", command=self.qr_pair_device, style="Primary.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Button(wireless, text="连接已配对", command=self.connect_paired_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
+        ttk.Label(wireless, text="连接地址").pack(anchor=tk.W, padx=6, pady=(2, 0))
+        ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
         wireless_actions = ttk.Frame(wireless, style="Surface.TFrame")
         wireless_actions.pack(fill=tk.X, padx=6, pady=(2, 6))
         ttk.Button(wireless_actions, text="连接", command=self.connect_device, style="Primary.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
@@ -1276,6 +1303,16 @@ class AdbPilotGui(BaseTk):
             except queue.Empty:
                 break
 
+            if kind == "progress":
+                if label.startswith("扫码配对:") and label.split(":", 2)[1] != str(self.qr_pair_session):
+                    continue
+                self._append_output(f"{payload}\n")
+                if label.startswith("扫码配对") or label == "安装依赖":
+                    message = str(payload).split("\n", 1)[0]
+                    self.qr_pair_status_var.set(message)
+                    self._update_dependency_progress(message)
+                continue
+
             if kind == "ok":
                 if label != "设备监听":
                     self.status_var.set(f"完成：{label}")
@@ -1284,12 +1321,18 @@ class AdbPilotGui(BaseTk):
                 elif payload is not None:
                     self._append_output(f"{payload}\n")
             else:
+                if label.startswith("扫码配对:") and label.split(":", 2)[1] != str(self.qr_pair_session):
+                    continue
                 if callback:
                     callback(payload)
                 if label != "设备监听":
                     self.status_var.set(f"失败：{label}")
                     self._append_output(f"错误：{payload}\n")
-                if label != "设备监听" and isinstance(payload, AdbPilotError):
+                if label.startswith("扫码配对"):
+                    self.qr_pair_status_var.set("扫码配对失败，请查看输出日志")
+                if label == "安装依赖":
+                    self.qr_pair_status_var.set("依赖安装失败，请查看输出日志")
+                if label != "设备监听" and not label.startswith("扫码配对") and isinstance(payload, AdbPilotError):
                     messagebox.showerror("AdbPilot", str(payload))
 
         self.after(100, self._process_results)
@@ -1383,6 +1426,12 @@ class AdbPilotGui(BaseTk):
             for serial, row in self.device_rows.items()
             if row.get("state") != "已断开"
         }
+        unique_devices: dict[str, Device] = {}
+        for device in devices:
+            previous = unique_devices.get(device.serial)
+            if previous is None or (not previous.is_ready and device.is_ready):
+                unique_devices[device.serial] = device
+        devices = list(unique_devices.values())
         self.devices = devices
         current_serials = {device.serial for device in devices}
         for item in self.device_table.get_children():
@@ -1414,19 +1463,6 @@ class AdbPilotGui(BaseTk):
                     continue
                 details = dict(row.get("details", {}))
                 next_rows[serial] = {"state": "已断开", "details": details}
-                self.device_table.insert(
-                    "",
-                    tk.END,
-                    values=(
-                        serial,
-                        "已断开",
-                        details.get("product", ""),
-                        details.get("model", ""),
-                        details.get("device", ""),
-                        device_connection_type(serial, details),
-                    ),
-                    tags=("disconnected",),
-                )
 
         self.device_table.tag_configure("disconnected", foreground="#9ca3af")
         self.device_rows = next_rows
@@ -1454,9 +1490,6 @@ class AdbPilotGui(BaseTk):
         if noisy or connected or disconnected:
             self._append_output(f"检测到 {len(devices)} 台在线设备\n")
         self._update_lock_status()
-        selected_for_logs = self.selected_serial_var.get().strip()
-        if selected_for_logs in current_serials and not self.log_package_var.get().strip():
-            self.use_foreground_package(default_only=True)
         self._render_floating_devices()
 
     def show_device_info(self) -> None:
@@ -1469,6 +1502,186 @@ class AdbPilotGui(BaseTk):
             messagebox.showwarning("AdbPilot", "请输入 host:port 地址")
             return
         self._run_async(f"连接 {address}", lambda: self._get_client().connect(address))
+
+    def connect_paired_device(self) -> None:
+        self._run_async("连接已配对设备", lambda: self._get_client().connect_paired_by_mdns())
+
+    def pair_device(self) -> None:
+        address = self.pair_addr_var.get().strip()
+        code = self.pair_code_var.get().strip()
+        if not address:
+            messagebox.showwarning("AdbPilot", "请输入配对 host:port 地址")
+            return
+        if not code:
+            messagebox.showwarning("AdbPilot", "请输入无线调试配对码")
+            return
+        self._run_async(f"配对 {address}", lambda: self._get_client().pair(address, code))
+
+    def qr_pair_device(self) -> None:
+        if self.qr_pair_cancel_event is not None:
+            self.qr_pair_cancel_event.set()
+        self.qr_pair_session += 1
+        session = self.qr_pair_session
+        cancel_event = threading.Event()
+        self.qr_pair_cancel_event = cancel_event
+        service_name, password, payload = generate_adb_qr_pairing_payload()
+        if not self._show_qr_pairing_window(payload):
+            return
+        self.qr_pair_status_var.set("等待手机扫描")
+        self._append_output(
+            "扫码配对：进入扫码匹配状态，等待手机扫描。\n"
+            "请在手机进入“开发者选项 > 无线调试 > 使用二维码配对设备”并扫描弹窗二维码。\n"
+        )
+
+        def done(result: str) -> None:
+            if session != self.qr_pair_session:
+                return
+            self.qr_pair_status_var.set("扫码配对完成")
+            self._append_output(f"{result}\n")
+            self.refresh_devices()
+
+        self._run_async(
+            f"扫码配对:{session}:{service_name}",
+            lambda: self._get_client().pair_by_qr(
+                service_name,
+                password,
+                cancelled=cancel_event.is_set,
+                progress=lambda message: self.result_queue.put(
+                    ("progress", f"扫码配对:{session}", message, None)
+                ),
+            ),
+            done,
+        )
+
+    def _show_qr_pairing_window(self, payload: str) -> bool:
+        self._pending_qr_payload = payload
+        if self.qr_pair_window is not None and self.qr_pair_window.winfo_exists():
+            self.qr_pair_window.destroy()
+
+        window = tk.Toplevel(self)
+        window.title("扫码配对")
+        window.resizable(False, False)
+        window.configure(bg=COLORS["surface"])
+        window.transient(self)
+        window.grab_set()
+        window.protocol("WM_DELETE_WINDOW", self._close_qr_pairing_window)
+
+        ttk.Label(window, text="无线调试扫码配对", style="Header.TLabel").pack(anchor=tk.W, padx=16, pady=(14, 4))
+        ttk.Label(
+            window,
+            text="手机打开无线调试，选择“使用二维码配对设备”后扫描此码。",
+            style="Muted.TLabel",
+            wraplength=340,
+        ).pack(anchor=tk.W, padx=16, pady=(0, 10))
+        ttk.Label(
+            window,
+            textvariable=self.qr_pair_status_var,
+            style="Status.TLabel",
+            wraplength=340,
+        ).pack(anchor=tk.W, padx=16, pady=(0, 10))
+
+        content = ttk.Frame(window, style="Surface.TFrame")
+        content.pack(fill=tk.BOTH, padx=16, pady=(0, 8))
+        self.qr_pair_content = content
+        actions = ttk.Frame(window, style="Surface.TFrame")
+        actions.pack(fill=tk.X, padx=16, pady=(0, 14))
+        ttk.Button(actions, text="关闭", command=self._close_qr_pairing_window, style="Quiet.TButton").pack(side=tk.RIGHT)
+        self.qr_pair_window = window
+
+        if not self._render_qr_code(payload, content):
+            self._show_qr_dependency_prompt(content)
+        return True
+
+    def _render_qr_code(self, payload: str, parent: ttk.Frame) -> bool:
+        try:
+            import qrcode
+            from PIL import ImageTk
+        except ImportError:
+            return False
+        for child in parent.winfo_children():
+            child.destroy()
+        image = qrcode.make(payload).resize((300, 300))
+        self.qr_pair_image = ImageTk.PhotoImage(image)
+        ttk.Label(parent, image=self.qr_pair_image).pack(pady=(0, 8))
+        return True
+
+    def _show_qr_dependency_prompt(self, parent: ttk.Frame) -> None:
+        for child in parent.winfo_children():
+            child.destroy()
+        self.qr_pair_status_var.set("缺少二维码依赖")
+        ttk.Label(
+            parent,
+            text="生成二维码需要 qrcode。点击后会下载并自动安装，完成后显示二维码。",
+            style="Muted.TLabel",
+            wraplength=320,
+        ).pack(anchor=tk.W, pady=(8, 12))
+        self.qr_dependency_progress = ttk.Progressbar(parent, mode="determinate", maximum=100)
+        self.qr_dependency_progress.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(
+            parent,
+            text="下载并安装 qrcode",
+            command=self.install_qrcode_dependency,
+            style="Primary.TButton",
+        ).pack(fill=tk.X, pady=(0, 8))
+
+    def _update_dependency_progress(self, message: str) -> None:
+        bar = getattr(self, "qr_dependency_progress", None)
+        if bar is None or not bar.winfo_exists():
+            return
+        if (message.startswith("下载进度") or message.startswith("正在安装")) and "%" in message:
+            percent = message.split("%", 1)[0].rsplit(" ", 1)[-1]
+            try:
+                bar.stop()
+                bar.configure(mode="determinate", maximum=100)
+                bar["value"] = int(percent)
+            except ValueError:
+                pass
+            return
+        if message.startswith(("准备下载", "正在下载")):
+            bar.configure(mode="indeterminate")
+            bar.start(12)
+            return
+        if message.startswith(("开始安装", "正在安装")):
+            bar.stop()
+            bar.configure(mode="indeterminate")
+            bar.start(12)
+            return
+        if message == "安装完成":
+            bar.stop()
+            bar.configure(mode="determinate", maximum=100)
+            bar["value"] = 100
+
+    def install_qrcode_dependency(self) -> None:
+        self.qr_pair_status_var.set("准备下载 qrcode")
+        self._update_dependency_progress("准备下载 qrcode")
+
+        def report(message: str) -> None:
+            self.result_queue.put(("progress", "安装依赖", message, None))
+
+        def done(result: str) -> None:
+            payload = getattr(self, "_pending_qr_payload", "")
+            content = getattr(self, "qr_pair_content", None)
+            if content is not None and content.winfo_exists() and self._render_qr_code(payload, content):
+                self.qr_pair_status_var.set("等待手机扫描")
+                self._append_output(f"{result}\n二维码已生成。\n")
+                return
+            self.qr_pair_status_var.set("依赖已安装，但二维码仍无法生成")
+            self._append_output(f"{result}\n")
+
+        self._run_async(
+            "安装依赖",
+            lambda: install_dependency(
+                DependencyRequest(requirement="qrcode[pil]", import_names=("qrcode", "PIL")),
+                progress=report,
+            ),
+            done,
+        )
+
+    def _close_qr_pairing_window(self) -> None:
+        if self.qr_pair_cancel_event is not None:
+            self.qr_pair_cancel_event.set()
+        if self.qr_pair_window is not None and self.qr_pair_window.winfo_exists():
+            self.qr_pair_window.destroy()
 
     def disconnect_device(self) -> None:
         address = self.connect_addr_var.get().strip() or None

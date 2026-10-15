@@ -1,9 +1,57 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
 
-from adbpilot.client import parse_devices, parse_foreground_package, parse_key_value_lines, parse_package_dump, parse_processes
+from adbpilot.client import (
+    AdbClient,
+    find_mdns_service,
+    parse_devices,
+    parse_foreground_package,
+    parse_key_value_lines,
+    parse_mdns_services,
+    mdns_address_host,
+    parse_package_dump,
+    parse_processes,
+)
+from adbpilot.models import Device
+from adbpilot.errors import DeviceSelectionError
 
 
 class ClientParsingTests(unittest.TestCase):
+    def test_parse_mdns_services(self):
+        output = """List of discovered mdns services
+adb-14141FDF600081-QXjCrW  _adb-tls-pairing._tcp  192.168.86.38:33861
+studio-abc123XYZ9          _adb-tls-pairing._tcp  192.168.86.39:55861
+adb-14141FDF600081-TnSdi9  _adb-tls-connect._tcp.  192.168.86.38:33015
+adb-e8d3d34b-1grL4          adb-tls-connect._tcp   192.168.1.71:44177
+"""
+
+        services = parse_mdns_services(output)
+        service = find_mdns_service(
+            services,
+            name="studio-abc123XYZ9",
+            service_type="_adb-tls-pairing._tcp",
+        )
+        connect = find_mdns_service(
+            services,
+            service_type="_adb-tls-connect._tcp",
+            host="192.168.86.38",
+        )
+
+        self.assertEqual(len(services), 4)
+        self.assertEqual(service["address"], "192.168.86.39:55861")
+        self.assertEqual(connect["name"], "adb-14141FDF600081-TnSdi9")
+        connect_without_leading_underscore = find_mdns_service(
+            services,
+            service_type="_adb-tls-connect._tcp",
+            host="192.168.1.71",
+        )
+        self.assertEqual(connect_without_leading_underscore["address"], "192.168.1.71:44177")
+
+    def test_mdns_address_host(self):
+        self.assertEqual(mdns_address_host("192.168.86.38:33015"), "192.168.86.38")
+        self.assertEqual(mdns_address_host("[fe80::abcd]:33015"), "fe80::abcd")
+
     def test_parse_devices_with_details(self):
         output = """List of devices attached
 emulator-5554 device product:sdk_gphone64 model:sdk_gphone64_x86_64 device:emu64x transport_id:1
@@ -21,6 +69,52 @@ ZYX987 no permissions usb:2-1
         self.assertEqual(devices[1].state, "offline")
         self.assertEqual(devices[2].state, "unauthorized")
         self.assertEqual(devices[3].state, "no permissions")
+
+    def test_deduplicate_devices_by_hardware_serial(self):
+        client = AdbClient("adb")
+        client.run = Mock(
+            side_effect=lambda args, **kwargs: SimpleNamespace(
+                stdout={"adb-phone._adb-tls-connect._tcp.": "PHONE-001", "192.168.1.71:44177": "PHONE-001"}[
+                    kwargs["serial"]
+                ]
+            )
+        )
+        devices = [
+            Device("adb-phone._adb-tls-connect._tcp.", "device"),
+            Device("192.168.1.71:44177", "device"),
+        ]
+
+        result = client._deduplicate_devices(devices)
+
+        self.assertEqual([device.serial for device in result], ["192.168.1.71:44177"])
+        self.assertEqual(client.run.call_count, 2)
+
+    def test_pair_by_qr_can_be_cancelled_and_logs_exit(self):
+        client = AdbClient("adb")
+        client.mdns_services = Mock(return_value="List of discovered mdns services\n")
+        progress = []
+
+        with self.assertRaises(DeviceSelectionError):
+            client.pair_by_qr(
+                "studio-test",
+                "password",
+                timeout=120,
+                cancelled=lambda: True,
+                progress=progress.append,
+            )
+
+        self.assertEqual(progress[0], "扫码配对：进入等待扫码状态")
+        self.assertEqual(progress[-1], "扫码配对：退出扫码匹配状态（已取消）")
+
+    def test_pair_by_qr_logs_exit_when_initial_mdns_fails(self):
+        client = AdbClient("adb")
+        client.mdns_services = Mock(side_effect=RuntimeError("mdns unavailable"))
+        progress = []
+
+        with self.assertRaises(RuntimeError):
+            client.pair_by_qr("studio-test", "password", progress=progress.append)
+
+        self.assertEqual(progress[-1], "扫码配对：退出扫码匹配状态（异常）")
 
     def test_parse_key_value_lines(self):
         output = """AC powered: false

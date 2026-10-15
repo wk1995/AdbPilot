@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     connect.add_argument("address")
     connect.set_defaults(handler=handle_connect)
 
+    pair = subparsers.add_parser("pair", help="配对 Android 11+ 无线调试设备，例如 192.168.1.10:37123 123456")
+    pair.add_argument("address")
+    pair.add_argument("code")
+    pair.set_defaults(handler=handle_pair)
+
     disconnect = subparsers.add_parser("disconnect", help="断开无线调试设备")
     disconnect.add_argument("address", nargs="?")
     disconnect.set_defaults(handler=handle_disconnect)
@@ -248,6 +253,11 @@ def handle_info(client: AdbClient, args: argparse.Namespace) -> int:
 
 def handle_connect(client: AdbClient, args: argparse.Namespace) -> int:
     print(client.connect(args.address))
+    return 0
+
+
+def handle_pair(client: AdbClient, args: argparse.Namespace) -> int:
+    print(client.pair(args.address, args.code))
     return 0
 
 
