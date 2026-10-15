@@ -22,7 +22,7 @@ on:
 permissions:
   contents: write
   actions: read
-  pull-requests: read
+  pull-requests: write
 
 # Serialize version decisions and uploads, including manual runs and reruns.
 concurrency:
@@ -42,6 +42,7 @@ jobs:
       macos_version: ${{ steps.resolve.outputs.macos_version }}
       windows_tag: ${{ steps.resolve.outputs.windows_tag }}
       macos_tag: ${{ steps.resolve.outputs.macos_tag }}
+      defer_build: ${{ steps.release.outputs.defer_build }}
       release_sha: ${{ steps.release.outputs.release_sha }}
     steps:
       - name: Checkout source
@@ -70,7 +71,7 @@ jobs:
             --macos "$INPUT_MACOS" \
             --apply
 
-      - name: Commit, tag, and create platform releases
+      - name: Open version pull request or tag the merged release
         if: steps.resolve.outputs.windows_build == 'true' || steps.resolve.outputs.macos_build == 'true'
         id: release
         env:
@@ -92,14 +93,37 @@ jobs:
           git add readme.md packaging/windows/version.txt packaging/windows/README.md \
             packaging/windows/file_version_info.txt packaging/macos/version.txt packaging/macos/README.md
 
-          if git diff --cached --quiet; then
-            echo "No version file changes to commit."
-          else
-            git commit -m "[home][mac-min] chore: release desktop platform versions [skip ci]"
-            git push origin HEAD:master
+          defer_build=false
+          if ! git diff --cached --quiet; then
+            # master only accepts pull requests, so the version bump waits there.
+            # Packages are built on the later run, after that pull request merges.
+            git commit -m "[home][mac-min] chore: release desktop platform versions"
+            release_branch="release/desktop-versions"
+            git push --force-with-lease origin "HEAD:refs/heads/$release_branch"
+            pr_number="$(gh pr view "$release_branch" --json number,state --jq 'select(.state=="OPEN") | .number')"
+            if [ -z "$pr_number" ]; then
+              pr_url="$(gh pr create \
+                --base master \
+                --head "$release_branch" \
+                --title "[home][mac-min] chore: release desktop platform versions" \
+                --body "$(cat <<'EOF'
+Automated version bump. Packages are built only after this pull request merges.
+
+Required checks merge this pull request when they pass.
+EOF
+)")"
+              pr_number="${pr_url##*/}"
+            fi
+            gh pr merge "$pr_number" --merge --auto
+            defer_build=true
           fi
 
           release_sha="$(git rev-parse HEAD)"
+          echo "defer_build=$defer_build" >> "$GITHUB_OUTPUT"
+          if [ "$defer_build" = true ]; then
+            echo "Version bump is waiting on a pull request; packages are not built yet."
+            exit 0
+          fi
 
           create_release() {
             local platform="$1"
@@ -134,7 +158,7 @@ jobs:
     name: Build Windows ${{ matrix.systemos }}-bit
     runs-on: windows-latest
     needs: version
-    if: needs.version.outputs.windows_build == 'true'
+    if: needs.version.outputs.windows_build == 'true' && needs.version.outputs.defer_build != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -195,7 +219,7 @@ jobs:
     name: Build macOS ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     needs: version
-    if: needs.version.outputs.macos_build == 'true'
+    if: needs.version.outputs.macos_build == 'true' && needs.version.outputs.defer_build != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -259,6 +283,7 @@ jobs:
     needs: [version, build-windows, build-macos]
     if: >-
       always() && needs.version.result == 'success' &&
+      needs.version.outputs.defer_build != 'true' &&
       (needs.build-windows.result == 'success' || needs.build-macos.result == 'success')
     env:
       GH_TOKEN: ${{ github.token }}

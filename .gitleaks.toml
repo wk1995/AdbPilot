@@ -1,0 +1,15 @@
+title = "AdbPilot secret scan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documentation placeholders and CI references, not live credentials"
+paths = [
+  '''(^|/)\.github/workflows/.*\.ya?ml$''',
+]
+regexes = [
+  '''PUBLISH_APP_FROM_ADB_PILOT_TO_GITHUB_IO''',
+  '''secrets\.[A-Z0-9_]+''',
+  '''github\.token''',
+]
