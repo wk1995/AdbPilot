@@ -55,10 +55,14 @@ def format_pip_progress(line: str, state: dict[str, int]) -> str | None:
     if progress:
         current = int(progress.group(1))
         total = int(progress.group(2))
-        state["install_seen"] = max(state.get("install_seen", 0), 1)
+        installing = state.get("install_seen", 0) > 0
         if total > 0:
             percent = min(100, int(current * 100 / total))
+            if installing:
+                return f"正在安装 {percent}%（{current} / {total}）"
             return f"下载进度 {percent}%（{_format_bytes(current)} / {_format_bytes(total)}）"
+        if installing:
+            return f"正在安装 {current}"
         return f"下载进度 {_format_bytes(current)}"
 
     if text.startswith("Installing collected packages"):

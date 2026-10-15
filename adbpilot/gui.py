@@ -1628,7 +1628,7 @@ class AdbPilotGui(BaseTk):
         bar = getattr(self, "qr_dependency_progress", None)
         if bar is None or not bar.winfo_exists():
             return
-        if message.startswith("下载进度") and "%" in message:
+        if (message.startswith("下载进度") or message.startswith("正在安装")) and "%" in message:
             percent = message.split("%", 1)[0].rsplit(" ", 1)[-1]
             try:
                 bar.stop()
