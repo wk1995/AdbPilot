@@ -26,6 +26,7 @@ screenshots/
 apks/
 .adbpilot/
 .superpowers/
+.workbuddy/
 
 # OS / editor
 .DS_Store
