@@ -7,8 +7,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from adbpilot.client import AdbClient
-from adbpilot.errors import AdbCommandError, AdbNotFoundError
+from adbpilot.errors import AdbCommandError, AdbNotFoundError, PairingCodeError
 from adbpilot.gui import AdbPilotGui
+from adbpilot.models import WirelessPairingResult
 
 
 class WirelessClientTests(unittest.TestCase):
@@ -136,6 +137,75 @@ class WirelessGuiTests(unittest.TestCase):
         self.assertEqual(self.gui.wireless_status_var.get(), "断开成功：localhost:5555")
         self.assertFalse(self.gui.wireless_busy)
         self.gui.refresh_devices.assert_called_once()
+
+
+class PairingGuiTests(unittest.TestCase):
+    def setUp(self):
+        self.client = Mock()
+        self.gui = SimpleNamespace(
+            pair_addr_var=Value("192.168.1.10:37123"),
+            pair_code_var=Value("123456"),
+            connect_addr_var=Value(""),
+            wireless_status_var=Value(),
+            capability_status_var=Value(),
+            status_var=Value(),
+            wireless_busy=False,
+            pairing_in_progress=False,
+            pair_button=Mock(),
+            connect_addr_entry=Mock(),
+            _get_client=Mock(return_value=self.client),
+            _append_output=Mock(),
+            refresh_devices=Mock(),
+            after=Mock(),
+            result_queue=queue.Queue(),
+        )
+        for name in ("pair_device", "_set_pairing_busy", "_run_async", "_process_results"):
+            setattr(self.gui, name, getattr(AdbPilotGui, name).__get__(self.gui))
+        thread_patch = patch("adbpilot.gui.threading.Thread")
+        self.thread = thread_patch.start()
+        self.addCleanup(thread_patch.stop)
+        error_patch = patch("adbpilot.gui.messagebox.showerror")
+        error_patch.start()
+        self.addCleanup(error_patch.stop)
+
+    def finish_worker(self):
+        self.thread.call_args.kwargs["target"]()
+        self.gui._process_results()
+
+    def test_submit_clears_code_and_blocks_repeat(self):
+        self.client.pair.return_value = WirelessPairingResult("paired_and_connected", True, True, "192.168.1.10:37123")
+        self.gui.pair_device()
+        self.assertEqual(self.gui.pair_code_var.get(), "")
+        self.assertTrue(self.gui.pairing_in_progress)
+        self.gui.pair_device()
+        self.assertEqual(self.thread.call_count, 1)
+        self.finish_worker()
+        self.assertFalse(self.gui.pairing_in_progress)
+        self.client.pair.assert_called_once_with("192.168.1.10:37123", "123456", connect_address=None)
+
+    def test_waiting_for_connect_focuses_connection_address(self):
+        self.client.pair.return_value = WirelessPairingResult(
+            "paired_waiting_for_connect",
+            True,
+            False,
+            "192.168.1.10:37123",
+            next_action="请填写连接地址",
+        )
+        self.gui.pair_device()
+        self.finish_worker()
+        self.gui.connect_addr_entry.focus_set.assert_called_once()
+        self.gui.refresh_devices.assert_not_called()
+        self.assertIn("请填写连接地址", self.gui.wireless_status_var.get())
+
+    def test_invalid_code_is_visible_and_allows_retry(self):
+        self.client.pair.side_effect = PairingCodeError("请输入当前显示的 6 位数字")
+        self.gui.pair_device()
+        self.finish_worker()
+        self.assertIn("6 位数字", self.gui.wireless_status_var.get())
+        self.assertFalse(self.gui.pairing_in_progress)
+        self.gui.pair_code_var.set("654321")
+        self.gui.pair_device()
+        self.assertEqual(self.thread.call_count, 2)
 
 
 if __name__ == "__main__":
