@@ -215,24 +215,59 @@ class WifiStateMachineTests(unittest.TestCase):
         self.assertFalse(capabilities.wifi2_host_compatible)
 
     def test_network_probe_uses_service_version_not_android_version(self):
-        service = "service: _adb-tls-connect\nmdns_service_version: 2.0\nbuild_version_sdk_full: 37\n"
-        older = "service: _adb-tls-connect\nbuild_version_sdk_full: 37\n"
-        with patch("adbpilot.client.subprocess.run") as run:
-            run.side_effect = [
-                self.version("37.0.1"),
-                self.capabilities(),
-                subprocess.CompletedProcess([], 0, service, ""),
-            ]
-            wifi2 = self.client.wifi_capabilities(probe_network=True)
-            run.side_effect = [
-                self.version("37.0.1"),
-                self.capabilities(),
-                subprocess.CompletedProcess([], 0, older, ""),
-            ]
-            wifi1 = self.client.wifi_capabilities(probe_network=True)
+        wifi2 = self._capabilities_with_track_output(
+            "service: _adb-tls-connect\nmdns_service_version: 2.0\nbuild_version_sdk_full: 37\n"
+        )
+        wifi1 = self._capabilities_with_track_output(
+            "service: _adb-tls-connect\nbuild_version_sdk_full: 37\n"
+        )
         self.assertEqual(wifi2.device_generation, "wifi2")
         self.assertEqual(wifi1.device_generation, "wifi1")
         self.assertEqual(wifi2.network_mdns_status, "visible")
+
+    def _capabilities_with_track_output(self, output):
+        process = Mock()
+        process.communicate.return_value = (output, "")
+        with patch("adbpilot.client.subprocess.run") as run, patch(
+            "adbpilot.client.subprocess.Popen", return_value=process
+        ):
+            run.side_effect = [self.version("37.0.1"), self.capabilities()]
+            return self.client.wifi_capabilities(probe_network=True)
+
+    def test_track_services_timeout_keeps_output_collected_before_stop(self):
+        service = "service: _adb-tls-connect\nmdns_service_version: 2.0\n"
+        process = Mock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["adb", "mdns"], 3),
+            (service, ""),
+        ]
+        with patch("adbpilot.client.subprocess.run") as run, patch(
+            "adbpilot.client.subprocess.Popen", return_value=process
+        ):
+            run.side_effect = [self.version("37.0.1"), self.capabilities()]
+            capabilities = self.client.wifi_capabilities(probe_network=True)
+        process.kill.assert_called_once()
+        self.assertEqual(capabilities.device_generation, "wifi2")
+        self.assertEqual(capabilities.network_mdns_status, "visible")
+
+    def test_track_services_timeout_without_output_stays_unknown(self):
+        process = Mock()
+        process.communicate.side_effect = [
+            subprocess.TimeoutExpired(["adb", "mdns"], 3),
+            ("", ""),
+        ]
+        with patch("adbpilot.client.subprocess.run") as run, patch(
+            "adbpilot.client.subprocess.Popen", return_value=process
+        ):
+            run.side_effect = [self.version("37.0.1"), self.capabilities()]
+            capabilities = self.client.wifi_capabilities(probe_network=True)
+        self.assertEqual(capabilities.network_mdns_status, "unknown")
+        self.assertEqual(capabilities.device_generation, "unknown")
+
+    def test_track_services_header_without_device_stays_unknown(self):
+        capabilities = self._capabilities_with_track_output("Services:\n")
+        self.assertEqual(capabilities.network_mdns_status, "unknown")
+        self.assertFalse(any("无线调试已开启" in warning for warning in capabilities.warnings))
 
     def test_ambiguous_success_does_not_claim_paired(self):
         with patch("adbpilot.client.subprocess.run") as run:
