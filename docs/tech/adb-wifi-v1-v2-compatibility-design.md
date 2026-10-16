@@ -2,7 +2,7 @@
 
 - 状态：Draft
 - 日期：2026-08-20
-- 修订：2026-10-16，按当前 ADB 用户文档与 Platform-Tools 发布说明校正能力检测、自动连接和版本边界
+- 修订：2026-10-16，按当前 ADB 用户文档校正能力检测；同日按当前代码把配对、扫码和连接从「待实现」改为「已有，需补齐」
 - 目标分支：`codex/feat-adb-wifi-v1-v2-compat`
 - 关联 PRD：[AdbPilot ADB Wi-Fi 1.0 / 2.0 兼容 PRD](../product/adb-wifi-v1-v2-compatibility-prd.md)
 
@@ -40,20 +40,21 @@ Android 官方资料给出的关键约束如下：
 
 ### 3.1 当前实现
 
-- `adbpilot/client.py` 已有 `connect()`、`disconnect()`、`devices()`、`version()` 与统一的 `run()`。
-- `adbpilot/cli.py` 已暴露 `connect` / `disconnect`。
-- `adbpilot/ai_cli.py` 已暴露同名 JSON 操作与 schema。
-- `adbpilot/gui.py` 的“无线调试”区域只有一个连接地址输入框；操作通过 `_run_async()` 在后台线程执行。
-- 测试以 Python `unittest` 为主，现有客户端测试更偏向纯解析逻辑。
+- `adbpilot/client.py` 已有 `connect()`、`disconnect()`、`pair(address, pairing_code)`、`pair_by_qr()`、`mdns_services()`、`connect_paired_by_mdns()`、`devices()` 和 `version()`。
+- `pair()` 目前执行 `adb pair <地址> <配对码>`，配对码在命令参数中。
+- `pair_by_qr()` 生成临时服务名和配对信息，等待 `_adb-tls-pairing` 或直接出现的 `_adb-tls-connect`，再连接新设备。
+- `connect_paired_by_mdns()` 等待 `_adb-tls-connect`；找不到时提示改填无线调试主页上的连接地址。
+- `adbpilot/gui.py` 的「无线调试」已有配对地址、配对码、扫码配对、连接已配对、连接地址、连接和断开。操作走后台线程。
+- `adbpilot/cli.py` 与 `adbpilot/ai_cli.py` 已暴露 `connect` / `disconnect`，尚未暴露能力检查和配对。
+- 测试以 Python `unittest` 为主。
 
 ### 3.2 当前缺口
 
-- 没有 `adb pair` 封装，GUI 无法完成 Android 11+ 安全配对。
-- 没有区分配对地址和连接地址，容易误用端口。
-- 没有稳定的 platform-tools 版本解析或无线能力模型。
-- 直接复用现有 `run()` 无法安全地通过标准输入传入配对码。
-- 错误只有通用 `AdbCommandError`，界面无法给出针对无线配对的下一步。
-- 三个入口缺少统一的结构化配对结果。
+- 没有 `wifi_capabilities()`，不读取 `adb server-status`，也不读取 `mdns_service_version`。界面不能区分主机条件和设备代际。
+- 配对地址和连接地址已经分栏，但没有在调用 adb 前拦截空地址、非法端口和控制字符。
+- 六位配对码和扫码临时配对信息都会进入 adb 命令参数，不符合本方案的脱敏约束。
+- 错误仍主要是通用 `AdbCommandError` 或一段提示文本，没有本方案的错误类别。
+- GUI、CLI、JSON CLI 没有共用的配对结果对象。CLI 和 JSON CLI 还不能做能力检查和配对。
 
 ## 4. 目标与非目标
 
@@ -69,7 +70,7 @@ Android 官方资料给出的关键约束如下：
 
 - 不自行实现 TLS 配对、mDNS responder/browser 或 Wi-Fi 2.0 协议。
 - 不在 MVP 使用 `host:track-mdns-services` 等内部/低层 ADB Server 服务。
-- 不生成二维码，不解析 Android Studio 私有状态，不操作 ADB 私钥文件。
+- 不重写现有扫码配对，不解析 Android Studio 私有状态，不操作 ADB 私钥文件。现有二维码流程只补齐脱敏、取消和失败分类。
 - 不实现 ADB Server mDNS 自动重启；该能力进入后续独立设计。
 - 不自动执行设备侧 `adb tcpip`。
 
@@ -359,15 +360,12 @@ class AdbConnectionError(AdbCommandError): ...
 
 ### 11.1 布局
 
-保留现有侧栏“无线调试”区域，避免破坏主界面：
+保留现有侧栏「无线调试」区域。配对地址、配对码、扫码配对、连接已配对、连接地址、连接和断开都已经存在，本方案不重做这些入口：
 
-- 顶部显示简短能力状态，例如“经典连接可用 · 安全配对可用 · 主机具备 Wi-Fi 2.0 条件”。最后一项必须同时满足版本、`mdns_enabled` 和后端要求，不能只因为版本不低于 37 就显示。
-- 保留当前连接地址、连接、断开控件，标题改为“经典/已配对设备连接”。
-- 新增“安全配对…”按钮，打开模态 `tk.Toplevel`：
-  - 配对地址（必填）。
-  - 六位配对码（必填，掩码显示）。
-  - 连接地址（可选，明确说明来自无线调试主页）。
-  - “配对”与“取消”。
+- 顶部增加简短能力状态，例如“经典连接可用 · 安全配对可用 · 主机具备 Wi-Fi 2.0 条件”。最后一项必须同时满足版本、`mdns_enabled` 和后端要求，不能只因为版本不低于 37 就显示。
+- 连接地址、连接、断开保留，标题改为“经典/已配对设备连接”，避免和配对地址混用。
+- 现有配对栏继续承担六位码流程：配对地址必填，配对码掩码显示。配对成功但设备没有自动出现时，把焦点放到连接地址，不要求重新输入配对码。
+- 现有扫码配对保留。电脑继续出示二维码，手机扫描；补齐临时配对信息脱敏、取消和失败分类，不改扫码方向。
 - 提供“检查能力”入口，不在应用启动时强制执行额外 adb 命令。
 
 ### 11.2 交互状态
@@ -528,7 +526,7 @@ python -m unittest discover -s tests -v
 3. 实现 `wifi_capabilities()`、`pair()` 与配对后设备差异验证。
 4. 接入普通 CLI 与 `tests/test_cli.py`。
 5. 接入 JSON CLI schema/operation 与脱敏测试。
-6. 接入 GUI 配对对话框、异步状态和刷新逻辑。
+6. 在现有 GUI 的配对、扫码和连接上接入能力状态、异步结果和脱敏，不新增另一套配对入口。
 7. 运行完整自动化测试与 Windows/macOS 真机矩阵。
 8. 更新 README、版本说明和产品优化清单状态。
 
@@ -540,7 +538,7 @@ python -m unittest discover -s tests -v
 | 把配对码作为 `adb pair host code` 参数 | 不采用 | 会暴露在进程列表、shell history 或调试日志中 |
 | 仅按 Android SDK 或主机 adb 版本判断 2.0 | 不采用 | 官方以 `mdns_service_version` 判断设备，以 `adb server-status` 判断主机；系统版本和 adb 版本都不能单独替代 |
 | adb 版本过低时禁用全部无线功能 | 不采用 | 经典 `adb connect` 仍可能正常工作 |
-| 首期同时做二维码和自动 mDNS 发现 | 不采用 | 扩大安全与跨平台范围，延迟核心配对码能力交付 |
+| 重写现有扫码配对，或同时做自动 mDNS 发现 | 不采用 | 扫码已在 GUI 中可用；重写它或同时做持续发现会扩大范围。本方案只补齐脱敏、取消和失败分类 |
 
 ## 19. 后续技术优化登记
 
@@ -549,7 +547,7 @@ python -m unittest discover -s tests -v
 - 基于公开 `adb mdns services` 或 adb 37+ 跟踪能力的设备发现。
 - mDNS 状态卡死的旁路证据、冷却与无在线设备保护。
 - IPv6-only 网络真机验收。地址解析已接受 `[IPv6]:port`，`track-services` 的 IPv6 与 `.local` 主机名可展示，但首期不承诺仅 IPv6 网络。
-- 二维码生成、随机服务名、临时 secret 生命周期与扫码状态机。
+- 扫码配对的取消、超时，以及临时服务名和配对信息不入日志。二维码生成本身已有，不另做一套。
 - USB `adb tcpip` 的设备选择、端口冲突和明确授权交互。
 - 配对取消、子进程终止和 GUI 生命周期一致性。
 - 多 adb 二进制与已运行 ADB Server 版本不一致的诊断。
