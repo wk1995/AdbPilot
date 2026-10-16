@@ -237,12 +237,12 @@ class AdbPilotGui(BaseTk):
         self.selected_serial_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
 
-        self._configure_style()
-        self.protocol("WM_DELETE_WINDOW", self._close_app)
-        self._build_ui()
         saved_adb_path = str(self.gui_config.get("adb_path", "")).strip()
         if saved_adb_path and Path(saved_adb_path).expanduser().is_file():
             self.adb_path_var.set(saved_adb_path)
+        self._configure_style()
+        self.protocol("WM_DELETE_WINDOW", self._close_app)
+        self._build_ui()
         if DND_FILES is None:
             self._append_output("提示：安装 tkinterdnd2 后可将文件拖到路径输入框。\n")
         self.after(100, self._process_results)
@@ -323,24 +323,16 @@ class AdbPilotGui(BaseTk):
         path_row.pack(fill=tk.X, pady=(12, 0))
 
         ttk.Label(path_row, text="ADB 路径", style="Muted.TLabel").pack(side=tk.LEFT)
-        # Explicit classic-entry colors keep the path readable with macOS themes.
-        adb_entry = tk.Entry(
+        # A writable combo keeps manual entry while offering the adb copies already found.
+        self.adb_path_combo = ttk.Combobox(
             path_row,
             textvariable=self.adb_path_var,
             width=48,
-            background=COLORS["surface"],
-            foreground=COLORS["text"],
-            insertbackground=COLORS["text"],
-            selectbackground=COLORS["accent"],
-            selectforeground="#ffffff",
-            relief=tk.FLAT,
-            borderwidth=0,
-            highlightthickness=1,
-            highlightbackground=COLORS["border"],
-            highlightcolor=COLORS["accent"],
+            values=saved_adb_paths(self.gui_config),
         )
-        adb_entry.pack(side=tk.LEFT, padx=(8, 4), ipady=5, fill=tk.X, expand=True)
-        self._register_file_drop(adb_entry, self.adb_path_var)
+        self.adb_path_combo.pack(side=tk.LEFT, padx=(8, 4), ipady=5, fill=tk.X, expand=True)
+        self.adb_path_combo.bind("<<ComboboxSelected>>", self._on_adb_path_selected)
+        self._register_file_drop(self.adb_path_combo, self.adb_path_var)
         ttk.Button(path_row, text="浏览", command=self._browse_adb, style="Quiet.TButton").pack(side=tk.LEFT, padx=4)
 
         ttk.Label(path_row, text="超时", style="Muted.TLabel").pack(side=tk.LEFT, padx=(12, 4))
@@ -674,6 +666,8 @@ class AdbPilotGui(BaseTk):
         if path:
             self.adb_path_var.set(path)
             self._remember_adb_path(path)
+            if hasattr(self, "_refresh_adb_path_choices"):
+                self._refresh_adb_path_choices()
 
     def _browse_apk(self) -> None:
         path = filedialog.askopenfilename(title="选择 APK", filetypes=[("APK", "*.apk"), ("所有文件", "*.*")])
@@ -1242,22 +1236,42 @@ class AdbPilotGui(BaseTk):
         variable.set(path)
         if variable is self.adb_path_var:
             self._remember_adb_path(path)
+            if hasattr(self, "_refresh_adb_path_choices"):
+                self._refresh_adb_path_choices()
         self._append_output(f"已拖入文件：{path}\n")
 
+    def _on_adb_path_selected(self, _event: tk.Event[Any] | None = None) -> None:
+        path = self.adb_path_var.get().strip()
+        if path:
+            self._remember_adb_path(path)
+            self.client = None
+
     def _resolve_initial_adb_path(self) -> None:
-        if self.adb_path_var.get().strip():
-            return
+        current = self.adb_path_var.get().strip()
         try:
-            adb_path = PlatformAdapter().resolve_adb()
+            discovered = [str(path) for path in PlatformAdapter().discover_adb_paths(current or None)]
         except AdbPilotError as exc:
             self._append_output(f"未自动找到 adb：{exc}\n")
+            self._refresh_adb_path_choices()
             return
-        self.adb_path_var.set(str(adb_path))
-        self._remember_adb_path(str(adb_path))
-        self._append_output(f"已自动找到 adb：{adb_path}\n")
+        if not current and discovered:
+            self.adb_path_var.set(discovered[0])
+            self._remember_adb_path(discovered[0])
+            self._append_output(f"已自动找到 adb：{discovered[0]}\n")
+        self._refresh_adb_path_choices(discovered)
+
+    def _refresh_adb_path_choices(self, discovered: list[str] | None = None) -> None:
+        if not hasattr(self, "adb_path_combo"):
+            return
+        current = self.adb_path_var.get().strip()
+        if discovered is None:
+            discovered = [str(path) for path in PlatformAdapter().discover_adb_paths(current or None)]
+        choices = merge_adb_paths(saved_adb_paths(self.gui_config), discovered, current)
+        self.adb_path_combo.configure(values=choices)
 
     def _remember_adb_path(self, path: str) -> None:
         self.gui_config["adb_path"] = path
+        self.gui_config["adb_paths"] = merge_adb_paths(saved_adb_paths(self.gui_config), [path])
         save_gui_config(self.gui_config)
 
     def _get_client(self) -> AdbClient:
@@ -2116,6 +2130,27 @@ def device_display_name(serial: str, details: dict[str, str]) -> str:
     if model:
         return model.replace("_", " ")
     return serial
+
+
+def saved_adb_paths(config: dict[str, Any]) -> list[str]:
+    raw = config.get("adb_paths", [])
+    values = raw if isinstance(raw, list) else []
+    current = str(config.get("adb_path", "")).strip()
+    return merge_adb_paths([str(item) for item in values if str(item).strip()], [current])
+
+
+def merge_adb_paths(*groups: list[str] | tuple[str, ...] | str) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        items = [group] if isinstance(group, str) else group
+        for item in items:
+            path = str(item).strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            merged.append(path)
+    return merged
 
 
 def gui_config_path() -> Path:
