@@ -19,6 +19,8 @@ from adbpilot.gui import (
     generate_adb_qr_pairing_payload,
     gui_config_path,
     load_gui_config,
+    merge_adb_paths,
+    saved_adb_paths,
     macos_floating_helper_build_path,
     macos_floating_helper_needs_build,
     macos_floating_helper_source_path,
@@ -138,6 +140,29 @@ class GuiHelperTests(unittest.TestCase):
 
     def test_device_display_name_falls_back_to_serial(self):
         self.assertEqual(device_display_name("abc", {}), "abc")
+
+    def test_saved_adb_paths_keep_history_and_current_path(self):
+        paths = saved_adb_paths(
+            {
+                "adb_path": "/sdk/current/adb",
+                "adb_paths": ["/sdk/old/adb", "/sdk/current/adb", "  "],
+            }
+        )
+        self.assertEqual(paths, ["/sdk/old/adb", "/sdk/current/adb"])
+
+    def test_merge_adb_paths_drops_duplicates_and_blanks(self):
+        self.assertEqual(
+            merge_adb_paths(["/a/adb", ""], ["/a/adb", "/b/adb"], "/b/adb"),
+            ["/a/adb", "/b/adb"],
+        )
+
+    def test_remember_adb_path_appends_without_replacing_history(self):
+        gui = SimpleNamespace(gui_config={"adb_path": "/old/adb", "adb_paths": ["/old/adb"]})
+        with patch("adbpilot.gui.save_gui_config") as save:
+            AdbPilotGui._remember_adb_path(gui, "/new/adb")
+        self.assertEqual(gui.gui_config["adb_path"], "/new/adb")
+        self.assertEqual(gui.gui_config["adb_paths"], ["/old/adb", "/new/adb"])
+        save.assert_called_once_with(gui.gui_config)
 
     def test_gui_config_round_trip(self):
         with TemporaryDirectory() as temp_dir:

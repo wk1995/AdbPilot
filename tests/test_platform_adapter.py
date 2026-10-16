@@ -7,6 +7,25 @@ from adbpilot.platform_adapter import PlatformAdapter
 
 
 class PlatformAdapterTests(unittest.TestCase):
+    def test_discover_adb_paths_keeps_existing_unique_files(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = root / "one" / "adb"
+            second = root / "two" / "adb"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            first.write_text("", encoding="utf-8")
+            second.write_text("", encoding="utf-8")
+            missing = root / "missing" / "adb"
+
+            adapter = PlatformAdapter(env={})
+            with patch.object(adapter, "_candidate_paths", return_value=[first, first, missing, second]), patch(
+                "adbpilot.platform_adapter.shutil.which", return_value=str(second)
+            ), patch.object(adapter, "_which_from_login_shell", return_value=None):
+                self.assertEqual(adapter.discover_adb_paths(), [first, second])
+
     def test_configured_path_takes_priority(self):
         import tempfile
 
