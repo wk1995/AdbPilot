@@ -1,4 +1,5 @@
 import os
+import queue
 import threading
 import tkinter as tk
 import unittest
@@ -155,6 +156,63 @@ class GuiHelperTests(unittest.TestCase):
             merge_adb_paths(["/a/adb", ""], ["/a/adb", "/b/adb"], "/b/adb"),
             ["/a/adb", "/b/adb"],
         )
+
+    def test_download_progress_updates_bar_without_spamming_log(self):
+        output = Mock()
+
+        class Bar(dict):
+            def winfo_exists(self) -> bool:
+                return True
+
+            def stop(self) -> None:
+                return None
+
+            def configure(self, **_kwargs: object) -> None:
+                return None
+
+        bar = Bar()
+        status = Mock()
+        gui = SimpleNamespace(
+            qr_pair_session=0,
+            result_queue=Mock(),
+            status_var=Mock(),
+            output=output,
+            adb_download_status_var=status,
+            adb_download_progress=bar,
+            _append_output=output,
+            _update_adb_download_progress=lambda message: AdbPilotGui._update_adb_download_progress(gui, message),
+            _update_dependency_progress=Mock(),
+            after=lambda _delay, callback: callback,
+        )
+        gui.result_queue.get_nowait.side_effect = [("progress", "下载 adb", "下载进度 40%", None), queue.Empty()]
+        with patch("adbpilot.gui.time.strftime", return_value="14:00:00"):
+            AdbPilotGui._process_results(gui)
+        status.set.assert_called_once_with("下载进度 40%")
+        self.assertEqual(bar["value"], 40)
+        output.assert_not_called()
+
+    def test_download_completion_switches_to_new_adb(self):
+        gui = SimpleNamespace(
+            adb_version_var=Mock(**{"get.return_value": "37.0.0"}),
+            adb_download_dir_var=Mock(**{"get.return_value": "/work/AdbPilot"}),
+            adb_path_var=Mock(),
+            client="old",
+            result_queue=Mock(),
+            _saved_download_dir=lambda: "/work/AdbPilot",
+            _remember_download_dir=Mock(),
+            _remember_adb_path=Mock(),
+            _refresh_adb_path_choices=Mock(),
+            _append_output=Mock(),
+        )
+        captured: dict[str, object] = {}
+        gui._run_async = lambda label, func, on_success=None, on_error=None: captured.update(done=on_success)
+        AdbPilotGui._start_adb_download(gui)
+        done = captured["done"]
+        path = Path("/work/AdbPilot/tools/platform-tools-37.0.0/platform-tools/adb")
+        done(path)
+        gui.adb_path_var.set.assert_called_once_with(str(path))
+        gui._remember_adb_path.assert_called_once_with(str(path))
+        self.assertIsNone(gui.client)
 
     def test_remember_adb_path_appends_without_replacing_history(self):
         gui = SimpleNamespace(gui_config={"adb_path": "/old/adb", "adb_paths": ["/old/adb"]})
