@@ -101,6 +101,8 @@
   }
   select.status { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
   textarea.note { width: min(640px, 100%); min-height: 64px; resize: vertical; }
+  textarea.note[data-need="1"] { border-color: var(--bad); background: var(--bad-soft); }
+  button[disabled] { opacity: .45; cursor: default; }
   input.env { width: min(280px, 100%); }
   .empty { padding: 40px 10px; text-align: center; color: var(--muted); }
   dialog {
@@ -256,7 +258,8 @@ function card(item) {
         <select class="status" data-field="status">${options}</select>
         <input class="env" data-field="env" placeholder="环境，例如 macOS · adb 37.0.0 · Android 15" value="${esc(item.env || "")}">
       </div>
-      <textarea class="note" data-field="note" placeholder="记录实际现象、时间、下一步">${esc(item.note || "")}</textarea>
+      <textarea class="note" data-field="note" placeholder="${item.status === "fail" ? "失败现象。写看到的提示、时间和环境" : "记录实际现象、时间、下一步"}" ${item.status === "fail" && !item.note ? "data-need=\"1\"" : ""}>${esc(item.note || "")}</textarea>
+      ${item.status === "fail" ? `<div class="row"><button class="btn" data-act="send" type="button" ${item.note ? "" : "disabled"}>发给对话</button><span class="meta" data-send="1"></span></div>` : ""}
     </div>
   </details>`;
 }
@@ -266,6 +269,54 @@ function esc(value) {
 }
 
 function find(id) { return board.cases.find((item) => item.id === id); }
+
+function failureText(item) {
+  return [
+    "人工测试失败",
+    "功能：" + board.title,
+    "用例：" + item.id + (item.group ? "（" + item.group + "）" : ""),
+    "操作：" + item.action,
+    "通过标准：" + item.expect,
+    "环境：" + (item.env || "未记录"),
+    "现象：" + item.note
+  ].join(String.fromCharCode(10));
+}
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const box = document.createElement("textarea");
+    box.value = text;
+    document.body.appendChild(box);
+    box.select();
+    const copied = document.execCommand("copy");
+    box.remove();
+    return copied;
+  }
+}
+function askHostToSend(text) {
+  const request = { source: "adbpilot-test-board", type: "send-to-chat", text: text };
+  let delivered = false;
+  try {
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage(request, "*");
+      delivered = true;
+    }
+  } catch (_) {}
+  return delivered;
+}
+async function sendFailure(item, label) {
+  const text = failureText(item);
+  const copied = await copyText(text);
+  if (askHostToSend(text) && copied) {
+    label.textContent = "已推到对话框，也放进了剪贴板";
+  } else if (copied) {
+    label.textContent = "这个窗口发不进对话框，已放到剪贴板。直接粘贴即可";
+  } else {
+    label.textContent = "没能复制，请手动选择现象文字";
+  }
+}
 
 $("list").addEventListener("change", (event) => {
   const field = event.target.dataset.field;
@@ -283,6 +334,16 @@ $("list").addEventListener("input", (event) => {
   const item = find(root.dataset.id);
   if (!item) return;
   item[field] = event.target.value;
+});
+$("list").addEventListener("click", async (event) => {
+  if (event.target.dataset.act !== "send") return;
+  const root = event.target.closest(".case");
+  const item = root && find(root.dataset.id);
+  const label = root.querySelector("[data-send]");
+  if (!item || !item.note || !label) return;
+  event.target.disabled = true;
+  await sendFailure(item, label);
+  event.target.disabled = false;
 });
 $("filters").addEventListener("click", (event) => {
   const key = event.target.dataset.filter;
