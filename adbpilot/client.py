@@ -793,11 +793,10 @@ class AdbClient:
             time.sleep(min(1, max(deadline - time.monotonic(), 0)))
 
     def _probe_tls_services(self) -> tuple[str, str]:
-        result = self.run(["mdns", "track-services", "--proto-text"], timeout=3, check=False)
-        text = result.stdout + "\n" + result.stderr
+        text = self._read_track_services(seconds=3)
         if "_adb-tls-connect" not in text and "adb-tls-connect" not in text:
-            if text.strip():
-                return "not_visible", "unknown"
+            # A header such as "Services:" only means the command started.
+            # It is not evidence that wireless debugging is enabled.
             return "unknown", "unknown"
         generation = "wifi1"
         for value in re.findall(r"mdns_service_version\D+([0-9]+(?:\.[0-9]+)?)", text):
@@ -805,6 +804,30 @@ class AdbClient:
             if major >= 2:
                 generation = "wifi2"
         return "visible", generation
+
+    def _read_track_services(self, *, seconds: float) -> str:
+        """Read a bounded sample from the streaming track-services command.
+
+        The command does not exit on its own. Stopping it with a normal
+        subprocess timeout discards the sample on this Python version, so the
+        process is read directly and terminated when the window ends.
+        """
+
+        command = self._build_command(["mdns", "track-services", "--proto-text"])
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        try:
+            stdout, stderr = process.communicate(timeout=seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+        return f"{stdout or ''}\n{stderr or ''}"
 
     def _build_command(self, args: Iterable[str], *, serial: str | None = None) -> list[str]:
         command = [str(self.adb_path)]
