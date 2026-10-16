@@ -2,6 +2,7 @@
 
 - 状态：Draft
 - 日期：2026-08-20
+- 修订：2026-10-16，按当前 ADB 用户文档与 Platform-Tools 发布说明校正自动连接、能力检测和版本边界
 - 目标版本：MVP（版本号由发布流程决定）
 - 目标分支：`codex/feat-adb-wifi-v1-v2-compat`
 - 需求来源：兼容截图所示 ADB Wi-Fi 1.0 设备提示，并支持 ADB Wi-Fi 2.0
@@ -13,15 +14,18 @@
 
 | 产品术语 | 定义 | 首期支持 |
 | --- | --- | --- |
-| 经典 TCP/IP | 设备已通过 `adb tcpip` 或厂商能力开启 TCP 监听后，使用 `adb connect host:port` 连接；常见默认端口为 5555 | 是 |
-| ADB Wi-Fi 1.0 | Android 11–16 引入/使用的安全无线调试配对流程，使用 `adb pair`、TLS 与 mDNS | 是 |
-| ADB Wi-Fi 2.0 | Android 17 与 adb 37.0.0 引入的新一代无线调试能力，重点改善可信网络上的发现与自动连接体验 | 是，通过 adb 37+ 透明兼容；AdbPilot 首期不自行实现底层协议 |
+| 经典 TCP/IP | 官方文档中 Android 10 及更低版本的无线连接方式：先经 USB 执行 `adb tcpip 5555`，再 `adb connect ip:5555`。Android 11+ 在配对成功但 mDNS 不可用时，也使用 `adb connect ip:port` 回退。通道不加密 | 是。只做已开放端口上的连接和断开，不自动执行 `adb tcpip` |
+| ADB Wi-Fi 1.0 | 手机 Android 11+、电视和 Wear OS Android 13+ 的安全无线调试。使用 `adb pair`、TLS 和 mDNS。配对一次后，主机发现 `_adb-tls-connect` 且该主机仍受信任时会自动连接。Android 11 的 Wear 不使用这套说明 | 是 |
+| ADB Wi-Fi 2.0 | Android 17 与 Platform-Tools 37.0.0 引入。设备是否支持，以 `adb mdns track-services --proto-text` 里的 `mdns_service_version` 不低于 `2.0` 为准，不能只用系统版本号判断。它更换 mDNS 实现，并在设备连上已勾选「始终允许」的可信网络时自动连接 | 是，但只在主机 `adb server-status` 与设备服务版本同时满足时声明。AdbPilot 不实现协议，也不能因电脑上的 adb 够新就声称整条 2.0 链路可用 |
 
-Android 官方说明 Android 11 及以上支持无线调试，Android 17 搭配 adb 37.0.0 引入 ADB Wi-Fi 2.0。经典 `adb connect` 是兼容入口，不在文档中冒充 ADB Wi-Fi 1.0。
+当前行为以 [ADB 用户文档](https://developer.android.com/tools/adb) 为准。AOSP 架构文档仍描述 Openscreen 和 `adb mdns check`，只用于解释服务名与端口，不作为现行排障步骤。
 
 参考资料：
 
-- [Android：通过 Wi-Fi 连接设备](https://developer.android.com/studio/run/device#wireless)
+- [ADB 用户文档：无线调试与排障](https://developer.android.com/tools/adb)
+- [Platform-Tools 发布说明](https://developer.android.com/tools/releases/platform-tools)
+- [Android API 级别](https://developer.android.com/about/versions/api-levels)（Android 16 为 API 36，Android 17 为 API 37）
+- [ADB Wi-Fi 2.0 官方介绍](https://developer.android.com/blog/posts/introducing-fast-and-reliable-wireless-debugging-with-android-debug-bridge-adb-wi-fi-2-0)
 - [AOSP：ADB Wi-Fi 架构](https://android.googlesource.com/platform/packages/modules/adb/+/HEAD/docs/dev/adb_wifi.md)
 - [AOSP：ADB 命令手册](https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/docs/user/adb.1.md)
 
@@ -33,14 +37,14 @@ AdbPilot 当前只暴露 `adb connect host:port`，无法在产品内完成 Andr
 
 ### Proposed Solution
 
-在 `AdbClient` 增加无线能力检测、安全配对和配对后连接编排，统一供桌面 GUI、普通 CLI 和 `adbpilot-ai` JSON CLI 使用。产品始终委托本机 Android SDK Platform-Tools 实现底层协议：支持经典 TCP/IP；对 Android 11–16 使用安全配对流程；对 Android 17+ 在检测到 adb 37+ 时透明使用 ADB Wi-Fi 2.0 能力，并在能力不足时提供可执行的降级或升级建议。
+在 `AdbClient` 增加无线能力检测、安全配对和配对后连接编排，统一供桌面 GUI、普通 CLI 和 `adbpilot-ai` JSON CLI 使用。产品始终委托本机 Android SDK Platform-Tools 实现底层协议：保留经典 TCP/IP；对符合官方门槛的设备使用安全配对。已配对设备在同一网络上自动出现，是 Wi-Fi 1.0 就有的行为。只有主机 `adb server-status` 与设备 `mdns_service_version` 同时满足时，才标记 Wi-Fi 2.0；否则继续使用配对码和显式连接地址，不声称 2.0 可用。
 
 ### Success Criteria
 
-- 在 Windows 与 macOS 验收矩阵中，经典 TCP/IP、ADB Wi-Fi 1.0 和 ADB Wi-Fi 2.0 每个组合连续执行 20 次，配对/连接成功率均不低于 95%；失败必须返回明确原因，不允许界面无响应。
+- 在 Windows 与 macOS 验收矩阵中，经典 TCP/IP、ADB Wi-Fi 1.0 首次配对、ADB Wi-Fi 1.0 同一网络再次自动连接，以及已确认的 ADB Wi-Fi 2.0，每个组合连续执行 20 次，配对/连接成功率均不低于 95%；失败必须返回明确原因，不允许界面无响应。没有 Android 17 设备时不得把 2.0 记为通过。
 - 对当前已经支持的 `connect`、`disconnect` 行为和既有自动化测试保持 100% 通过，不引入无线连接回归。
 - GUI、CLI、JSON CLI 均可完成能力检查、配对和连接；三端对同一底层错误的错误类别一致率达到 100%。
-- 配对码不得出现在进程命令行、AdbPilot 日志、GUI 输出、JSON 成功/失败响应或异常消息中；自动化安全测试通过率为 100%。
+- 配对码不得出现在 AdbPilot 发起的进程命令行、AdbPilot 日志、GUI 输出、JSON 成功/失败响应或异常消息中；自动化安全测试通过率为 100%。产品不得开启 `ADB_TRACE`，也不得把 `adb server-status` 指向的服务日志读入界面。用户自行开启 adb 跟踪时，官方服务日志不在本产品的脱敏范围内。
 - 用户触发 GUI 配对或连接后 200 ms 内进入“执行中”状态，网络命令在 60 秒内成功、失败或超时返回，Tk 主线程不得阻塞。
 
 ## 2. User Experience & Functionality
@@ -55,16 +59,18 @@ AdbPilot 当前只暴露 `adb connect host:port`，无法在产品内完成 Andr
 
 ```text
 进入“无线调试”
-  ├─ 检查能力
+  ├─ 检查能力（读取 adb server-status，不启动时强制执行）
   │    ├─ 仅经典 TCP/IP → 展示连接入口与升级建议
-  │    ├─ 支持安全配对 → 展示配对码入口
-  │    └─ adb 37+ → 标记“可兼容 Wi-Fi 2.0”
+  │    ├─ 安全配对可用，但 mDNS 未开启或后端过旧 → 展示配对码，并给出重启 adb 的建议
+  │    └─ version ≥ 37 且 mdns_enabled、后端为 LIBADBMDNS → 标记“主机具备 Wi-Fi 2.0 条件”
   ├─ 经典 TCP/IP
   │    └─ 输入连接地址 → 连接 → 刷新设备列表
-  └─ 安全无线调试（Wi-Fi 1.0 / 2.0）
+  └─ 安全无线调试
        └─ 输入配对地址和六位配对码 → 配对
-            ├─ 设备自动上线 → 完成
-            └─ 未自动上线 → 输入无线调试主页连接地址 → 连接 → 刷新设备列表
+            ├─ 同一网络上已配对设备自动出现 → 完成
+            ├─ 首次配对后 TLS 设备自动出现 → 完成
+            └─ 未出现 → 输入无线调试主页连接地址 → 连接 → 刷新设备列表
+设备上线后，仅当 mdns_service_version ≥ 2.0 时标记“设备支持 Wi-Fi 2.0”
 ```
 
 配对地址和连接地址可能不同，且端口可能变化。界面与文案必须分别命名，不使用一个含糊的“设备地址”字段承载两者。
@@ -77,9 +83,11 @@ As a 开发者, I want to 在操作前看到本机 adb 的无线能力等级 so 
 
 Acceptance Criteria:
 
-- 显示 adb 版本、经典 TCP/IP 支持状态、安全配对支持状态、mDNS 可用状态和 Wi-Fi 2.0 主机兼容状态。
-- adb 不存在、版本低于安全配对最低要求、`adb pair` 不可用或 mDNS 检查失败时，返回不同的受控状态和处理建议。
-- 未连接设备时不得声称已确认手机是 Wi-Fi 1.0 或 2.0；只能说明“主机具备对应兼容能力”。设备上线并读取 SDK 后才展示设备侧判断。
+- 显示 adb 路径、`adb server-status` 中的 `version`、`mdns_enabled`、`mdns_backend`，以及安全配对是否达到稳定门槛。
+- 安全配对的稳定门槛是 Platform-Tools 34.0.5。30.0.0–34.0.4 只标记为早期实现，不提供产品内配对；经典连接保持可用，并建议升级。
+- `mdns_enabled` 为 false，或 37.0.0 的 `mdns_backend` 不是 `LIBADBMDNS` 时，分别提示设置 `ADB_MDNS=1` 或 `ADB_MDNS_OPENSCREEN=0`，然后由用户确认后再重启 adb 服务。AdbPilot 不自行执行 `kill-server`。
+- 37.0.1 起 openscreen 已删除，`ADB_MDNS_OPENSCREEN` 不再起作用；该版本只检查 `version` 与 `mdns_enabled`。
+- 未看到设备服务前，不得声称手机、电视或手表是 Wi-Fi 1.0 或 2.0。设备上线后，以 `adb mdns track-services --proto-text` 的 `mdns_service_version` 判断：不低于 `2.0` 才标记设备支持 Wi-Fi 2.0；缺失该字段只标记为安全无线调试，不用 `ro.build.version.sdk` 代替。
 - 能力检查失败不得禁用仍可工作的经典 `adb connect`。
 
 #### Story 2：连接经典 TCP/IP 设备
@@ -99,12 +107,12 @@ As an Android 11+ 用户, I want to 在 AdbPilot 中输入配对地址和六位�
 
 Acceptance Criteria:
 
-- GUI 明确引导用户在手机“开发者选项 → 无线调试 → 使用配对码配对设备”中获取配对地址和六位数字配对码。
+- GUI 明确引导用户在“开发者选项 → 无线调试 → 使用配对码配对设备”中获取配对地址和六位数字配对码。手机最低为 Android 11；电视和 Wear OS 最低为 Android 13。
 - 配对地址与连接地址使用独立字段；配对码仅接受 6 位数字，提交后立即从可见输入框清除。
-- AdbPilot 不把配对码拼入 adb 命令参数，而是通过标准输入交给 `adb pair`。
-- 以 adb 退出码、输出语义和配对后设备可见性综合判断结果，兼容旧 platform-tools 曾存在的错误退出码行为。
-- 配对成功后最多等待 10 秒检测设备自动上线；未上线时提示用户填写无线调试主页上的连接地址，不误用配对端口执行 `adb connect`。
-- Wi-Fi 1.0 设备能力受限时仍可使用配对码流程；Wi-Fi 2.0 设备在 adb 37+ 上由 platform-tools 处理协议差异和可信网络自动连接。
+- 官方 `adb pair` 在未提供配对码时从标准输入读取，也允许把配对码作为命令参数。AdbPilot 只使用前一种。这是产品安全约束，不是 adb 协议要求。
+- 稳定配对以 Platform-Tools 34.0.5 起的非零退出码为失败证据，再结合输出语义和配对后是否出现新的 TLS 设备。无线设备序列号通常形如 `adb-<序列号后缀>._adb-tls-connect._tcp`，不能把已有 USB 设备或普通 `ip:port` 设备当成配对成功。
+- 配对成功后最多等待 10 秒。Wi-Fi 1.0 起，主机发现 `_adb-tls-connect` 且主机仍受信任时就会自动连接；未出现时提示填写无线调试主页上的连接地址。官方明确：企业 Wi-Fi 可能阻止连接，配对成功后若网络不支持 mDNS，也必须手动 `adb connect`。不得复用配对端口。
+- Wi-Fi 2.0 不改变上述配对码流程。只有设备服务版本不低于 `2.0` 且主机状态满足第 1 条时，才额外说明「连上已勾选始终允许的网络后会自动连接」。电脑端 adb 版本不能单独作为 2.0 可用的结论。
 
 #### Story 4：通过 CLI 与 JSON CLI 自动化无线连接
 
@@ -124,7 +132,7 @@ As a 现场支持人员, I want to 看到与失败原因对应的下一步 so th
 
 Acceptance Criteria:
 
-- 至少区分：adb 缺失、adb 版本过低、配对能力不可用、地址非法、配对码非法、配对码错误/过期、配对服务不可达、配对成功但设备未上线、连接被拒绝、mDNS 不可用、命令超时。
+- 至少区分：adb 缺失、adb 低于稳定配对门槛、配对能力不可用、地址非法、配对码非法、配对码错误/过期、配对服务不可达、配对成功但设备未上线、连接被拒绝、mDNS 被关闭、mDNS 后端过旧、网络未发现 TLS 服务、企业网络阻止连接、命令超时。
 - 每类错误包含一条不超过 120 个中文字符的用户建议，并保留底层退出码供诊断，但不包含敏感输入。
 - 厂商 ROM 未实现或限制最新 API 时，提示“继续使用当前可用的配对码/经典连接流程，或升级系统与 platform-tools”，不把硬件限制错误归因于 AdbPilot。
 - 错误文案不得建议关闭防火墙、删除密钥或重置全部 ADB 授权作为默认第一步；高影响操作只列在后续排障中。
@@ -136,7 +144,7 @@ Acceptance Criteria:
 - 首期不自动执行 `adb tcpip`，不通过 USB 一键开启经典 TCP/IP 模式。
 - 首期不管理、导出或删除 `~/.android/adbkey*` 等 ADB 主机密钥。
 - 首期不实现跨网段、互联网中继、VPN 穿透或远程 ADB 暴露。
-- 首期不承诺 IPv6-only 网络兼容；按当前 adb mDNS 命令可见能力以 IPv4/主机名为主。
+- 首期不把 IPv6-only 网络列为已验收能力。`adb mdns track-services` 可能同时返回 IPv4、IPv6 和 `.local` 主机名；首期可以展示，但验收矩阵仍以 IPv4 为主。
 - 首期不修改 Android Studio、设备系统或厂商 ROM，也不绕过 Android 的配对与授权机制。
 
 ## 3. AI System Requirements (If Applicable)
@@ -173,8 +181,8 @@ AdbClient
 用户选择的 adb / ADB Server
         │
         ├─ 经典 TCP/IP
-        ├─ ADB Wi-Fi 1.0
-        └─ ADB Wi-Fi 2.0（adb 37+ 与 Android 17+）
+        ├─ ADB Wi-Fi 1.0（配对后可自动连接）
+        └─ ADB Wi-Fi 2.0（主机状态与 mdns_service_version 同时满足）
 ```
 
 - 所有界面层只消费结构化能力与结果对象。
@@ -196,14 +204,15 @@ AdbClient
 | 场景 | 设备要求 | 主机 adb | 首期产品行为 |
 | --- | --- | --- | --- |
 | 经典 TCP/IP | 已开放 ADB TCP 端口 | 能执行 `connect` | 直接连接/断开 |
-| ADB Wi-Fi 1.0 | Android 11–16 或报告 v1.0 的兼容设备 | 最低 30.0.0，推荐最新 | 配对码配对；必要时手动输入连接地址 |
-| ADB Wi-Fi 2.0 | Android 17+ 且设备实现对应 API | 37.0.0+，推荐 37.0.1+ | 配对码配对；复用 adb 的可信网络自动连接能力 |
-| 新设备 + 旧 adb | Android 17+ | 低于 37.0.0 | 不冒充 2.0；允许已探测到的旧流程并提示升级 |
-| 旧设备 + 新 adb | Android 11–16 | 37.0.0+ | 依赖 platform-tools 向后兼容，继续使用 1.0 配对 |
+| ADB Wi-Fi 1.0 | 手机 Android 11–16；电视和 Wear OS 为 Android 13–16。Android 11 Wear 除外 | 34.0.5–36.x | 配对码配对。同一网络上发现 `_adb-tls-connect` 时自动连接；否则手动输入连接地址 |
+| ADB Wi-Fi 2.0 | `mdns_service_version` 不低于 `2.0` | 37.0.0 且 `mdns_enabled=true`、后端为 `LIBADBMDNS`；推荐 37.0.1+ | 配对码流程不变。额外说明可信网络自动连接，不把主机版本单独当成设备已支持 |
+| 新设备 + 旧 adb | 设备服务版本不低于 `2.0` | 低于 37.0.0，但不低于 34.0.5 | 不标记 2.0。继续使用稳定配对流程并提示升级 |
+| 旧设备 + 新 adb | 无 `mdns_service_version: 2.0` | 37.0.1+ | 标记为 1.0 安全无线调试，不因主机 adb 够新升级设备代际 |
+| 早期 platform-tools | 任意 | 30.0.0–34.0.4 | 不提供产品内配对。30.0.0 仅为初步支持，34.0.5 前失败仍可能返回成功退出码 |
 
 ### Security & Privacy
 
-- 配对码属于短期敏感凭据：仅驻留内存，提交后清空 GUI 字段，不写配置、不写日志、不进入 adb 进程参数。
+- 配对码属于短期敏感凭据：仅驻留 AdbPilot 进程内存，提交后清空 GUI 字段，不写配置、不写 AdbPilot 日志、不进入 AdbPilot 发起的 adb 进程参数。adb 随后发给本机 ADB Server 的内部指令仍可能携带该值；产品不读取、不转发 `adb server-status` 的 `log_absolute_path`。
 - 地址、设备序列号和 mDNS 实例可用于本地诊断，但默认日志应脱敏；文档、截图和错误上报不记录真实配对码、完整设备 GUID、完整序列号或 Wi-Fi 名称。
 - 不修改 ADB 私钥权限，不复制密钥，不提供绕过授权的能力。
 - 所有输入以参数数组传递给子进程，不使用 shell 拼接；拒绝换行、NUL 和控制字符。
@@ -226,7 +235,7 @@ AdbClient
 - 能力检测与结构化结果。
 - 经典 TCP/IP 连接保留并改善地址校验。
 - 六位配对码流程，覆盖 GUI、CLI、JSON CLI。
-- 配对后自动上线检测与手动连接地址回退。
+- 配对后自动上线检测覆盖 Wi-Fi 1.0，不只覆盖 2.0；未上线时使用手动连接地址回退。
 - Windows/macOS 真机验收；Linux CLI 自动化兼容测试。
 
 #### v1.1
@@ -247,8 +256,9 @@ AdbClient
 
 | 风险 | 影响 | 首期控制措施 |
 | --- | --- | --- |
-| “Wi-Fi 1.0/2.0”术语与经典 TCP/IP 混淆 | 错误承诺兼容范围 | 在产品和文档中使用统一术语；设备未上线前只声明主机能力 |
-| platform-tools 旧版本配对失败时退出码不可靠 | 误报成功 | 结合退出码、输出语义和设备上线验证；推荐 37.0.1+ |
+| “Wi-Fi 1.0/2.0”术语与经典 TCP/IP 混淆 | 错误承诺兼容范围 | 在产品和文档中使用统一术语；设备服务出现前只声明主机能力 |
+| 把 1.0 已有的自动连接写成 2.0 专属 | Android 11–16 的重连行为漏测或提示错误 | 1.0 验收包含同一网络再次自动连接；2.0 只额外验证可信网络与 `mdns_service_version` |
+| platform-tools 30.0.0–34.0.4 配对失败时退出码不可靠 | 误报成功 | 产品内配对最低 34.0.5；推荐 37.0.1+ |
 | 配对端口与连接端口不同且会变化 | 用户连接失败 | UI 分字段、分步骤；不自动复用配对端口 |
 | mDNS 被防火墙、AP 隔离或 VPN 影响 | 自动上线失败 | 配对后允许显式连接地址回退，提供分层提示 |
 | 厂商 ROM 或硬件未实现最新 API | 2.0 能力不可用 | 安全降级到可用流程，避免把协议能力写死在 AdbPilot |
@@ -263,7 +273,7 @@ AdbClient
 | --- | --- | --- |
 | P1 | mDNS 自动发现配对地址与连接地址 | MVP 真机数据表明手输地址是主要失败来源；确认 Windows/macOS mDNS 表现 |
 | P1 | ADB Server mDNS 异常自动诊断/恢复 | 收集“系统可发现、adb 不可发现”的复现数据；确保不会中断已有设备 |
-| P1 | IPv6 与 IPv6-only 网络 | AOSP 命令输出与各平台支持明确后建立测试矩阵 |
+| P1 | IPv6-only 网络验收 | `track-services` 已返回 IPv6 与 `.local` 主机名；补齐仅 IPv6 网络的测试矩阵后再承诺可用 |
 | P2 | 二维码配对 | 明确 AdbPilot 生成二维码、手机扫描和密钥生命周期的安全设计 |
 | P2 | USB 一键开启 `adb tcpip` | 明确是否允许改变设备 adbd 监听状态及默认端口策略 |
 | P2 | 已配对设备/可信网络管理 | 确认 adb 是否提供稳定、跨平台、可公开依赖的查询接口 |
