@@ -8,8 +8,17 @@ import re
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterable, TextIO
 
-from .errors import AdbCommandError, DeviceSelectionError, suggestion_for_device_state
-from .models import CommandResult, Device, DeviceInfo, RunningProcess
+from .errors import (
+    AdbCommandError,
+    AdbConnectionError,
+    AdbPairingError,
+    AdbWifiCapabilityError,
+    DeviceSelectionError,
+    PairingCodeError,
+    WirelessAddressError,
+    suggestion_for_device_state,
+)
+from .models import AdbWifiCapabilities, CommandResult, Device, DeviceInfo, RunningProcess, WirelessPairingResult
 from .platform_adapter import PlatformAdapter
 
 
@@ -388,20 +397,157 @@ class AdbClient:
         return self.run(["shell", *command], serial=target, timeout=120).stdout
 
     def connect(self, address: str) -> str:
-        result = self.run(["connect", address])
+        normalized = normalize_adb_address(address, require_port=False)
+        result = self.run(["connect", normalized])
         output = result.stdout.strip()
         # adb can report connection failures on stdout with exit status 0.
         if not output.lower().startswith(("connected to ", "already connected to ")):
-            raise AdbCommandError(
+            raise AdbConnectionError(
                 output or result.stderr.strip() or "ADB 未返回连接成功信息",
                 result.returncode,
                 result.stdout,
                 result.stderr,
+                category="connect_failed",
             )
         return output
 
-    def pair(self, address: str, pairing_code: str) -> str:
-        return self.run(["pair", address, pairing_code], timeout=60).stdout.strip()
+    def pair(
+        self,
+        address: str,
+        pairing_code: str,
+        *,
+        connect_address: str | None = None,
+        wait_for_device_seconds: float = 10.0,
+        allow_qr_secret: bool = False,
+    ) -> WirelessPairingResult:
+        pairing_address = normalize_adb_address(address, require_port=True)
+        code = pairing_code if allow_qr_secret else normalize_pairing_code(pairing_code)
+        if allow_qr_secret and (not code or any(ord(char) < 32 for char in code)):
+            raise PairingCodeError("扫码配对信息无效，请重新生成二维码。")
+        explicit_address = (
+            normalize_adb_address(connect_address, require_port=True) if connect_address else ""
+        )
+        capabilities = self.wifi_capabilities()
+        if not capabilities.supports_pair:
+            raise AdbWifiCapabilityError(capabilities.warnings[0] if capabilities.warnings else "当前 adb 不支持安全配对。")
+
+        result = self._run_with_input(
+            ["pair", pairing_address],
+            input_text=f"{code}\n",
+            timeout=60,
+            check=False,
+            redact=(code,),
+        )
+        outcome = classify_pair_output(result.returncode, result.stdout, result.stderr)
+        if outcome == "failed":
+            category = classify_pair_failure(result.stdout, result.stderr)
+            raise AdbPairingError(
+                wifi_error_message(category),
+                result.returncode,
+                result.stdout,
+                result.stderr,
+                category=category,
+            )
+        if outcome == "ambiguous":
+            return WirelessPairingResult(
+                status="ambiguous",
+                paired=False,
+                connected=False,
+                pairing_address=pairing_address,
+                connection_address=explicit_address,
+                next_action="配对结果无法确认。请升级 Platform-Tools 到 34.0.5 或更高版本后重试。",
+                capabilities=capabilities,
+            )
+
+        before = self.devices()
+        appeared = self._wait_for_new_tls_device(before, wait_for_device_seconds)
+        if appeared is not None:
+            return WirelessPairingResult(
+                status="paired_and_connected",
+                paired=True,
+                connected=appeared.is_ready,
+                pairing_address=pairing_address,
+                connection_address=explicit_address,
+                device_serial=appeared.serial,
+                next_action="设备已自动出现。",
+                capabilities=capabilities,
+            )
+        if explicit_address:
+            self.connect(explicit_address)
+            after = self.devices()
+            matched = next((device for device in after if device.serial == explicit_address), None)
+            if matched is None:
+                raise AdbConnectionError(
+                    wifi_error_message("connect_failed"),
+                    0,
+                    "",
+                    "",
+                    category="connect_failed",
+                )
+            return WirelessPairingResult(
+                status="paired_connected_explicitly",
+                paired=True,
+                connected=matched.is_ready,
+                pairing_address=pairing_address,
+                connection_address=explicit_address,
+                device_serial=matched.serial,
+                next_action="已使用无线调试主页上的连接地址完成连接。",
+                capabilities=capabilities,
+            )
+        return WirelessPairingResult(
+            status="paired_waiting_for_connect",
+            paired=True,
+            connected=False,
+            pairing_address=pairing_address,
+            next_action="配对已完成，但设备没有自动出现。请填写手机无线调试主页上的连接地址，不要使用配对端口。",
+            capabilities=capabilities,
+        )
+
+    def wifi_capabilities(self, *, probe_network: bool = False) -> AdbWifiCapabilities:
+        version_text = self.run(["version"], timeout=10).stdout
+        revision = parse_platform_tools_revision(version_text)
+        status_result = self.run(["server-status"], timeout=10, check=False)
+        status = parse_server_status(status_result.stdout + "\n" + status_result.stderr)
+        revision_text = format_revision(revision)
+        supports_pair = revision is not None and revision >= (34, 0, 5)
+        mdns_enabled = status.get("mdns_enabled", "unknown").lower()
+        mdns_backend = status.get("mdns_backend", "unknown")
+        warnings: list[str] = []
+        if revision is None:
+            warnings.append("无法识别 Platform-Tools 版本，产品内不执行安全配对。")
+        elif revision < (30, 0, 0):
+            warnings.append("当前 adb 低于 30.0.0，只保留经典连接。")
+        elif revision < (34, 0, 5):
+            warnings.append("当前 adb 属于 30.0.0–34.0.4 的早期配对实现，产品内不执行配对。请升级到 34.0.5 或更高版本。")
+        wifi2 = False
+        if revision is not None and revision >= (37, 0, 0) and supports_pair and mdns_enabled == "true":
+            if revision == (37, 0, 0) and mdns_backend.upper() != "LIBADBMDNS":
+                warnings.append("37.0.0 的发现后端不是 LIBADBMDNS。可设置 ADB_MDNS_OPENSCREEN=0 后自行重启 adb。")
+            else:
+                wifi2 = True
+        if mdns_enabled == "false":
+            warnings.append("发现设备功能未开启。可设置 ADB_MDNS=1 后自行重启 adb，仍可手输连接地址。")
+        if revision is not None and (30, 0, 1) <= revision < (35, 0, 0):
+            warnings.append("这个版本默认不会自动连接已配对设备。10 秒内没有出现时，请填写连接地址。")
+        network_status = "unknown"
+        device_generation = "unknown"
+        if probe_network:
+            network_status, device_generation = self._probe_tls_services()
+            if network_status == "not_visible":
+                warnings.append("无线调试已开启，但当前网络没有发现设备。请确认同一网络，或手输连接地址。")
+        return AdbWifiCapabilities(
+            adb_path=str(self.adb_path),
+            adb_version=version_text.strip(),
+            platform_tools_revision=revision_text,
+            supports_connect=True,
+            supports_pair=supports_pair,
+            mdns_enabled=mdns_enabled,
+            mdns_backend=mdns_backend,
+            network_mdns_status=network_status,
+            wifi2_host_compatible=wifi2,
+            device_generation=device_generation,
+            warnings=tuple(warnings),
+        )
 
     def disconnect(self, address: str | None = None) -> str:
         args = ["disconnect"]
@@ -503,7 +649,13 @@ class AdbClient:
                 pair_address = pairing_service["address"]
                 report(f"扫码配对：发现配对服务 {pair_address}，正在执行 adb pair")
                 try:
-                    pairing_output = self.pair(pair_address, password)
+                    pairing_result = self.pair(
+                        pair_address,
+                        password,
+                        wait_for_device_seconds=0,
+                        allow_qr_secret=True,
+                    )
+                    pairing_output = pairing_result.next_action if pairing_result.paired else ""
                 except Exception:
                     report("扫码配对：退出扫码匹配状态（异常）")
                     raise
@@ -595,6 +747,64 @@ class AdbClient:
         elif level:
             args.append(f"*:{level}")
         return self.stream(args, serial=target, output=output)
+
+    def _run_with_input(
+        self,
+        args: Iterable[str],
+        *,
+        input_text: str,
+        timeout: int,
+        check: bool = True,
+        redact: Iterable[str] = (),
+    ) -> CommandResult:
+        command = self._build_command(args)
+        completed = subprocess.run(
+            command,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            shell=False,
+        )
+        stdout = redact_secrets(completed.stdout, redact)
+        stderr = redact_secrets(completed.stderr, redact)
+        result = CommandResult(tuple(command), completed.returncode, stdout, stderr)
+        if check and completed.returncode != 0:
+            raise AdbCommandError(
+                self._format_failure(command, completed.returncode, stderr, stdout),
+                completed.returncode,
+                stdout,
+                stderr,
+            )
+        return result
+
+    def _wait_for_new_tls_device(self, before: list[Device], seconds: float) -> Device | None:
+        known = {device.serial for device in before}
+        deadline = time.monotonic() + max(seconds, 0)
+        while True:
+            for device in self.devices():
+                if device.serial in known or not is_tls_connect_serial(device.serial):
+                    continue
+                return device
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(min(1, max(deadline - time.monotonic(), 0)))
+
+    def _probe_tls_services(self) -> tuple[str, str]:
+        result = self.run(["mdns", "track-services", "--proto-text"], timeout=3, check=False)
+        text = result.stdout + "\n" + result.stderr
+        if "_adb-tls-connect" not in text and "adb-tls-connect" not in text:
+            if text.strip():
+                return "not_visible", "unknown"
+            return "unknown", "unknown"
+        generation = "wifi1"
+        for value in re.findall(r"mdns_service_version\D+([0-9]+(?:\.[0-9]+)?)", text):
+            major = int(value.split(".", 1)[0])
+            if major >= 2:
+                generation = "wifi2"
+        return "visible", generation
 
     def _build_command(self, args: Iterable[str], *, serial: str | None = None) -> list[str]:
         command = [str(self.adb_path)]
@@ -768,3 +978,134 @@ def find_process_name_index(header: list[str]) -> int:
 
 def looks_like_package_name(value: str) -> bool:
     return bool(re.match(r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+(?:[:][A-Za-z0-9_.-]+)?$", value))
+
+
+def parse_platform_tools_revision(output: str) -> tuple[int, int, int] | None:
+    for line in output.splitlines():
+        match = re.search(r"\bVersion\s+(\d+)\.(\d+)\.(\d+)", line)
+        if match and not line.lower().startswith("android debug bridge"):
+            return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+    return None
+
+
+def format_revision(revision: tuple[int, int, int] | None) -> str:
+    if revision is None:
+        return ""
+    return ".".join(str(part) for part in revision)
+
+
+def parse_server_status(output: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in output.splitlines():
+        line = raw_line.strip().lstrip("-").strip()
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower().replace(" ", "_")
+        if key in {"version", "mdns_enabled", "mdns_backend"}:
+            values[key] = value.strip().strip('"')
+    return values
+
+
+def normalize_adb_address(value: str, *, require_port: bool = True) -> str:
+    text = value.strip()
+    if not text or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise WirelessAddressError("请使用手机当前页面显示的 IP:端口。")
+    if text.startswith("[") and "]" in text:
+        host, _, port = text[1:].partition("]")
+        port = port[1:] if port.startswith(":") else ""
+        if not host or ":" not in host:
+            raise WirelessAddressError("请使用手机当前页面显示的 IP:端口。")
+    else:
+        if text.count(":") != 1:
+            if require_port:
+                raise WirelessAddressError("请使用手机当前页面显示的 IP:端口。")
+            return text
+        host, port = text.rsplit(":", 1)
+        if not host or any(char.isspace() for char in host):
+            raise WirelessAddressError("请使用手机当前页面显示的 IP:端口。")
+    if require_port or port:
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            raise WirelessAddressError("请使用手机当前页面显示的 IP:端口。")
+    return text
+
+
+def normalize_pairing_code(value: str) -> str:
+    code = value.strip()
+    if not re.fullmatch(r"[0-9]{6}", code):
+        raise PairingCodeError("请重新打开配对码页面，输入当前显示的 6 位数字。")
+    return code
+
+
+def classify_pair_output(returncode: int, stdout: str, stderr: str) -> str:
+    text = f"{stdout}\n{stderr}".lower()
+    if returncode != 0:
+        return "failed"
+    if any(token in text for token in ("successfully paired", "paired to", "success")):
+        return "success"
+    return "ambiguous"
+
+
+def classify_pair_failure(stdout: str, stderr: str) -> str:
+    text = f"{stdout}\n{stderr}".lower()
+    if any(token in text for token in ("timeout", "timed out", "connection refused", "unreachable", "no route")):
+        return "pair_unreachable"
+    if any(token in text for token in ("failed", "incorrect", "wrong", "rejected", "denied", "invalid")):
+        return "pair_rejected"
+    return "unknown"
+
+
+def wifi_error_message(category: str) -> str:
+    messages = {
+        "adb_missing": "未找到 adb。请安装或选择 Platform-Tools。",
+        "pair_unsupported": "当前 adb 不能在产品内安全配对。请升级到 34.0.5 或更高版本，经典连接仍可使用。",
+        "mdns_disabled": "发现设备功能未开启。可设置 ADB_MDNS=1 后自行重启 adb，仍可手输地址。",
+        "mdns_backend_obsolete": "发现设备的后端过旧。37.0.0 可设置 ADB_MDNS_OPENSCREEN=0 后自行重启 adb。",
+        "network_mdns_not_visible": "当前网络没有发现设备。请确认同一网络，或手输连接地址。",
+        "invalid_address": "请使用手机当前页面显示的 IP:端口。",
+        "invalid_code": "请重新打开配对码页面，输入当前显示的 6 位数字。",
+        "pair_rejected": "配对码可能错误或已过期。请在手机上生成新的配对码后重试。",
+        "pair_unreachable": "配对页面可能已关闭，或地址已经变化。请保持配对页面开启后重试。",
+        "paired_not_connected": "已经配对，但设备没有自动出现。请填写无线调试主页上的连接地址。",
+        "connect_failed": "连接失败。请使用无线调试主页上的连接端口，不要使用配对端口。",
+        "unknown": "配对没有完成。请查看手机当前页面后重试。",
+    }
+    return messages.get(category, messages["unknown"])
+
+
+def is_tls_connect_serial(serial: str) -> bool:
+    return "._adb-tls-connect._tcp" in serial.lower()
+
+
+def redact_secrets(text: str, secrets_to_hide: Iterable[str]) -> str:
+    redacted = text
+    for secret in secrets_to_hide:
+        if secret:
+            redacted = redacted.replace(secret, "[redacted]")
+    return redacted
+
+
+def capability_summary(capabilities: AdbWifiCapabilities) -> str:
+    parts = ["经典连接可用"]
+    parts.append("安全配对可用" if capabilities.supports_pair else "安全配对不可用")
+    if capabilities.wifi2_host_compatible:
+        parts.append("主机具备 Wi-Fi 2.0 条件")
+    if capabilities.device_generation == "wifi2":
+        parts.append("设备支持 Wi-Fi 2.0")
+    elif capabilities.device_generation == "wifi1":
+        parts.append("设备为安全无线调试")
+    return " · ".join(parts)
+
+
+def pairing_status_text(result: WirelessPairingResult) -> str:
+    labels = {
+        "paired_and_connected": "配对成功，设备已出现",
+        "paired_waiting_for_connect": "配对成功，等待填写连接地址",
+        "paired_connected_explicitly": "配对成功，已按连接地址连上",
+        "unsupported": "当前 adb 不支持安全配对",
+        "ambiguous": "配对结果无法确认",
+    }
+    label = labels.get(result.status, "配对结束")
+    if result.next_action:
+        return f"{label}。{result.next_action}"
+    return label

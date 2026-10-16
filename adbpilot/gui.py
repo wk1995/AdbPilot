@@ -18,8 +18,8 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from . import __version__
-from .client import AdbClient
-from .errors import AdbPilotError
+from .client import AdbClient, capability_summary, pairing_status_text
+from .errors import AdbNotFoundError, AdbPilotError, PairingCodeError, WirelessAddressError
 from .models import Device, RunningProcess
 from .packages import DependencyRequest, install_dependency
 from .platform_adapter import PlatformAdapter
@@ -412,16 +412,23 @@ class AdbPilotGui(BaseTk):
         self.pair_code_var = tk.StringVar()
         self.connect_addr_var = tk.StringVar(value="192.168.1.10:5555")
         self.wireless_status_var = tk.StringVar(value="请输入设备的无线调试连接地址")
+        self.capability_status_var = tk.StringVar(value="尚未检查这台电脑的无线能力")
         self.wireless_busy = False
+        self.pairing_in_progress = False
+        ttk.Label(wireless, textvariable=self.capability_status_var, wraplength=300).pack(fill=tk.X, padx=6, pady=(6, 0))
+        ttk.Button(wireless, text="检查能力", command=self.check_wifi_capabilities, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(4, 6))
         ttk.Label(wireless, text="配对地址").pack(anchor=tk.W, padx=6, pady=(6, 0))
         ttk.Entry(wireless, textvariable=self.pair_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
         ttk.Label(wireless, text="配对码").pack(anchor=tk.W, padx=6, pady=(2, 0))
-        ttk.Entry(wireless, textvariable=self.pair_code_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
-        ttk.Button(wireless, text="配对", command=self.pair_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(2, 6))
+        self.pair_code_entry = ttk.Entry(wireless, textvariable=self.pair_code_var, width=28, show="*")
+        self.pair_code_entry.pack(fill=tk.X, padx=6, pady=(0, 4))
+        self.pair_button = ttk.Button(wireless, text="配对", command=self.pair_device, style="Quiet.TButton")
+        self.pair_button.pack(fill=tk.X, padx=6, pady=(2, 6))
         ttk.Button(wireless, text="扫码配对", command=self.qr_pair_device, style="Primary.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Button(wireless, text="连接已配对", command=self.connect_paired_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(wireless, text="连接地址").pack(anchor=tk.W, padx=6, pady=(2, 0))
-        ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
+        self.connect_addr_entry = ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28)
+        self.connect_addr_entry.pack(fill=tk.X, padx=6, pady=(0, 4))
         wireless_actions = ttk.Frame(wireless, style="Surface.TFrame")
         wireless_actions.pack(fill=tk.X, padx=6, pady=(2, 6))
         self.connect_button = ttk.Button(wireless_actions, text="连接", command=self.connect_device, style="Primary.TButton")
@@ -1520,6 +1527,22 @@ class AdbPilotGui(BaseTk):
         serial = self._selected_serial()
         self._run_async("读取设备详情", lambda: self._get_client().device_info(serial), self._display_mapping)
 
+    def check_wifi_capabilities(self) -> None:
+        if self.wireless_busy or self.pairing_in_progress:
+            return
+        try:
+            client = self._get_client()
+        except Exception as exc:
+            self.capability_status_var.set(f"检查失败：{exc}")
+            return
+
+        def done(capabilities: Any) -> None:
+            self.capability_status_var.set(capability_summary(capabilities))
+            if capabilities.warnings:
+                self._append_output("\n".join(capabilities.warnings) + "\n")
+
+        self._run_async("检查无线能力", lambda: client.wifi_capabilities(probe_network=True), done)
+
     def connect_device(self) -> None:
         if self.wireless_busy:
             return
@@ -1534,15 +1557,51 @@ class AdbPilotGui(BaseTk):
         self._run_async("连接已配对设备", lambda: self._get_client().connect_paired_by_mdns())
 
     def pair_device(self) -> None:
+        if self.pairing_in_progress or self.wireless_busy:
+            return
         address = self.pair_addr_var.get().strip()
         code = self.pair_code_var.get().strip()
-        if not address:
-            messagebox.showwarning("AdbPilot", "请输入配对 host:port 地址")
+        connect_address = self.connect_addr_var.get().strip()
+        self.pair_code_var.set("")
+        try:
+            client = self._get_client()
+        except Exception as exc:
+            self.wireless_status_var.set(f"配对失败：{exc}")
             return
-        if not code:
-            messagebox.showwarning("AdbPilot", "请输入无线调试配对码")
-            return
-        self._run_async(f"配对 {address}", lambda: self._get_client().pair(address, code))
+
+        def failed(exc: Exception) -> None:
+            self._set_pairing_busy(False)
+            if isinstance(exc, subprocess.TimeoutExpired):
+                detail = "配对超时。请保持手机配对页面开启后重试。"
+            elif isinstance(exc, (AdbNotFoundError, WirelessAddressError, PairingCodeError, AdbPilotError)):
+                detail = str(exc)
+            else:
+                detail = str(exc)
+            self.wireless_status_var.set(f"配对失败：{detail}")
+
+        def done(result: Any) -> None:
+            self._set_pairing_busy(False)
+            self.wireless_status_var.set(pairing_status_text(result))
+            self._append_output(pairing_status_text(result) + "\n")
+            if result.status == "paired_waiting_for_connect":
+                self.connect_addr_entry.focus_set()
+                return
+            if result.connected:
+                self.refresh_devices()
+
+        self._set_pairing_busy(True)
+        self.wireless_status_var.set("正在配对，请稍候…")
+        self._run_async(
+            f"配对 {address}",
+            lambda: client.pair(address, code, connect_address=connect_address or None),
+            done,
+            failed,
+        )
+
+    def _set_pairing_busy(self, busy: bool) -> None:
+        self.pairing_in_progress = busy
+        if hasattr(self, "pair_button"):
+            self.pair_button.configure(state=tk.DISABLED if busy else tk.NORMAL, text="配对中…" if busy else "配对")
 
     def qr_pair_device(self) -> None:
         if self.qr_pair_cancel_event is not None:

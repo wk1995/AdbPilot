@@ -45,3 +45,30 @@ class RunningProcess:
     user: str
     name: str
     package: str = ""
+
+
+@dataclass(frozen=True)
+class AdbWifiCapabilities:
+    adb_path: str
+    adb_version: str
+    platform_tools_revision: str = ""
+    supports_connect: bool = True
+    supports_pair: bool = False
+    mdns_enabled: str = "unknown"
+    mdns_backend: str = "unknown"
+    network_mdns_status: str = "unknown"
+    wifi2_host_compatible: bool = False
+    device_generation: str = "unknown"
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class WirelessPairingResult:
+    status: str
+    paired: bool
+    connected: bool
+    pairing_address: str
+    connection_address: str = ""
+    device_serial: str = ""
+    next_action: str = ""
+    capabilities: AdbWifiCapabilities | None = None

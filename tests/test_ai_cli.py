@@ -17,8 +17,17 @@ class FakeClient:
     def connect(self, address):
         return f"connected to {address}"
 
-    def pair(self, address, code):
-        return f"paired {address} with {code}"
+    def pair(self, address, pairing_code, connect_address=None, wait_for_device_seconds=10.0):
+        from adbpilot.models import WirelessPairingResult
+
+        return WirelessPairingResult(
+            status="paired_waiting_for_connect",
+            paired=True,
+            connected=False,
+            pairing_address=address,
+            connection_address=connect_address or "",
+            next_action="请填写连接地址",
+        )
 
     def foreground_package(self, serial=None):
         return "com.example.app"
@@ -40,6 +49,8 @@ class AiCliTests(unittest.TestCase):
         self.assertIn("processes", schema["operations"])
         self.assertIn("logcat-dump", schema["operations"])
         self.assertIn("pair", schema["operations"])
+        self.assertIn("wifi-capabilities", schema["operations"])
+        self.assertEqual(schema["operations"]["pair"]["sensitive_params"], ["pairing_code"])
 
     def test_schema_command_outputs_json_without_adb(self):
         output = io.StringIO()
@@ -66,10 +77,14 @@ class AiCliTests(unittest.TestCase):
         self.assertEqual(string_result["stdout"], "abc:getprop ro.product.model")
         self.assertEqual(array_result["stdout"], "abc:getprop ro.product.model")
 
-    def test_pair_operation_returns_message(self):
-        data = ai_cli.op_pair(FakeClient(), {"address": "192.168.1.10:37123", "code": "123456"})
+    def test_pair_operation_returns_status_without_code(self):
+        data = ai_cli.op_pair(
+            FakeClient(),
+            {"address": "192.168.1.10:37123", "pairing_code": "123456", "connect_address": "192.168.1.10:5555"},
+        )
 
-        self.assertEqual(data["message"], "paired 192.168.1.10:37123 with 123456")
+        self.assertEqual(data["status"], "paired_waiting_for_connect")
+        self.assertNotIn("123456", json.dumps(data))
 
     def test_foreground_and_process_operations(self):
         client = FakeClient()
