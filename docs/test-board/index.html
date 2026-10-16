@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>测试用例</title>
+<style>
+  :root {
+    --bg: #f4f1ea;
+    --paper: #fffdf8;
+    --ink: #1c1915;
+    --muted: #6f675c;
+    --line: #e4ddd0;
+    --accent: #1f6b4a;
+    --accent-soft: #e7f3ec;
+    --warn: #8a5a12;
+    --warn-soft: #f8efd8;
+    --bad: #8d2f2a;
+    --bad-soft: #f8e6e4;
+    --skip: #4d5d73;
+    --skip-soft: #e8eef5;
+    --todo: #6f675c;
+    --todo-soft: #f0ece4;
+    --shadow: 0 10px 30px rgba(40, 32, 18, .06);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Songti SC", "Noto Serif SC", serif;
+    background:
+      radial-gradient(1200px 400px at 10% -10%, #efe6d4 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+  }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 80px; }
+  header.top {
+    display: flex; justify-content: space-between; gap: 20px; align-items: flex-end;
+    margin-bottom: 18px;
+  }
+  .kicker { letter-spacing: .18em; text-transform: uppercase; font-size: 12px; color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; }
+  h1 { margin: 4px 0 0; font-weight: 560; font-size: 34px; letter-spacing: -.02em; }
+  .sub { margin: 6px 0 0; color: var(--muted); font-size: 15px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .btn, .ghost {
+    border: 1px solid var(--line); background: var(--paper); border-radius: 999px;
+    padding: 8px 14px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px;
+  }
+  .btn { background: var(--ink); color: #f7f3ea; border-color: var(--ink); }
+  .ghost:hover, .btn:hover { transform: translateY(-1px); }
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 8px 0 16px; }
+  .stat {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px;
+    box-shadow: var(--shadow);
+  }
+  .stat b { display: block; font-size: 26px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; }
+  .toolbar {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap;
+  }
+  .search {
+    flex: 1; min-width: 220px; background: var(--paper); border: 1px solid var(--line);
+    border-radius: 12px; padding: 10px 12px;
+  }
+  .filters { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    border: 1px solid var(--line); background: transparent; border-radius: 999px;
+    padding: 6px 10px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; color: var(--muted);
+  }
+  .chip.on { background: var(--ink); color: #f7f3ea; border-color: var(--ink); }
+  .case {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 16px;
+    margin-bottom: 10px; box-shadow: var(--shadow); overflow: hidden;
+  }
+  .case summary {
+    list-style: none; display: grid; grid-template-columns: 72px 1fr auto; gap: 12px;
+    align-items: center; padding: 14px 16px; cursor: pointer;
+  }
+  .case summary::-webkit-details-marker { display: none; }
+  .id { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 650; letter-spacing: .04em; }
+  .title { font-size: 16px; }
+  .meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .badge {
+    font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; border-radius: 999px;
+    padding: 4px 10px; white-space: nowrap;
+  }
+  .pass { background: var(--accent-soft); color: var(--accent); }
+  .fail { background: var(--bad-soft); color: var(--bad); }
+  .blocked { background: var(--warn-soft); color: var(--warn); }
+  .unverified { background: var(--skip-soft); color: var(--skip); }
+  .todo { background: var(--todo-soft); color: var(--todo); }
+  .body { padding: 0 16px 16px 100px; display: grid; gap: 10px; }
+  .pair { display: grid; grid-template-columns: 88px 1fr; gap: 8px; font-size: 14.5px; }
+  .pair dt { color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; padding-top: 3px; }
+  .pair dd { margin: 0; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  select.status, textarea.note, input.env {
+    background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
+  }
+  select.status { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
+  textarea.note { width: min(640px, 100%); min-height: 64px; resize: vertical; }
+  input.env { width: min(280px, 100%); }
+  .empty { padding: 40px 10px; text-align: center; color: var(--muted); }
+  dialog {
+    border: none; border-radius: 18px; padding: 0; width: min(640px, calc(100vw - 24px));
+    box-shadow: 0 30px 80px rgba(0,0,0,.18);
+  }
+  dialog::backdrop { background: rgba(28, 25, 21, .35); }
+  .dlg { padding: 18px 18px 16px; background: var(--paper); }
+  .dlg h2 { margin: 0 0 12px; font-size: 22px; font-weight: 560; }
+  label.field { display: block; margin-bottom: 10px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; color: var(--muted); }
+  label.field input, label.field textarea, label.field select {
+    display: block; width: 100%; margin-top: 4px; background: #fff; border: 1px solid var(--line);
+    border-radius: 10px; padding: 8px 10px; font-size: 15px;
+  }
+  label.field textarea { min-height: 72px; }
+  .dlg .row { justify-content: flex-end; margin-top: 6px; }
+  .prep { color: var(--muted); font-size: 14px; margin: 0 0 14px; }
+  @media (max-width: 760px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .case summary, .body, .pair { grid-template-columns: 1fr; }
+    .body { padding-left: 16px; }
+    header.top { flex-direction: column; align-items: flex-start; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <div class="kicker">Manual test board</div>
+      <h1 id="featureTitle">测试用例</h1>
+      <p class="sub" id="featureNote"></p>
+    </div>
+    <div class="actions">
+      <button class="ghost" id="switchBtn" type="button">切换功能</button>
+      <button class="ghost" id="exportBtn" type="button">导出记录</button>
+      <button class="ghost" id="importBtn" type="button">导入</button>
+      <button class="btn" id="addBtn" type="button">新增用例</button>
+      <input id="file" type="file" accept="application/json" hidden>
+    </div>
+  </header>
+  <p class="prep" id="prep"></p>
+  <section class="stats" id="stats"></section>
+  <div class="toolbar">
+    <input class="search" id="q" type="search" placeholder="搜索编号、操作、通过标准">
+    <div class="filters" id="filters"></div>
+  </div>
+  <div id="list"></div>
+</div>
+
+<dialog id="suiteDlg">
+  <form class="dlg" method="dialog" id="suiteForm">
+    <h2>功能套件</h2>
+    <label class="field">功能名称<input name="title" required></label>
+    <label class="field">说明<textarea name="note"></textarea></label>
+    <label class="field">准备<textarea name="prep" placeholder="一行一条"></textarea></label>
+    <div class="row">
+      <button class="ghost" value="cancel" type="submit">取消</button>
+      <button class="btn" value="ok" type="submit">使用</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="caseDlg">
+  <form class="dlg" method="dialog" id="caseForm">
+    <h2 id="caseDlgTitle">新增用例</h2>
+    <label class="field">编号<input name="id" required placeholder="例如 M1"></label>
+    <label class="field">操作<textarea name="action" required></textarea></label>
+    <label class="field">通过标准<textarea name="expect" required></textarea></label>
+    <label class="field">分组<input name="group" placeholder="可选，例如 配对 / 下载"></label>
+    <div class="row">
+      <button class="ghost" value="cancel" type="submit">取消</button>
+      <button class="btn" value="ok" type="submit">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<script id="seed" type="application/json">
+{
+  "title": "ADB Wi-Fi 人工测试",
+  "note": "需要真实手机、电脑和网络。没有报出 mdns_service_version: 2.0 时，2.0 相关用例记为未验证。",
+  "prep": [
+    "手机：Android 11 或更高，已打开开发者选项和无线调试。",
+    "电脑：AdbPilot 能找到一份 adb。建议再准备一份 34.0.5 以下的旧 adb。",
+    "手机和电脑先连同一个 Wi-Fi。配对页面和无线调试主页要同时能打开。"
+  ],
+  "cases": [
+    {"id":"M1","action":"打开无线调试，点击「检查能力」","expect":"显示当前 adb 路径和能力。版本达到 34.0.5 才显示安全配对可用。只有版本、发现设备功能都满足时，才显示主机具备 Wi-Fi 2.0 条件","status":"todo"},
+    {"id":"M2","action":"把 adb 换成 34.0.4 或更旧，再点「检查能力」，然后尝试配对","expect":"提示升级。软件不执行配对。按地址连接仍可使用","status":"pass","env":"macOS · adb 34.0.4","note":"2026-10-16 14:21:30 提示「30.0.0–34.0.4 的早期配对实现，产品内不执行配对」。"},
+    {"id":"M3","action":"在手机「使用配对码配对设备」页面取出地址和六位码，在软件中配对，连接地址留空","expect":"配对成功。设备自动出现时状态为已出现；没有出现时提示改填无线调试主页上的连接地址，且不要求重新输入配对码","status":"todo"},
+    {"id":"M4","action":"重复 M3，但提前填入无线调试主页上的连接地址","expect":"设备没有自动出现时，软件用这个地址连上。状态与「自动出现」不同","status":"todo"},
+    {"id":"M5","action":"故意把配对地址填进连接地址","expect":"连接失败，并提示不要使用配对端口","status":"todo"},
+    {"id":"M6","action":"输入错误或过期的六位码","expect":"提示重新生成配对码。输出和进程参数里看不到这六位数字","status":"todo"},
+    {"id":"M7","action":"打开配对码页面后立刻关闭，再提交刚才的地址","expect":"提示配对页面已关闭或地址变化，不显示为已配对","status":"todo"},
+    {"id":"M8","action":"配对成功后断开，手机和电脑仍在同一网络，再次打开软件并点「连接已配对」","expect":"已记住这台电脑的手机可以再次连上，不需要重新输入六位码","status":"todo"},
+    {"id":"M9","action":"点「扫码配对」，用手机「使用二维码配对设备」扫描电脑上的二维码","expect":"方向是手机扫电脑。成功后设备出现。关闭窗口会取消等待","status":"todo"},
+    {"id":"M10","action":"手机连上已勾选「始终允许」的网络后，查看能力","expect":"只有 adb mdns track-services --proto-text 报出不低于 2.0 时，才显示设备支持 Wi-Fi 2.0。系统版本是 17 但没有该字段时，仍显示安全无线调试","status":"unverified","note":"2.0 未验证。"},
+    {"id":"M11","action":"电脑和手机不在同一网络，或使用会隔离设备的企业 Wi-Fi","expect":"不把这种情况标成软件故障。提示确认同一网络，并允许手输连接地址","status":"todo"},
+    {"id":"M12","action":"命令行执行 adbpilot pair <配对地址>，按提示输入六位码","expect":"配对码不出现在命令本身。结果与界面同一套状态。失败时命令退出码为 2","status":"todo"},
+    {"id":"M13","action":"电视或 Wear OS","expect":"Android 13 及以上按 M3 验证。Android 11 的手表只确认提示不适用，不要求配对成功","status":"todo"},
+    {"id":"M14","action":"点路径框下拉箭头","expect":"列出电脑上已找到的 adb，以及以前浏览或下载过的路径。选中后，下一次操作改用这一份","status":"unverified","note":"代码和单元测试已覆盖，界面尚未人工复测。"},
+    {"id":"M15","action":"点「下载版本」，确认默认目录，再点「打开目录」","expect":"源码运行时目录是项目目录。打包后的程序目录是应用所在目录。系统文件窗口打开的是这个目录","status":"pass","env":"macOS · 源码目录","note":"默认目录为项目目录。文件位于 tools/platform-tools-34.0.4/。"},
+    {"id":"M16","action":"选择 34.0.4，点「下载并使用」","expect":"窗口显示进度条和百分比，日志不被进度刷满。完成后路径切到下载的 adb，并出现在下拉里","status":"pass","env":"macOS · adb 34.0.4","note":"14:21:11 开始下载，14:21:12 已切换。进度条按百分比更新。"},
+    {"id":"M17","action":"不改目录，再次下载同一个 34.0.4","expect":"不再重新下载，直接提示已在目录中，并继续使用这份 adb","status":"unverified","note":"代码和单元测试已覆盖，界面尚未人工复测。"},
+    {"id":"M18","action":"把目录改到别处，下载另一个版本","expect":"文件保存到新目录。回到默认项目目录时，原先下载的版本仍在","status":"unverified","note":"代码和单元测试已覆盖，界面尚未人工复测。"}
+  ]
+}
+</script>
+<script>
+const KEY = "adbpilot.testboard.v1";
+const STATUSES = [
+  ["todo", "未测"],
+  ["pass", "通过"],
+  ["fail", "失败"],
+  ["blocked", "阻塞"],
+  ["unverified", "未验证"]
+];
+const seed = JSON.parse(document.getElementById("seed").textContent);
+const $ = (id) => document.getElementById(id);
+
+let board = load();
+let filter = "all";
+let query = "";
+
+function load() {
+  try {
+    const raw = localStorage.getItem(KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (_) {}
+  return structuredClone(seed);
+}
+function save() { localStorage.setItem(KEY, JSON.stringify(board)); }
+
+function counts() {
+  const c = { all: board.cases.length, todo: 0, pass: 0, fail: 0, blocked: 0, unverified: 0 };
+  for (const item of board.cases) c[item.status] = (c[item.status] || 0) + 1;
+  return c;
+}
+
+function render() {
+  $("featureTitle").textContent = board.title || "测试用例";
+  $("featureNote").textContent = board.note || "";
+  $("prep").textContent = (board.prep || []).join(" ");
+  document.title = board.title || "测试用例";
+  const c = counts();
+  $("stats").innerHTML = [
+    ["全部", c.all], ["通过", c.pass], ["失败", c.fail], ["未验证", c.unverified], ["未测", c.todo + c.blocked]
+  ].map(([name, n]) => `<div class="stat"><b>${n}</b><span>${name}</span></div>`).join("");
+
+  const chips = [["all", "全部"], ...STATUSES];
+  $("filters").innerHTML = chips.map(([key, name]) =>
+    `<button class="chip ${filter === key ? "on" : ""}" data-filter="${key}" type="button">${name}</button>`
+  ).join("");
+
+  const q = query.trim().toLowerCase();
+  const items = board.cases.filter((item) => {
+    if (filter !== "all" && item.status !== filter) return false;
+    if (!q) return true;
+    return [item.id, item.action, item.expect, item.group, item.note, item.env].join(" ").toLowerCase().includes(q);
+  });
+  $("list").innerHTML = items.length ? items.map(card).join("") : `<div class="empty">没有匹配的用例</div>`;
+}
+
+function card(item) {
+  const label = STATUSES.find(([k]) => k === item.status)?.[1] || item.status;
+  const options = STATUSES.map(([k, name]) => `<option value="${k}" ${k === item.status ? "selected" : ""}>${name}</option>`).join("");
+  return `<details class="case" data-id="${esc(item.id)}">
+    <summary>
+      <span class="id">${esc(item.id)}</span>
+      <span><div class="title">${esc(item.action)}</div><div class="meta">${esc(item.group || "未分组")}${item.env ? " · " + esc(item.env) : ""}</div></span>
+      <span class="badge ${esc(item.status)}">${label}</span>
+    </summary>
+    <div class="body">
+      <dl class="pair"><dt>通过标准</dt><dd>${esc(item.expect)}</dd></dl>
+      <div class="row">
+        <select class="status" data-field="status">${options}</select>
+        <input class="env" data-field="env" placeholder="环境，例如 macOS · adb 37.0.0 · Android 15" value="${esc(item.env || "")}">
+      </div>
+      <textarea class="note" data-field="note" placeholder="记录实际现象、时间、下一步">${esc(item.note || "")}</textarea>
+      <div class="row"><button class="ghost" data-act="edit" type="button">编辑用例</button><button class="ghost" data-act="delete" type="button">删除</button></div>
+    </div>
+  </details>`;
+}
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+function find(id) { return board.cases.find((item) => item.id === id); }
+
+$("list").addEventListener("change", (event) => {
+  const field = event.target.dataset.field;
+  const root = event.target.closest(".case");
+  if (!field || !root) return;
+  const item = find(root.dataset.id);
+  if (!item) return;
+  item[field] = event.target.value;
+  save();
+  if (field === "status") render();
+});
+$("list").addEventListener("input", (event) => {
+  const field = event.target.dataset.field;
+  const root = event.target.closest(".case");
+  if (!field || !root || field === "status") return;
+  const item = find(root.dataset.id);
+  if (!item) return;
+  item[field] = event.target.value;
+  save();
+});
+$("list").addEventListener("click", (event) => {
+  const act = event.target.dataset.act;
+  const root = event.target.closest(".case");
+  if (!act || !root) return;
+  const item = find(root.dataset.id);
+  if (act === "delete") {
+    if (!confirm(`删除 ${item.id}？`)) return;
+    board.cases = board.cases.filter((row) => row.id !== item.id);
+    save(); render();
+  }
+  if (act === "edit") openCase(item);
+});
+$("filters").addEventListener("click", (event) => {
+  const key = event.target.dataset.filter;
+  if (!key) return;
+  filter = key;
+  render();
+});
+$("q").addEventListener("input", () => { query = $("q").value; render(); });
+
+$("addBtn").onclick = () => openCase(null);
+function openCase(item) {
+  const form = $("caseForm");
+  $("caseDlgTitle").textContent = item ? "编辑用例" : "新增用例";
+  form.id.value = item?.id || "";
+  form.action.value = item?.action || "";
+  form.expect.value = item?.expect || "";
+  form.group.value = item?.group || "";
+  form.dataset.editing = item?.id || "";
+  $("caseDlg").showModal();
+}
+$("caseForm").addEventListener("submit", (event) => {
+  if (event.submitter?.value !== "ok") return;
+  const form = event.target;
+  const id = form.id.value.trim();
+  const editing = form.dataset.editing;
+  if (!editing && find(id)) { event.preventDefault(); alert("编号已存在"); return; }
+  const next = {
+    ...(editing ? find(editing) : { status: "todo", env: "", note: "" }),
+    id, action: form.action.value.trim(), expect: form.expect.value.trim(), group: form.group.value.trim()
+  };
+  if (editing && editing !== id) board.cases = board.cases.filter((row) => row.id !== editing);
+  const index = board.cases.findIndex((row) => row.id === id);
+  if (index >= 0) board.cases[index] = next;
+  else board.cases.push(next);
+  save(); render();
+});
+
+$("switchBtn").onclick = () => {
+  const form = $("suiteForm");
+  form.title.value = board.title || "";
+  form.note.value = board.note || "";
+  form.prep.value = (board.prep || []).join("\n");
+  $("suiteDlg").showModal();
+};
+$("suiteForm").addEventListener("submit", (event) => {
+  if (event.submitter?.value !== "ok") return;
+  const form = event.target;
+  const title = form.title.value.trim();
+  if (title !== board.title && board.cases.length && !confirm("切换功能会清空当前用例列表。先导出记录再继续？点确定即清空。")) {
+    event.preventDefault();
+    return;
+  }
+  const changing = title !== board.title;
+  board.title = title;
+  board.note = form.note.value.trim();
+  board.prep = form.prep.value.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (changing) board.cases = [];
+  save(); render();
+});
+
+$("exportBtn").onclick = () => {
+  const blob = new Blob([JSON.stringify(board, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `${(board.title || "test-cases").replace(/\s+/g, "-")}.json`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+$("importBtn").onclick = () => $("file").click();
+$("file").onchange = async () => {
+  const file = $("file").files?.[0];
+  $("file").value = "";
+  if (!file) return;
+  const data = JSON.parse(await file.text());
+  if (!data || !Array.isArray(data.cases)) { alert("不是测试用例文件"); return; }
+  board = data;
+  save(); render();
+};
+
+$("list").addEventListener("toggle", (event) => {
+  if (event.target.open) event.target.querySelector("textarea")?.focus();
+}, true);
+
+render();
+</script>
+</body>
+</html>
