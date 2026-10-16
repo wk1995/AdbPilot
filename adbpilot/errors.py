@@ -11,6 +11,10 @@ class AdbNotFoundError(AdbPilotError):
     """Raised when the adb executable cannot be found."""
 
 
+class AdbDownloadError(AdbPilotError):
+    """Raised when a platform-tools package cannot be downloaded or unpacked."""
+
+
 class AdbCommandError(AdbPilotError):
     """Raised when an adb command exits with a non-zero status."""
 

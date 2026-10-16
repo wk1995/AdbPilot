@@ -18,8 +18,9 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from . import __version__
+from .adb_download import ADB_VERSIONS, default_download_root, download_platform_tools, open_directory
 from .client import AdbClient, capability_summary, pairing_status_text
-from .errors import AdbNotFoundError, AdbPilotError, PairingCodeError, WirelessAddressError
+from .errors import AdbDownloadError, AdbNotFoundError, AdbPilotError, PairingCodeError, WirelessAddressError
 from .models import Device, RunningProcess
 from .packages import DependencyRequest, install_dependency
 from .platform_adapter import PlatformAdapter
@@ -233,6 +234,8 @@ class AdbPilotGui(BaseTk):
         self.result_queue: queue.Queue[tuple[str, str, Any, ResultCallback | None]] = queue.Queue()
 
         self.adb_path_var = tk.StringVar()
+        self.adb_version_var = tk.StringVar(value=ADB_VERSIONS[0])
+        self.adb_download_dir_var = tk.StringVar(value=self._saved_download_dir())
         self.timeout_var = tk.StringVar(value="30")
         self.selected_serial_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
@@ -334,6 +337,7 @@ class AdbPilotGui(BaseTk):
         self.adb_path_combo.bind("<<ComboboxSelected>>", self._on_adb_path_selected)
         self._register_file_drop(self.adb_path_combo, self.adb_path_var)
         ttk.Button(path_row, text="浏览", command=self._browse_adb, style="Quiet.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(path_row, text="下载版本", command=self.open_adb_download, style="Quiet.TButton").pack(side=tk.LEFT, padx=4)
 
         ttk.Label(path_row, text="超时", style="Muted.TLabel").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Entry(path_row, textvariable=self.timeout_var, width=6).pack(side=tk.LEFT)
@@ -1269,6 +1273,81 @@ class AdbPilotGui(BaseTk):
         choices = merge_adb_paths(saved_adb_paths(self.gui_config), discovered, current)
         self.adb_path_combo.configure(values=choices)
 
+    def _saved_download_dir(self) -> str:
+        saved = str(self.gui_config.get("adb_download_dir", "")).strip()
+        if saved:
+            return saved
+        return str(default_download_root(Path(__file__)))
+
+    def open_adb_download(self) -> None:
+        if getattr(self, "adb_download_window", None) is not None and self.adb_download_window.winfo_exists():
+            self.adb_download_window.lift()
+            return
+        window = tk.Toplevel(self)
+        window.title("下载 adb")
+        window.resizable(False, False)
+        window.configure(bg=COLORS["surface"])
+        window.transient(self)
+        self.adb_download_window = window
+
+        frame = ttk.Frame(window, padding=16, style="Surface.TFrame")
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="选择要下载的 adb 版本", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky=tk.W)
+        ttk.Label(frame, text="版本", style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(12, 0))
+        version = ttk.Combobox(frame, textvariable=self.adb_version_var, values=ADB_VERSIONS, width=16, state="readonly")
+        version.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=(8, 0), pady=(12, 0))
+        ttk.Label(frame, text="目录", style="Muted.TLabel").grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
+        directory = ttk.Entry(frame, textvariable=self.adb_download_dir_var, width=42)
+        directory.grid(row=2, column=1, sticky=tk.EW, padx=(8, 4), pady=(10, 0))
+        ttk.Button(frame, text="选择目录", command=self._choose_adb_download_dir, style="Quiet.TButton").grid(row=2, column=2, pady=(10, 0))
+        self.adb_download_status_var = tk.StringVar(value="等待下载")
+        ttk.Label(frame, textvariable=self.adb_download_status_var, style="Status.TLabel").grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(12, 0))
+        self.adb_download_progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.adb_download_progress.grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=(8, 0))
+        ttk.Button(frame, text="打开目录", command=self._open_adb_download_dir, style="Quiet.TButton").grid(row=5, column=1, sticky=tk.W, padx=(8, 0), pady=(12, 0))
+        ttk.Button(frame, text="下载并使用", command=self._start_adb_download, style="Primary.TButton").grid(row=5, column=2, pady=(12, 0))
+        frame.columnconfigure(1, weight=1)
+
+    def _choose_adb_download_dir(self) -> None:
+        current = self.adb_download_dir_var.get().strip()
+        selected = filedialog.askdirectory(parent=self, title="选择 adb 下载目录", initialdir=current or None)
+        if selected:
+            self.adb_download_dir_var.set(selected)
+            self._remember_download_dir(selected)
+
+    def _open_adb_download_dir(self) -> None:
+        path = Path(self.adb_download_dir_var.get().strip() or self._saved_download_dir()).expanduser()
+        self._remember_download_dir(str(path))
+        try:
+            open_directory(path)
+        except AdbDownloadError as exc:
+            messagebox.showerror("AdbPilot", str(exc), parent=self)
+
+    def _start_adb_download(self) -> None:
+        version = self.adb_version_var.get().strip()
+        destination = Path(self.adb_download_dir_var.get().strip() or self._saved_download_dir()).expanduser()
+        self._remember_download_dir(str(destination))
+
+        def report(message: str) -> None:
+            self.result_queue.put(("progress", "下载 adb", message, None))
+
+        def done(path: Path) -> None:
+            self.adb_path_var.set(str(path))
+            self._remember_adb_path(str(path))
+            self._refresh_adb_path_choices()
+            self.client = None
+            self._append_output(f"已切换到下载的 adb：{path}\n")
+
+        self._run_async(
+            f"下载 adb {version}",
+            lambda: download_platform_tools(version, destination, progress=report),
+            done,
+        )
+
+    def _remember_download_dir(self, path: str) -> None:
+        self.gui_config["adb_download_dir"] = path
+        save_gui_config(self.gui_config)
+
     def _remember_adb_path(self, path: str) -> None:
         self.gui_config["adb_path"] = path
         self.gui_config["adb_paths"] = merge_adb_paths(saved_adb_paths(self.gui_config), [path])
@@ -1351,9 +1430,12 @@ class AdbPilotGui(BaseTk):
             if kind == "progress":
                 if label.startswith("扫码配对:") and label.split(":", 2)[1] != str(self.qr_pair_session):
                     continue
+                message = str(payload).split("\n", 1)[0]
+                if label == "下载 adb":
+                    self._update_adb_download_progress(message)
+                    continue
                 self._append_output(f"{payload}\n")
                 if label.startswith("扫码配对") or label == "安装依赖":
-                    message = str(payload).split("\n", 1)[0]
                     self.qr_pair_status_var.set(message)
                     self._update_dependency_progress(message)
                 continue
@@ -1380,7 +1462,7 @@ class AdbPilotGui(BaseTk):
                 if label != "设备监听" and not label.startswith("扫码配对") and isinstance(payload, AdbPilotError):
                     messagebox.showerror("AdbPilot", str(payload))
 
-        self.after(100, self._process_results)
+        self.after(100, lambda: self._process_results())
 
     def _append_output(self, text: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -1723,6 +1805,32 @@ class AdbPilotGui(BaseTk):
             command=self.install_qrcode_dependency,
             style="Primary.TButton",
         ).pack(fill=tk.X, pady=(0, 8))
+
+    def _update_adb_download_progress(self, message: str) -> None:
+        status = getattr(self, "adb_download_status_var", None)
+        bar = getattr(self, "adb_download_progress", None)
+        if status is not None:
+            status.set(message)
+        self.status_var.set(message)
+        if bar is None or not bar.winfo_exists():
+            return
+        if message.startswith("下载进度") and "%" in message:
+            percent = message.split("%", 1)[0].rsplit(" ", 1)[-1]
+            try:
+                bar.stop()
+                bar.configure(mode="determinate", maximum=100)
+                bar["value"] = int(percent)
+            except ValueError:
+                pass
+            return
+        if message.startswith("正在下载"):
+            bar.configure(mode="indeterminate")
+            bar.start(12)
+            return
+        if message.startswith(("正在解压", "下载完成")) or message.endswith("已在目录中"):
+            bar.stop()
+            bar.configure(mode="determinate", maximum=100)
+            bar["value"] = 100
 
     def _update_dependency_progress(self, message: str) -> None:
         bar = getattr(self, "qr_dependency_progress", None)
