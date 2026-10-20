@@ -2,6 +2,7 @@ import os
 import queue
 import threading
 import tkinter as tk
+from tkinter import ttk
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -18,6 +19,7 @@ from adbpilot.gui import (
     floating_topmost_locked_from_config,
     floating_topmost_style,
     generate_adb_qr_pairing_payload,
+    qr_pairing_mosaic,
     gui_config_path,
     load_gui_config,
     merge_adb_paths,
@@ -114,6 +116,80 @@ class GuiHelperTests(unittest.TestCase):
         self.assertEqual(len(service_name), len("studio-") + 10)
         self.assertEqual(len(password), 12)
         self.assertEqual(payload, f"WIFI:T:ADB;S:{service_name};P:{password};;")
+
+    def test_qr_pairing_mosaic_hides_the_expired_code(self):
+        mosaic = qr_pairing_mosaic()
+
+        self.assertNotIn("WIFI:T:ADB", mosaic)
+        self.assertGreater(len(mosaic.splitlines()), 1)
+        self.assertIn("██", mosaic)
+        self.assertIn("░░", mosaic)
+
+    def test_finished_qr_pairing_covers_code_and_offers_restart(self):
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        content = ttk.Frame(root)
+        content.pack()
+        ttk.Label(content, text="可扫描二维码").pack()
+        status = tk.StringVar(master=root, value="等待手机扫描")
+        actions = ttk.Frame(root)
+        restart = ttk.Button(actions, text="重新生成")
+        gui = SimpleNamespace(
+            qr_pair_content=content,
+            qr_pair_window=root,
+            qr_pair_status_var=status,
+            qr_pair_restart_button=restart,
+        )
+
+        AdbPilotGui._finish_qr_pairing(gui, "扫码配对已结束，这个二维码不能再用。")
+
+        labels = [child.cget("text") for child in content.winfo_children() if isinstance(child, ttk.Label)]
+        self.assertTrue(labels)
+        self.assertNotIn("可扫描二维码", labels)
+        self.assertTrue(any("██" in text for text in labels))
+        self.assertIn("不能再用", status.get())
+        self.assertIn(restart, actions.pack_slaves())
+
+    def test_successful_qr_pairing_closes_window_without_cancelling(self):
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        window = tk.Toplevel(root)
+        self.addCleanup(window.destroy)
+        cancel_event = threading.Event()
+        gui = SimpleNamespace(
+            qr_pair_session=0,
+            qr_pair_cancel_event=None,
+            qr_pair_window=window,
+            qr_pair_status_var=Mock(),
+            _append_output=Mock(),
+            _show_qr_pairing_window=Mock(return_value=True),
+            _get_client=Mock(return_value=Mock()),
+            refresh_devices=Mock(),
+            _close_qr_pairing_window=lambda cancel=True: AdbPilotGui._close_qr_pairing_window(gui, cancel),
+        )
+        gui.qr_pair_cancel_event = cancel_event
+
+        done = None
+
+        def capture_run_async(_self, _label, _work, on_done, _on_error):
+            nonlocal done
+            done = on_done
+
+        gui._run_async = lambda *args: capture_run_async(gui, *args)
+        with patch(
+            "adbpilot.gui.generate_adb_qr_pairing_payload", return_value=("studio-test", "secret", "payload")
+        ):
+            AdbPilotGui.qr_pair_device(gui)
+
+        self.assertIsNotNone(done)
+        cancel_event.clear()
+        done("已连接 192.168.1.8:5555")
+
+        self.assertFalse(cancel_event.is_set())
+        self.assertFalse(window.winfo_exists())
+        gui.refresh_devices.assert_called_once()
 
     def test_device_connection_type(self):
         self.assertEqual(device_connection_type("emulator-5554"), "USB")

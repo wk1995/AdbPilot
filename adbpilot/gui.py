@@ -21,6 +21,7 @@ from . import __version__
 from .adb_download import ADB_VERSIONS, default_download_root, download_platform_tools, open_directory
 from .client import AdbClient, capability_summary, pairing_status_text
 from .errors import AdbDownloadError, AdbNotFoundError, AdbPilotError, PairingCodeError, WirelessAddressError
+from .history import load_devices, log_path, recent_events
 from .models import Device, RunningProcess
 from .packages import DependencyRequest, install_dependency
 from .platform_adapter import PlatformAdapter
@@ -194,6 +195,13 @@ def generate_adb_qr_pairing_payload() -> tuple[str, str, str]:
     service_name = "studio-" + "".join(secrets.choice(alphabet) for _ in range(10))
     password = "".join(secrets.choice(alphabet) for _ in range(12))
     return service_name, password, f"WIFI:T:ADB;S:{service_name};P:{password};;"
+
+
+def qr_pairing_mosaic(columns: int = 15, rows: int = 9) -> str:
+    """Block pattern that covers an expired pairing QR so it cannot be scanned."""
+    tiles = ("██", "░░")
+    lines = ["".join(tiles[(x + y + (x * y) % 3) % 2] for x in range(columns)) for y in range(rows)]
+    return "\n".join(lines)
 
 
 class AdbPilotGui(BaseTk):
@@ -442,6 +450,7 @@ class AdbPilotGui(BaseTk):
         self._build_screen_tab(self.tabs)
         self._build_shell_tab(self.tabs)
         self._build_log_tab(self.tabs)
+        self._build_history_tab(self.tabs)
 
     def _build_apps_tab(self, tabs: ttk.Notebook) -> None:
         tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
@@ -640,6 +649,83 @@ class AdbPilotGui(BaseTk):
         self.log_output = tk.Text(tab, height=14, wrap=tk.NONE)
         self._style_text(self.log_output)
         self.log_output.pack(fill=tk.BOTH, expand=True)
+
+    def _build_history_tab(self, tabs: ttk.Notebook) -> None:
+        tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
+        tabs.add(tab, text="连接历史")
+
+        ttk.Label(
+            tab,
+            text="记录本机看到的连接、断开和设备出现、离开。手机自己显示已连接但电脑没认出时，这里会留下失败或未发现记录。",
+            style="Muted.TLabel",
+            wraplength=720,
+        ).pack(anchor=tk.W)
+
+        toolbar = ttk.Frame(tab, style="Surface.TFrame")
+        toolbar.pack(fill=tk.X, pady=(8, 6))
+        ttk.Button(toolbar, text="刷新记录", command=self.refresh_connection_history, style="Quiet.TButton").pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="打开日志文件", command=self.open_diagnostic_log, style="Quiet.TButton").pack(side=tk.LEFT, padx=8)
+        ttk.Label(toolbar, textvariable=self._history_path_var(), style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
+
+        columns = ("seen", "name", "state", "address", "source", "result")
+        self.history_table = ttk.Treeview(tab, columns=columns, show="headings", height=7)
+        headings = {
+            "seen": "最近时间",
+            "name": "设备",
+            "state": "状态",
+            "address": "地址",
+            "source": "来源",
+            "result": "结果",
+        }
+        widths = {"seen": 170, "name": 160, "state": 90, "address": 220, "source": 70, "result": 280}
+        for column in columns:
+            self.history_table.heading(column, text=headings[column])
+            self.history_table.column(column, width=widths[column], anchor=tk.W)
+        self.history_table.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(tab, text="诊断日志", style="Section.TLabel").pack(anchor=tk.W)
+        self.history_log = tk.Text(tab, height=10, wrap=tk.NONE)
+        self._style_text(self.history_log)
+        self.history_log.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        self.after(800, self.refresh_connection_history)
+
+    def _history_path_var(self) -> tk.StringVar:
+        if not hasattr(self, "history_path_var"):
+            self.history_path_var = tk.StringVar(value=str(log_path()))
+        return self.history_path_var
+
+    def refresh_connection_history(self) -> None:
+        table = getattr(self, "history_table", None)
+        log_view = getattr(self, "history_log", None)
+        if table is None or log_view is None:
+            return
+        for item in table.get_children():
+            table.delete(item)
+        for device in load_devices():
+            table.insert(
+                "",
+                tk.END,
+                values=(
+                    str(device.get("last_seen", "")),
+                    str(device.get("model") or device.get("serial") or "未知设备"),
+                    str(device.get("last_state", "")),
+                    str(device.get("address") or device.get("serial") or ""),
+                    str(device.get("last_source", "")),
+                    str(device.get("last_result", "")),
+                ),
+            )
+        log_view.delete("1.0", tk.END)
+        lines = recent_events(120)
+        log_view.insert(tk.END, "\n".join(lines) if lines else "还没有连接记录。")
+        log_view.see(tk.END)
+
+    def open_diagnostic_log(self) -> None:
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text("", encoding="utf-8")
+        open_directory(path.parent)
+        self._append_output(f"日志目录：{path.parent}\n")
 
     def _build_output(self, parent: ttk.Frame) -> None:
         footer = ttk.Frame(parent, padding=(14, 10), style="Surface.TFrame")
@@ -1357,7 +1443,7 @@ class AdbPilotGui(BaseTk):
         timeout = self._int_value(self.timeout_var, default=30)
         adb_path = self.adb_path_var.get().strip() or None
         if self.client is None or str(self.client.adb_path) != str(adb_path or self.client.adb_path) or self.client.timeout != timeout:
-            self.client = AdbClient(adb_path=adb_path, timeout=timeout)
+            self.client = AdbClient(adb_path=adb_path, timeout=timeout, history_source="gui")
             self.adb_path_var.set(str(self.client.adb_path))
             self._remember_adb_path(str(self.client.adb_path))
         return self.client
@@ -1593,6 +1679,7 @@ class AdbPilotGui(BaseTk):
 
         self.device_table.tag_configure("disconnected", foreground="#9ca3af")
         self.device_rows = next_rows
+        self._record_rendered_device_changes(previous_connected, devices)
 
         selected = self.selected_serial_var.get().strip()
         locked = self.locked_serial_var.get().strip()
@@ -1618,6 +1705,16 @@ class AdbPilotGui(BaseTk):
             self._append_output(f"检测到 {len(devices)} 台在线设备\n")
         self._update_lock_status()
         self._render_floating_devices()
+
+    def _record_rendered_device_changes(self, previous_connected: set[str], devices: list[Device]) -> None:
+        before = [Device(serial, "device", {}) for serial in previous_connected]
+        try:
+            messages = self._get_client().note_device_changes(before, devices)
+        except Exception as exc:  # noqa: BLE001 - history must not block the device list.
+            self._append_output(f"连接历史未写入：{exc}\n")
+            return
+        if messages:
+            AdbPilotGui.refresh_connection_history(self)
 
     def show_device_info(self) -> None:
         serial = self._selected_serial()
@@ -1674,11 +1771,13 @@ class AdbPilotGui(BaseTk):
             else:
                 detail = str(exc)
             self.wireless_status_var.set(f"配对失败：{detail}")
+            AdbPilotGui.refresh_connection_history(self)
 
         def done(result: Any) -> None:
             self._set_pairing_busy(False)
             self.wireless_status_var.set(pairing_status_text(result))
             self._append_output(pairing_status_text(result) + "\n")
+            AdbPilotGui.refresh_connection_history(self)
             if result.status == "paired_waiting_for_connect":
                 self.connect_addr_entry.focus_set()
                 return
@@ -1718,9 +1817,15 @@ class AdbPilotGui(BaseTk):
         def done(result: str) -> None:
             if session != self.qr_pair_session:
                 return
-            self.qr_pair_status_var.set("扫码配对完成")
             self._append_output(f"{result}\n")
+            self._close_qr_pairing_window(cancel=False)
             self.refresh_devices()
+
+        def failed(exc: Exception) -> None:
+            if session != self.qr_pair_session:
+                return
+            cancelled = "已取消" in str(exc)
+            self._finish_qr_pairing("扫码已取消。" if cancelled else "扫码配对已结束，这个二维码不能再用。")
 
         self._run_async(
             f"扫码配对:{session}:{service_name}",
@@ -1733,6 +1838,7 @@ class AdbPilotGui(BaseTk):
                 ),
             ),
             done,
+            failed,
         )
 
     def _show_qr_pairing_window(self, payload: str) -> bool:
@@ -1768,6 +1874,12 @@ class AdbPilotGui(BaseTk):
         actions = ttk.Frame(window, style="Surface.TFrame")
         actions.pack(fill=tk.X, padx=16, pady=(0, 14))
         ttk.Button(actions, text="关闭", command=self._close_qr_pairing_window, style="Quiet.TButton").pack(side=tk.RIGHT)
+        self.qr_pair_restart_button = ttk.Button(
+            actions,
+            text="重新生成",
+            command=self.qr_pair_device,
+            style="Primary.TButton",
+        )
         self.qr_pair_window = window
 
         if not self._render_qr_code(payload, content):
@@ -1786,6 +1898,21 @@ class AdbPilotGui(BaseTk):
         self.qr_pair_image = ImageTk.PhotoImage(image)
         ttk.Label(parent, image=self.qr_pair_image).pack(pady=(0, 8))
         return True
+
+    def _finish_qr_pairing(self, message: str) -> None:
+        content = getattr(self, "qr_pair_content", None)
+        window = getattr(self, "qr_pair_window", None)
+        if content is None or window is None or not window.winfo_exists():
+            return
+        self.qr_pair_status_var.set(message)
+        for child in content.winfo_children():
+            child.destroy()
+        mosaic = qr_pairing_mosaic()
+        ttk.Label(content, text=mosaic, font=mono_font(11), justify=tk.CENTER).pack(pady=(12, 8))
+        ttk.Label(content, text=message, style="Muted.TLabel", wraplength=320, justify=tk.CENTER).pack(pady=(0, 8))
+        button = getattr(self, "qr_pair_restart_button", None)
+        if button is not None and button.winfo_exists():
+            button.pack(side=tk.RIGHT, padx=(0, 8))
 
     def _show_qr_dependency_prompt(self, parent: ttk.Frame) -> None:
         for child in parent.winfo_children():
@@ -1885,8 +2012,8 @@ class AdbPilotGui(BaseTk):
             done,
         )
 
-    def _close_qr_pairing_window(self) -> None:
-        if self.qr_pair_cancel_event is not None:
+    def _close_qr_pairing_window(self, cancel: bool = True) -> None:
+        if cancel and self.qr_pair_cancel_event is not None:
             self.qr_pair_cancel_event.set()
         if self.qr_pair_window is not None and self.qr_pair_window.winfo_exists():
             self.qr_pair_window.destroy()
@@ -1914,6 +2041,7 @@ class AdbPilotGui(BaseTk):
             else:
                 detail = str(exc)
             self.wireless_status_var.set(f"{action}失败：{detail}")
+            AdbPilotGui.refresh_connection_history(self)
 
         # Capture Tk settings on the UI thread before starting the ADB worker.
         try:
@@ -1927,6 +2055,7 @@ class AdbPilotGui(BaseTk):
             self._set_wireless_busy(False)
             self.wireless_status_var.set(f"{action}成功：{target}")
             self._append_output(f"{output}\n")
+            AdbPilotGui.refresh_connection_history(self)
             self.refresh_devices()
 
         self._set_wireless_busy(True, connect=connect)

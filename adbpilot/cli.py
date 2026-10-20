@@ -13,6 +13,7 @@ from typing import Any
 from . import __version__
 from .client import AdbClient, capability_summary, pairing_status_text
 from .errors import AdbPilotError, suggestion_for_device_state
+from .history import format_device_row, load_devices, log_path, recent_events
 from .models import AdbWifiCapabilities, Device, DeviceInfo, RunningProcess, WirelessPairingResult
 
 
@@ -48,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_simple_command(subparsers, "version", "显示 adb 版本", handle_version)
     add_simple_command(subparsers, "restart-server", "重启 adb server", handle_restart_server)
+
+    history = subparsers.add_parser("history", help="查看已保存的连接历史和诊断日志")
+    history.add_argument("--limit", type=int, default=40, help="显示最近多少条日志")
+    history.add_argument("--json", action="store_true", help="以 JSON 输出设备历史")
+    history.set_defaults(handler=handle_history)
 
     devices = subparsers.add_parser("devices", help="列出设备")
     devices.add_argument("--json", action="store_true", help="以 JSON 输出")
@@ -253,6 +259,26 @@ def handle_info(client: AdbClient, args: argparse.Namespace) -> int:
 
     for key, value in data.items():
         print(f"{key}: {value}")
+    return 0
+
+
+def handle_history(client: AdbClient, args: argparse.Namespace) -> int:
+    devices = load_devices()
+    if args.json:
+        print(json.dumps({"log": str(log_path()), "devices": devices}, ensure_ascii=False, indent=2))
+        return 0
+    print(f"日志文件：{log_path()}")
+    if not devices:
+        print("还没有连接历史。")
+    else:
+        print("连接历史：")
+        for device in devices:
+            print(format_device_row(device))
+    events = recent_events(max(args.limit, 0))
+    if events:
+        print("最近日志：")
+        for line in events:
+            print(line)
     return 0
 
 

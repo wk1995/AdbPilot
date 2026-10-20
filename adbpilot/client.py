@@ -18,6 +18,7 @@ from .errors import (
     WirelessAddressError,
     suggestion_for_device_state,
 )
+from . import history as connection_history
 from .models import AdbWifiCapabilities, CommandResult, Device, DeviceInfo, RunningProcess, WirelessPairingResult
 from .platform_adapter import PlatformAdapter
 
@@ -28,9 +29,16 @@ DEFAULT_TIMEOUT = 30
 class AdbClient:
     """Small, testable wrapper around the adb executable."""
 
-    def __init__(self, adb_path: str | None = None, timeout: int = DEFAULT_TIMEOUT) -> None:
+    def __init__(
+        self,
+        adb_path: str | None = None,
+        timeout: int = DEFAULT_TIMEOUT,
+        *,
+        history_source: str = "cli",
+    ) -> None:
         self.adb_path = PlatformAdapter().resolve_adb(adb_path)
         self.timeout = timeout
+        self.history_source = history_source
 
     def run(
         self,
@@ -125,6 +133,7 @@ class AdbClient:
     def restart_server(self) -> None:
         self.run(["kill-server"], check=False)
         self.run(["start-server"])
+        self._record("restart-server", ok=True, message="adb server 已重启")
 
     def devices(self) -> list[Device]:
         result = self.run(["devices", "-l"])
@@ -398,17 +407,33 @@ class AdbClient:
 
     def connect(self, address: str) -> str:
         normalized = normalize_adb_address(address, require_port=False)
-        result = self.run(["connect", normalized])
+        try:
+            result = self.run(["connect", normalized])
+        except AdbCommandError as exc:
+            self._record("connect", ok=False, address=normalized, message=str(exc), detail=exc.stderr)
+            raise
         output = result.stdout.strip()
         # adb can report connection failures on stdout with exit status 0.
         if not output.lower().startswith(("connected to ", "already connected to ")):
+            message = output or result.stderr.strip() or "ADB 未返回连接成功信息"
+            self._record("connect", ok=False, address=normalized, message=message, detail=result.stderr)
             raise AdbConnectionError(
-                output or result.stderr.strip() or "ADB 未返回连接成功信息",
+                message,
                 result.returncode,
                 result.stdout,
                 result.stderr,
                 category="connect_failed",
             )
+        matched = self._device_at(normalized)
+        self._record(
+            "connect",
+            ok=True,
+            address=normalized,
+            serial=matched.serial if matched else "",
+            state=matched.state if matched else "",
+            model=self._device_model(matched),
+            message=output,
+        )
         return output
 
     def pair(
@@ -441,14 +466,17 @@ class AdbClient:
         outcome = classify_pair_output(result.returncode, result.stdout, result.stderr)
         if outcome == "failed":
             category = classify_pair_failure(result.stdout, result.stderr)
+            message = wifi_error_message(category)
+            self._record("pair", ok=False, address=pairing_address, message=message, detail=category)
             raise AdbPairingError(
-                wifi_error_message(category),
+                message,
                 result.returncode,
                 result.stdout,
                 result.stderr,
                 category=category,
             )
         if outcome == "ambiguous":
+            self._record("pair", ok=False, address=pairing_address, message="配对结果无法确认")
             return WirelessPairingResult(
                 status="ambiguous",
                 paired=False,
@@ -462,6 +490,15 @@ class AdbClient:
         before = self.devices()
         appeared = self._wait_for_new_tls_device(before, wait_for_device_seconds)
         if appeared is not None:
+            self._record(
+                "pair",
+                ok=True,
+                address=explicit_address or pairing_address,
+                serial=appeared.serial,
+                state=appeared.state,
+                model=self._device_model(appeared),
+                message="配对后设备已出现",
+            )
             return WirelessPairingResult(
                 status="paired_and_connected",
                 paired=True,
@@ -484,6 +521,15 @@ class AdbClient:
                     "",
                     category="connect_failed",
                 )
+            self._record(
+                "pair",
+                ok=matched.is_ready,
+                address=explicit_address,
+                serial=matched.serial,
+                state=matched.state,
+                model=self._device_model(matched),
+                message="已使用指定连接地址完成配对后连接",
+            )
             return WirelessPairingResult(
                 status="paired_connected_explicitly",
                 paired=True,
@@ -494,6 +540,7 @@ class AdbClient:
                 next_action="已使用无线调试主页上的连接地址完成连接。",
                 capabilities=capabilities,
             )
+        self._record("pair", ok=True, address=pairing_address, message="配对完成，等待填写连接地址")
         return WirelessPairingResult(
             status="paired_waiting_for_connect",
             paired=True,
@@ -551,9 +598,22 @@ class AdbClient:
 
     def disconnect(self, address: str | None = None) -> str:
         args = ["disconnect"]
-        if address:
-            args.append(address)
-        return self.run(args, timeout=60).stdout.strip()
+        normalized = normalize_adb_address(address, require_port=False) if address else ""
+        if normalized:
+            args.append(normalized)
+        try:
+            output = self.run(args, timeout=60).stdout.strip()
+        except AdbCommandError as exc:
+            self._record("disconnect", ok=False, address=normalized, message=str(exc), detail=exc.stderr)
+            raise
+        self._record(
+            "disconnect",
+            ok=True,
+            address=normalized,
+            state="disconnected",
+            message=output or ("已断开所有无线设备" if not normalized else "已断开"),
+        )
+        return output
 
     def mdns_services(self) -> str:
         return self.run(["mdns", "services"], timeout=20).stdout
@@ -828,6 +888,95 @@ class AdbClient:
             process.kill()
             stdout, stderr = process.communicate()
         return f"{stdout or ''}\n{stderr or ''}"
+
+    def note_device_changes(self, before: list[Device], after: list[Device]) -> list[str]:
+        """Record devices that appeared, disappeared, or changed state."""
+
+        previous = {device.serial: device for device in before}
+        current = {device.serial: device for device in after}
+        messages: list[str] = []
+        for serial, device in current.items():
+            old = previous.get(serial)
+            if old is None:
+                model = self._device_model(device)
+                self._record(
+                    "seen",
+                    ok=device.is_ready,
+                    serial=serial,
+                    state=device.state,
+                    model=model,
+                    address=serial if ":" in serial else "",
+                    message=f"发现设备 {model or serial}",
+                )
+                messages.append(f"发现设备：{model or serial}（{device.state}）")
+            elif old.state != device.state:
+                model = self._device_model(device)
+                self._record(
+                    "state",
+                    ok=device.is_ready,
+                    serial=serial,
+                    state=device.state,
+                    model=model,
+                    message=f"状态 {old.state} -> {device.state}",
+                )
+                messages.append(f"设备状态变化：{model or serial} {old.state} -> {device.state}")
+        for serial, device in previous.items():
+            if serial in current:
+                continue
+            model = self._device_model(device)
+            self._record(
+                "lost",
+                ok=False,
+                serial=serial,
+                state="已断开",
+                model=model,
+                message=f"设备离开列表 {model or serial}",
+            )
+            messages.append(f"设备已离开：{model or serial}")
+        return messages
+
+    def _device_at(self, address: str) -> Device | None:
+        try:
+            devices = self.devices()
+        except AdbCommandError:
+            return None
+        for device in devices:
+            if device.serial == address or address in device.serial:
+                return device
+        return next((device for device in devices if device.is_ready), None)
+
+    @staticmethod
+    def _device_model(device: Device | None) -> str:
+        if device is None:
+            return ""
+        return str(device.details.get("model") or device.details.get("product") or "")
+
+    def _record(
+        self,
+        event: str,
+        *,
+        ok: bool,
+        address: str = "",
+        serial: str = "",
+        state: str = "",
+        model: str = "",
+        message: str = "",
+        detail: str = "",
+    ) -> None:
+        try:
+            connection_history.record_event(
+                event,
+                source=self.history_source,
+                ok=ok,
+                address=address,
+                serial=serial,
+                state=state,
+                model=model,
+                message=message,
+                detail=detail,
+            )
+        except OSError:
+            return
 
     def _build_command(self, args: Iterable[str], *, serial: str | None = None) -> list[str]:
         command = [str(self.adb_path)]
