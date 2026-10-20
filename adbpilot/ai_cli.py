@@ -14,6 +14,7 @@ from . import __version__
 from .cli import capabilities_to_dict, pairing_result_to_dict
 from .client import AdbClient
 from .errors import AdbPilotError
+from .history import load_devices, log_path, recent_events
 from .models import Device, DeviceInfo, RunningProcess
 
 
@@ -164,6 +165,10 @@ def operation_schema() -> JsonMap:
             "devices": {"description": "List connected devices", "params": {}},
             "info": {"description": "Get device info", "params": {"serial": "optional string"}},
             "connect": {"description": "Connect wireless adb device", "params": {"address": "host:port string"}},
+            "history": {
+                "description": "Read saved connection history and recent diagnostic log lines",
+                "params": {"limit": "optional int"},
+            },
             "wifi-capabilities": {"description": "Inspect adb wireless capabilities", "params": {}},
             "pair": {
                 "description": "Pair a wireless adb device",
@@ -245,6 +250,15 @@ def op_info(client: AdbClient, params: JsonMap) -> JsonMap:
 
 def op_connect(client: AdbClient, params: JsonMap) -> JsonMap:
     return {"message": client.connect(required_str(params, "address"))}
+
+
+def op_history(client: AdbClient, params: JsonMap) -> JsonMap:
+    limit = params.get("limit", 40)
+    try:
+        count = max(int(limit), 0)
+    except (TypeError, ValueError):
+        count = 40
+    return {"log": str(log_path()), "devices": load_devices(), "events": recent_events(count)}
 
 
 def op_wifi_capabilities(client: AdbClient, params: JsonMap) -> JsonMap:
@@ -492,6 +506,7 @@ OPERATIONS: dict[str, Operation] = {
     "devices": op_devices,
     "info": op_info,
     "connect": op_connect,
+    "history": op_history,
     "wifi-capabilities": op_wifi_capabilities,
     "pair": op_pair,
     "disconnect": op_disconnect,

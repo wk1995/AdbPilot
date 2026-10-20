@@ -1,7 +1,10 @@
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
+from adbpilot import history as connection_history
 from adbpilot.client import (
     AdbClient,
     capability_summary,
@@ -95,6 +98,14 @@ class WifiParsingTests(unittest.TestCase):
 
 class WifiStateMachineTests(unittest.TestCase):
     def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="adbpilot-history-"))
+        self.paths = patch.multiple(
+            connection_history,
+            history_path=lambda: self.root / "connections.json",
+            log_path=lambda: self.root / "adbpilot.log",
+        )
+        self.paths.start()
+        self.addCleanup(self.paths.stop)
         with patch("adbpilot.client.PlatformAdapter.resolve_adb", return_value="/test/adb"):
             self.client = AdbClient(timeout=7)
 
