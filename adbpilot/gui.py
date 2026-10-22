@@ -18,8 +18,10 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from . import __version__
-from .client import AdbClient
-from .errors import AdbPilotError
+from .adb_download import ADB_VERSIONS, default_download_root, download_platform_tools, open_directory
+from .client import AdbClient, capability_summary, pairing_status_text
+from .errors import AdbDownloadError, AdbNotFoundError, AdbPilotError, PairingCodeError, WirelessAddressError
+from .history import load_devices, log_path, recent_events
 from .models import Device, RunningProcess
 from .packages import DependencyRequest, install_dependency
 from .platform_adapter import PlatformAdapter
@@ -195,6 +197,13 @@ def generate_adb_qr_pairing_payload() -> tuple[str, str, str]:
     return service_name, password, f"WIFI:T:ADB;S:{service_name};P:{password};;"
 
 
+def qr_pairing_mosaic(columns: int = 15, rows: int = 9) -> str:
+    """Block pattern that covers an expired pairing QR so it cannot be scanned."""
+    tiles = ("██", "░░")
+    lines = ["".join(tiles[(x + y + (x * y) % 3) % 2] for x in range(columns)) for y in range(rows)]
+    return "\n".join(lines)
+
+
 class AdbPilotGui(BaseTk):
     """Windows-friendly visual interface backed by the existing AdbClient."""
 
@@ -233,16 +242,18 @@ class AdbPilotGui(BaseTk):
         self.result_queue: queue.Queue[tuple[str, str, Any, ResultCallback | None]] = queue.Queue()
 
         self.adb_path_var = tk.StringVar()
+        self.adb_version_var = tk.StringVar(value=ADB_VERSIONS[0])
+        self.adb_download_dir_var = tk.StringVar(value=self._saved_download_dir())
         self.timeout_var = tk.StringVar(value="30")
         self.selected_serial_var = tk.StringVar()
         self.status_var = tk.StringVar(value="就绪")
 
-        self._configure_style()
-        self.protocol("WM_DELETE_WINDOW", self._close_app)
-        self._build_ui()
         saved_adb_path = str(self.gui_config.get("adb_path", "")).strip()
         if saved_adb_path and Path(saved_adb_path).expanduser().is_file():
             self.adb_path_var.set(saved_adb_path)
+        self._configure_style()
+        self.protocol("WM_DELETE_WINDOW", self._close_app)
+        self._build_ui()
         if DND_FILES is None:
             self._append_output("提示：安装 tkinterdnd2 后可将文件拖到路径输入框。\n")
         self.after(100, self._process_results)
@@ -323,25 +334,18 @@ class AdbPilotGui(BaseTk):
         path_row.pack(fill=tk.X, pady=(12, 0))
 
         ttk.Label(path_row, text="ADB 路径", style="Muted.TLabel").pack(side=tk.LEFT)
-        # Explicit classic-entry colors keep the path readable with macOS themes.
-        adb_entry = tk.Entry(
+        # A writable combo keeps manual entry while offering the adb copies already found.
+        self.adb_path_combo = ttk.Combobox(
             path_row,
             textvariable=self.adb_path_var,
             width=48,
-            background=COLORS["surface"],
-            foreground=COLORS["text"],
-            insertbackground=COLORS["text"],
-            selectbackground=COLORS["accent"],
-            selectforeground="#ffffff",
-            relief=tk.FLAT,
-            borderwidth=0,
-            highlightthickness=1,
-            highlightbackground=COLORS["border"],
-            highlightcolor=COLORS["accent"],
+            values=saved_adb_paths(self.gui_config),
         )
-        adb_entry.pack(side=tk.LEFT, padx=(8, 4), ipady=5, fill=tk.X, expand=True)
-        self._register_file_drop(adb_entry, self.adb_path_var)
+        self.adb_path_combo.pack(side=tk.LEFT, padx=(8, 4), ipady=5, fill=tk.X, expand=True)
+        self.adb_path_combo.bind("<<ComboboxSelected>>", self._on_adb_path_selected)
+        self._register_file_drop(self.adb_path_combo, self.adb_path_var)
         ttk.Button(path_row, text="浏览", command=self._browse_adb, style="Quiet.TButton").pack(side=tk.LEFT, padx=4)
+        ttk.Button(path_row, text="下载版本", command=self.open_adb_download, style="Quiet.TButton").pack(side=tk.LEFT, padx=4)
 
         ttk.Label(path_row, text="超时", style="Muted.TLabel").pack(side=tk.LEFT, padx=(12, 4))
         ttk.Entry(path_row, textvariable=self.timeout_var, width=6).pack(side=tk.LEFT)
@@ -352,6 +356,19 @@ class AdbPilotGui(BaseTk):
         panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
         panel.pack_propagate(False)
         panel.configure(width=360)
+
+        # The device controls are taller than the minimum window once the
+        # output footer is reserved. Keep them reachable with a small window.
+        viewport = tk.Canvas(panel, highlightthickness=0, bd=0, background=COLORS["surface"])
+        scrollbar = ttk.Scrollbar(panel, orient=tk.VERTICAL, command=viewport.yview)
+        viewport.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        viewport.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        content = ttk.Frame(viewport, style="Sidebar.TFrame")
+        window_id = viewport.create_window((0, 0), window=content, anchor=tk.NW)
+        content.bind("<Configure>", lambda _event: viewport.configure(scrollregion=viewport.bbox("all")))
+        viewport.bind("<Configure>", lambda event: viewport.itemconfigure(window_id, width=event.width))
+        panel = content
 
         header = ttk.Frame(panel, style="Sidebar.TFrame")
         header.pack(fill=tk.X, pady=(0, 10))
@@ -398,19 +415,31 @@ class AdbPilotGui(BaseTk):
         self.pair_addr_var = tk.StringVar(value="192.168.1.10:37123")
         self.pair_code_var = tk.StringVar()
         self.connect_addr_var = tk.StringVar(value="192.168.1.10:5555")
+        self.wireless_status_var = tk.StringVar(value="请输入设备的无线调试连接地址")
+        self.capability_status_var = tk.StringVar(value="尚未检查这台电脑的无线能力")
+        self.wireless_busy = False
+        self.pairing_in_progress = False
+        ttk.Label(wireless, textvariable=self.capability_status_var, wraplength=300).pack(fill=tk.X, padx=6, pady=(6, 0))
+        ttk.Button(wireless, text="检查能力", command=self.check_wifi_capabilities, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(4, 6))
         ttk.Label(wireless, text="配对地址").pack(anchor=tk.W, padx=6, pady=(6, 0))
         ttk.Entry(wireless, textvariable=self.pair_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
         ttk.Label(wireless, text="配对码").pack(anchor=tk.W, padx=6, pady=(2, 0))
-        ttk.Entry(wireless, textvariable=self.pair_code_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
-        ttk.Button(wireless, text="配对", command=self.pair_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(2, 6))
+        self.pair_code_entry = ttk.Entry(wireless, textvariable=self.pair_code_var, width=28, show="*")
+        self.pair_code_entry.pack(fill=tk.X, padx=6, pady=(0, 4))
+        self.pair_button = ttk.Button(wireless, text="配对", command=self.pair_device, style="Quiet.TButton")
+        self.pair_button.pack(fill=tk.X, padx=6, pady=(2, 6))
         ttk.Button(wireless, text="扫码配对", command=self.qr_pair_device, style="Primary.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Button(wireless, text="连接已配对", command=self.connect_paired_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(wireless, text="连接地址").pack(anchor=tk.W, padx=6, pady=(2, 0))
-        ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
+        self.connect_addr_entry = ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28)
+        self.connect_addr_entry.pack(fill=tk.X, padx=6, pady=(0, 4))
         wireless_actions = ttk.Frame(wireless, style="Surface.TFrame")
         wireless_actions.pack(fill=tk.X, padx=6, pady=(2, 6))
-        ttk.Button(wireless_actions, text="连接", command=self.connect_device, style="Primary.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
-        ttk.Button(wireless_actions, text="断开", command=self.disconnect_device, style="Quiet.TButton").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        self.connect_button = ttk.Button(wireless_actions, text="连接", command=self.connect_device, style="Primary.TButton")
+        self.connect_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        self.disconnect_button = ttk.Button(wireless_actions, text="断开", command=self.disconnect_device, style="Quiet.TButton")
+        self.disconnect_button.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 0))
+        ttk.Label(wireless, textvariable=self.wireless_status_var, wraplength=300).pack(fill=tk.X, padx=6, pady=(0, 6))
 
     def _build_tabs(self, parent: ttk.Frame) -> None:
         self.tabs = ttk.Notebook(parent)
@@ -421,6 +450,7 @@ class AdbPilotGui(BaseTk):
         self._build_screen_tab(self.tabs)
         self._build_shell_tab(self.tabs)
         self._build_log_tab(self.tabs)
+        self._build_history_tab(self.tabs)
 
     def _build_apps_tab(self, tabs: ttk.Notebook) -> None:
         tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
@@ -620,6 +650,83 @@ class AdbPilotGui(BaseTk):
         self._style_text(self.log_output)
         self.log_output.pack(fill=tk.BOTH, expand=True)
 
+    def _build_history_tab(self, tabs: ttk.Notebook) -> None:
+        tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
+        tabs.add(tab, text="连接历史")
+
+        ttk.Label(
+            tab,
+            text="记录本机看到的连接、断开和设备出现、离开。手机自己显示已连接但电脑没认出时，这里会留下失败或未发现记录。",
+            style="Muted.TLabel",
+            wraplength=720,
+        ).pack(anchor=tk.W)
+
+        toolbar = ttk.Frame(tab, style="Surface.TFrame")
+        toolbar.pack(fill=tk.X, pady=(8, 6))
+        ttk.Button(toolbar, text="刷新记录", command=self.refresh_connection_history, style="Quiet.TButton").pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="打开日志文件", command=self.open_diagnostic_log, style="Quiet.TButton").pack(side=tk.LEFT, padx=8)
+        ttk.Label(toolbar, textvariable=self._history_path_var(), style="Muted.TLabel").pack(side=tk.LEFT, padx=8)
+
+        columns = ("seen", "name", "state", "address", "source", "result")
+        self.history_table = ttk.Treeview(tab, columns=columns, show="headings", height=7)
+        headings = {
+            "seen": "最近时间",
+            "name": "设备",
+            "state": "状态",
+            "address": "地址",
+            "source": "来源",
+            "result": "结果",
+        }
+        widths = {"seen": 170, "name": 160, "state": 90, "address": 220, "source": 70, "result": 280}
+        for column in columns:
+            self.history_table.heading(column, text=headings[column])
+            self.history_table.column(column, width=widths[column], anchor=tk.W)
+        self.history_table.pack(fill=tk.X, pady=(0, 8))
+
+        ttk.Label(tab, text="诊断日志", style="Section.TLabel").pack(anchor=tk.W)
+        self.history_log = tk.Text(tab, height=10, wrap=tk.NONE)
+        self._style_text(self.history_log)
+        self.history_log.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+        self.after(800, self.refresh_connection_history)
+
+    def _history_path_var(self) -> tk.StringVar:
+        if not hasattr(self, "history_path_var"):
+            self.history_path_var = tk.StringVar(value=str(log_path()))
+        return self.history_path_var
+
+    def refresh_connection_history(self) -> None:
+        table = getattr(self, "history_table", None)
+        log_view = getattr(self, "history_log", None)
+        if table is None or log_view is None:
+            return
+        for item in table.get_children():
+            table.delete(item)
+        for device in load_devices():
+            table.insert(
+                "",
+                tk.END,
+                values=(
+                    str(device.get("last_seen", "")),
+                    str(device.get("model") or device.get("serial") or "未知设备"),
+                    str(device.get("last_state", "")),
+                    str(device.get("address") or device.get("serial") or ""),
+                    str(device.get("last_source", "")),
+                    str(device.get("last_result", "")),
+                ),
+            )
+        log_view.delete("1.0", tk.END)
+        lines = recent_events(120)
+        log_view.insert(tk.END, "\n".join(lines) if lines else "还没有连接记录。")
+        log_view.see(tk.END)
+
+    def open_diagnostic_log(self) -> None:
+        path = log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text("", encoding="utf-8")
+        open_directory(path.parent)
+        self._append_output(f"日志目录：{path.parent}\n")
+
     def _build_output(self, parent: ttk.Frame) -> None:
         footer = ttk.Frame(parent, padding=(14, 10), style="Surface.TFrame")
         footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(12, 0))
@@ -649,6 +756,8 @@ class AdbPilotGui(BaseTk):
         if path:
             self.adb_path_var.set(path)
             self._remember_adb_path(path)
+            if hasattr(self, "_refresh_adb_path_choices"):
+                self._refresh_adb_path_choices()
 
     def _browse_apk(self) -> None:
         path = filedialog.askopenfilename(title="选择 APK", filetypes=[("APK", "*.apk"), ("所有文件", "*.*")])
@@ -1217,29 +1326,124 @@ class AdbPilotGui(BaseTk):
         variable.set(path)
         if variable is self.adb_path_var:
             self._remember_adb_path(path)
+            if hasattr(self, "_refresh_adb_path_choices"):
+                self._refresh_adb_path_choices()
         self._append_output(f"已拖入文件：{path}\n")
 
+    def _on_adb_path_selected(self, _event: tk.Event[Any] | None = None) -> None:
+        path = self.adb_path_var.get().strip()
+        if path:
+            self._remember_adb_path(path)
+            self.client = None
+
     def _resolve_initial_adb_path(self) -> None:
-        if self.adb_path_var.get().strip():
-            return
+        current = self.adb_path_var.get().strip()
         try:
-            adb_path = PlatformAdapter().resolve_adb()
+            discovered = [str(path) for path in PlatformAdapter().discover_adb_paths(current or None)]
         except AdbPilotError as exc:
             self._append_output(f"未自动找到 adb：{exc}\n")
+            self._refresh_adb_path_choices()
             return
-        self.adb_path_var.set(str(adb_path))
-        self._remember_adb_path(str(adb_path))
-        self._append_output(f"已自动找到 adb：{adb_path}\n")
+        if not current and discovered:
+            self.adb_path_var.set(discovered[0])
+            self._remember_adb_path(discovered[0])
+            self._append_output(f"已自动找到 adb：{discovered[0]}\n")
+        self._refresh_adb_path_choices(discovered)
+
+    def _refresh_adb_path_choices(self, discovered: list[str] | None = None) -> None:
+        if not hasattr(self, "adb_path_combo"):
+            return
+        current = self.adb_path_var.get().strip()
+        if discovered is None:
+            discovered = [str(path) for path in PlatformAdapter().discover_adb_paths(current or None)]
+        choices = merge_adb_paths(saved_adb_paths(self.gui_config), discovered, current)
+        self.adb_path_combo.configure(values=choices)
+
+    def _saved_download_dir(self) -> str:
+        saved = str(self.gui_config.get("adb_download_dir", "")).strip()
+        if saved:
+            return saved
+        return str(default_download_root(Path(__file__)))
+
+    def open_adb_download(self) -> None:
+        if getattr(self, "adb_download_window", None) is not None and self.adb_download_window.winfo_exists():
+            self.adb_download_window.lift()
+            return
+        window = tk.Toplevel(self)
+        window.title("下载 adb")
+        window.resizable(False, False)
+        window.configure(bg=COLORS["surface"])
+        window.transient(self)
+        self.adb_download_window = window
+
+        frame = ttk.Frame(window, padding=16, style="Surface.TFrame")
+        frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frame, text="选择要下载的 adb 版本", style="Header.TLabel").grid(row=0, column=0, columnspan=3, sticky=tk.W)
+        ttk.Label(frame, text="版本", style="Muted.TLabel").grid(row=1, column=0, sticky=tk.W, pady=(12, 0))
+        version = ttk.Combobox(frame, textvariable=self.adb_version_var, values=ADB_VERSIONS, width=16, state="readonly")
+        version.grid(row=1, column=1, columnspan=2, sticky=tk.W, padx=(8, 0), pady=(12, 0))
+        ttk.Label(frame, text="目录", style="Muted.TLabel").grid(row=2, column=0, sticky=tk.W, pady=(10, 0))
+        directory = ttk.Entry(frame, textvariable=self.adb_download_dir_var, width=42)
+        directory.grid(row=2, column=1, sticky=tk.EW, padx=(8, 4), pady=(10, 0))
+        ttk.Button(frame, text="选择目录", command=self._choose_adb_download_dir, style="Quiet.TButton").grid(row=2, column=2, pady=(10, 0))
+        self.adb_download_status_var = tk.StringVar(value="等待下载")
+        ttk.Label(frame, textvariable=self.adb_download_status_var, style="Status.TLabel").grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(12, 0))
+        self.adb_download_progress = ttk.Progressbar(frame, mode="determinate", maximum=100)
+        self.adb_download_progress.grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=(8, 0))
+        ttk.Button(frame, text="打开目录", command=self._open_adb_download_dir, style="Quiet.TButton").grid(row=5, column=1, sticky=tk.W, padx=(8, 0), pady=(12, 0))
+        ttk.Button(frame, text="下载并使用", command=self._start_adb_download, style="Primary.TButton").grid(row=5, column=2, pady=(12, 0))
+        frame.columnconfigure(1, weight=1)
+
+    def _choose_adb_download_dir(self) -> None:
+        current = self.adb_download_dir_var.get().strip()
+        selected = filedialog.askdirectory(parent=self, title="选择 adb 下载目录", initialdir=current or None)
+        if selected:
+            self.adb_download_dir_var.set(selected)
+            self._remember_download_dir(selected)
+
+    def _open_adb_download_dir(self) -> None:
+        path = Path(self.adb_download_dir_var.get().strip() or self._saved_download_dir()).expanduser()
+        self._remember_download_dir(str(path))
+        try:
+            open_directory(path)
+        except AdbDownloadError as exc:
+            messagebox.showerror("AdbPilot", str(exc), parent=self)
+
+    def _start_adb_download(self) -> None:
+        version = self.adb_version_var.get().strip()
+        destination = Path(self.adb_download_dir_var.get().strip() or self._saved_download_dir()).expanduser()
+        self._remember_download_dir(str(destination))
+
+        def report(message: str) -> None:
+            self.result_queue.put(("progress", "下载 adb", message, None))
+
+        def done(path: Path) -> None:
+            self.adb_path_var.set(str(path))
+            self._remember_adb_path(str(path))
+            self._refresh_adb_path_choices()
+            self.client = None
+            self._append_output(f"已切换到下载的 adb：{path}\n")
+
+        self._run_async(
+            f"下载 adb {version}",
+            lambda: download_platform_tools(version, destination, progress=report),
+            done,
+        )
+
+    def _remember_download_dir(self, path: str) -> None:
+        self.gui_config["adb_download_dir"] = path
+        save_gui_config(self.gui_config)
 
     def _remember_adb_path(self, path: str) -> None:
         self.gui_config["adb_path"] = path
+        self.gui_config["adb_paths"] = merge_adb_paths(saved_adb_paths(self.gui_config), [path])
         save_gui_config(self.gui_config)
 
     def _get_client(self) -> AdbClient:
         timeout = self._int_value(self.timeout_var, default=30)
         adb_path = self.adb_path_var.get().strip() or None
         if self.client is None or str(self.client.adb_path) != str(adb_path or self.client.adb_path) or self.client.timeout != timeout:
-            self.client = AdbClient(adb_path=adb_path, timeout=timeout)
+            self.client = AdbClient(adb_path=adb_path, timeout=timeout, history_source="gui")
             self.adb_path_var.set(str(self.client.adb_path))
             self._remember_adb_path(str(self.client.adb_path))
         return self.client
@@ -1283,7 +1487,13 @@ class AdbPilotGui(BaseTk):
         state = row.get("state", "未知")
         self.lock_status_var.set(f"已锁定：{locked}（{state}）")
 
-    def _run_async(self, label: str, func: Callable[[], Any], on_success: ResultCallback | None = None) -> None:
+    def _run_async(
+        self,
+        label: str,
+        func: Callable[[], Any],
+        on_success: ResultCallback | None = None,
+        on_error: ResultCallback | None = None,
+    ) -> None:
         self.status_var.set(f"执行中：{label}")
         self._append_output(f"$ {label}\n")
 
@@ -1292,7 +1502,7 @@ class AdbPilotGui(BaseTk):
                 result = func()
                 self.result_queue.put(("ok", label, result, on_success))
             except Exception as exc:  # noqa: BLE001 - GUI must show unexpected worker failures.
-                self.result_queue.put(("err", label, exc, None))
+                self.result_queue.put(("err", label, exc, on_error))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1306,9 +1516,12 @@ class AdbPilotGui(BaseTk):
             if kind == "progress":
                 if label.startswith("扫码配对:") and label.split(":", 2)[1] != str(self.qr_pair_session):
                     continue
+                message = str(payload).split("\n", 1)[0]
+                if label == "下载 adb":
+                    self._update_adb_download_progress(message)
+                    continue
                 self._append_output(f"{payload}\n")
                 if label.startswith("扫码配对") or label == "安装依赖":
-                    message = str(payload).split("\n", 1)[0]
                     self.qr_pair_status_var.set(message)
                     self._update_dependency_progress(message)
                 continue
@@ -1335,7 +1548,7 @@ class AdbPilotGui(BaseTk):
                 if label != "设备监听" and not label.startswith("扫码配对") and isinstance(payload, AdbPilotError):
                     messagebox.showerror("AdbPilot", str(payload))
 
-        self.after(100, self._process_results)
+        self.after(100, lambda: self._process_results())
 
     def _append_output(self, text: str) -> None:
         timestamp = time.strftime("%H:%M:%S")
@@ -1466,6 +1679,7 @@ class AdbPilotGui(BaseTk):
 
         self.device_table.tag_configure("disconnected", foreground="#9ca3af")
         self.device_rows = next_rows
+        self._record_rendered_device_changes(previous_connected, devices)
 
         selected = self.selected_serial_var.get().strip()
         locked = self.locked_serial_var.get().strip()
@@ -1492,30 +1706,97 @@ class AdbPilotGui(BaseTk):
         self._update_lock_status()
         self._render_floating_devices()
 
+    def _record_rendered_device_changes(self, previous_connected: set[str], devices: list[Device]) -> None:
+        before = [Device(serial, "device", {}) for serial in previous_connected]
+        try:
+            messages = self._get_client().note_device_changes(before, devices)
+        except Exception as exc:  # noqa: BLE001 - history must not block the device list.
+            self._append_output(f"连接历史未写入：{exc}\n")
+            return
+        if messages:
+            AdbPilotGui.refresh_connection_history(self)
+
     def show_device_info(self) -> None:
         serial = self._selected_serial()
         self._run_async("读取设备详情", lambda: self._get_client().device_info(serial), self._display_mapping)
 
+    def check_wifi_capabilities(self) -> None:
+        if self.wireless_busy or self.pairing_in_progress:
+            return
+        try:
+            client = self._get_client()
+        except Exception as exc:
+            self.capability_status_var.set(f"检查失败：{exc}")
+            return
+
+        def done(capabilities: Any) -> None:
+            self.capability_status_var.set(capability_summary(capabilities))
+            if capabilities.warnings:
+                self._append_output("\n".join(capabilities.warnings) + "\n")
+
+        self._run_async("检查无线能力", lambda: client.wifi_capabilities(probe_network=True), done)
+
     def connect_device(self) -> None:
+        if self.wireless_busy:
+            return
         address = self.connect_addr_var.get().strip()
         if not address:
+            self.wireless_status_var.set("请输入 host:port 地址")
             messagebox.showwarning("AdbPilot", "请输入 host:port 地址")
             return
-        self._run_async(f"连接 {address}", lambda: self._get_client().connect(address))
+        self._run_wireless_action(address, connect=True)
 
     def connect_paired_device(self) -> None:
         self._run_async("连接已配对设备", lambda: self._get_client().connect_paired_by_mdns())
 
     def pair_device(self) -> None:
+        if self.pairing_in_progress or self.wireless_busy:
+            return
         address = self.pair_addr_var.get().strip()
         code = self.pair_code_var.get().strip()
-        if not address:
-            messagebox.showwarning("AdbPilot", "请输入配对 host:port 地址")
+        connect_address = self.connect_addr_var.get().strip()
+        self.pair_code_var.set("")
+        try:
+            client = self._get_client()
+        except Exception as exc:
+            self.wireless_status_var.set(f"配对失败：{exc}")
             return
-        if not code:
-            messagebox.showwarning("AdbPilot", "请输入无线调试配对码")
-            return
-        self._run_async(f"配对 {address}", lambda: self._get_client().pair(address, code))
+
+        def failed(exc: Exception) -> None:
+            self._set_pairing_busy(False)
+            if isinstance(exc, subprocess.TimeoutExpired):
+                detail = "配对超时。请保持手机配对页面开启后重试。"
+            elif isinstance(exc, (AdbNotFoundError, WirelessAddressError, PairingCodeError, AdbPilotError)):
+                detail = str(exc)
+            else:
+                detail = str(exc)
+            self.wireless_status_var.set(f"配对失败：{detail}")
+            AdbPilotGui.refresh_connection_history(self)
+
+        def done(result: Any) -> None:
+            self._set_pairing_busy(False)
+            self.wireless_status_var.set(pairing_status_text(result))
+            self._append_output(pairing_status_text(result) + "\n")
+            AdbPilotGui.refresh_connection_history(self)
+            if result.status == "paired_waiting_for_connect":
+                self.connect_addr_entry.focus_set()
+                return
+            if result.connected:
+                self.refresh_devices()
+
+        self._set_pairing_busy(True)
+        self.wireless_status_var.set("正在配对，请稍候…")
+        self._run_async(
+            f"配对 {address}",
+            lambda: client.pair(address, code, connect_address=connect_address or None),
+            done,
+            failed,
+        )
+
+    def _set_pairing_busy(self, busy: bool) -> None:
+        self.pairing_in_progress = busy
+        if hasattr(self, "pair_button"):
+            self.pair_button.configure(state=tk.DISABLED if busy else tk.NORMAL, text="配对中…" if busy else "配对")
 
     def qr_pair_device(self) -> None:
         if self.qr_pair_cancel_event is not None:
@@ -1536,9 +1817,15 @@ class AdbPilotGui(BaseTk):
         def done(result: str) -> None:
             if session != self.qr_pair_session:
                 return
-            self.qr_pair_status_var.set("扫码配对完成")
             self._append_output(f"{result}\n")
+            self._close_qr_pairing_window(cancel=False)
             self.refresh_devices()
+
+        def failed(exc: Exception) -> None:
+            if session != self.qr_pair_session:
+                return
+            cancelled = "已取消" in str(exc)
+            self._finish_qr_pairing("扫码已取消。" if cancelled else "扫码配对已结束，这个二维码不能再用。")
 
         self._run_async(
             f"扫码配对:{session}:{service_name}",
@@ -1551,6 +1838,7 @@ class AdbPilotGui(BaseTk):
                 ),
             ),
             done,
+            failed,
         )
 
     def _show_qr_pairing_window(self, payload: str) -> bool:
@@ -1586,6 +1874,12 @@ class AdbPilotGui(BaseTk):
         actions = ttk.Frame(window, style="Surface.TFrame")
         actions.pack(fill=tk.X, padx=16, pady=(0, 14))
         ttk.Button(actions, text="关闭", command=self._close_qr_pairing_window, style="Quiet.TButton").pack(side=tk.RIGHT)
+        self.qr_pair_restart_button = ttk.Button(
+            actions,
+            text="重新生成",
+            command=self.qr_pair_device,
+            style="Primary.TButton",
+        )
         self.qr_pair_window = window
 
         if not self._render_qr_code(payload, content):
@@ -1605,6 +1899,21 @@ class AdbPilotGui(BaseTk):
         ttk.Label(parent, image=self.qr_pair_image).pack(pady=(0, 8))
         return True
 
+    def _finish_qr_pairing(self, message: str) -> None:
+        content = getattr(self, "qr_pair_content", None)
+        window = getattr(self, "qr_pair_window", None)
+        if content is None or window is None or not window.winfo_exists():
+            return
+        self.qr_pair_status_var.set(message)
+        for child in content.winfo_children():
+            child.destroy()
+        mosaic = qr_pairing_mosaic()
+        ttk.Label(content, text=mosaic, font=mono_font(11), justify=tk.CENTER).pack(pady=(12, 8))
+        ttk.Label(content, text=message, style="Muted.TLabel", wraplength=320, justify=tk.CENTER).pack(pady=(0, 8))
+        button = getattr(self, "qr_pair_restart_button", None)
+        if button is not None and button.winfo_exists():
+            button.pack(side=tk.RIGHT, padx=(0, 8))
+
     def _show_qr_dependency_prompt(self, parent: ttk.Frame) -> None:
         for child in parent.winfo_children():
             child.destroy()
@@ -1623,6 +1932,32 @@ class AdbPilotGui(BaseTk):
             command=self.install_qrcode_dependency,
             style="Primary.TButton",
         ).pack(fill=tk.X, pady=(0, 8))
+
+    def _update_adb_download_progress(self, message: str) -> None:
+        status = getattr(self, "adb_download_status_var", None)
+        bar = getattr(self, "adb_download_progress", None)
+        if status is not None:
+            status.set(message)
+        self.status_var.set(message)
+        if bar is None or not bar.winfo_exists():
+            return
+        if message.startswith("下载进度") and "%" in message:
+            percent = message.split("%", 1)[0].rsplit(" ", 1)[-1]
+            try:
+                bar.stop()
+                bar.configure(mode="determinate", maximum=100)
+                bar["value"] = int(percent)
+            except ValueError:
+                pass
+            return
+        if message.startswith("正在下载"):
+            bar.configure(mode="indeterminate")
+            bar.start(12)
+            return
+        if message.startswith(("正在解压", "下载完成")) or message.endswith("已在目录中"):
+            bar.stop()
+            bar.configure(mode="determinate", maximum=100)
+            bar["value"] = 100
 
     def _update_dependency_progress(self, message: str) -> None:
         bar = getattr(self, "qr_dependency_progress", None)
@@ -1677,15 +2012,60 @@ class AdbPilotGui(BaseTk):
             done,
         )
 
-    def _close_qr_pairing_window(self) -> None:
-        if self.qr_pair_cancel_event is not None:
+    def _close_qr_pairing_window(self, cancel: bool = True) -> None:
+        if cancel and self.qr_pair_cancel_event is not None:
             self.qr_pair_cancel_event.set()
         if self.qr_pair_window is not None and self.qr_pair_window.winfo_exists():
             self.qr_pair_window.destroy()
 
     def disconnect_device(self) -> None:
+        if self.wireless_busy:
+            return
         address = self.connect_addr_var.get().strip() or None
-        self._run_async("断开无线设备", lambda: self._get_client().disconnect(address))
+        self._run_wireless_action(address, connect=False)
+
+    def _set_wireless_busy(self, busy: bool, *, connect: bool = True) -> None:
+        self.wireless_busy = busy
+        state = tk.DISABLED if busy else tk.NORMAL
+        self.connect_button.configure(state=state, text="连接中…" if busy and connect else "连接")
+        self.disconnect_button.configure(state=state, text="断开中…" if busy and not connect else "断开")
+
+    def _run_wireless_action(self, address: str | None, *, connect: bool) -> None:
+        action = "连接" if connect else "断开"
+        target = address or "所有无线设备"
+
+        def failed(exc: Exception) -> None:
+            self._set_wireless_busy(False)
+            if isinstance(exc, subprocess.TimeoutExpired):
+                detail = f"操作超时（{exc.timeout} 秒），请检查设备地址、端口及网络后重试"
+            else:
+                detail = str(exc)
+            self.wireless_status_var.set(f"{action}失败：{detail}")
+            AdbPilotGui.refresh_connection_history(self)
+
+        # Capture Tk settings on the UI thread before starting the ADB worker.
+        try:
+            client = self._get_client()
+        except Exception as exc:
+            failed(exc)
+            self._append_output(f"错误：{exc}\n")
+            return
+
+        def done(output: str) -> None:
+            self._set_wireless_busy(False)
+            self.wireless_status_var.set(f"{action}成功：{target}")
+            self._append_output(f"{output}\n")
+            AdbPilotGui.refresh_connection_history(self)
+            self.refresh_devices()
+
+        self._set_wireless_busy(True, connect=connect)
+        self.wireless_status_var.set(f"正在{action} {target}，请稍候…")
+        self._run_async(
+            f"{action} {target}",
+            lambda: client.connect(address) if connect else client.disconnect(address),
+            done,
+            failed,
+        )
 
     def use_foreground_package(self, default_only: bool = False) -> None:
         if default_only and self.log_package_var.get().strip():
@@ -1987,6 +2367,27 @@ def device_display_name(serial: str, details: dict[str, str]) -> str:
     if model:
         return model.replace("_", " ")
     return serial
+
+
+def saved_adb_paths(config: dict[str, Any]) -> list[str]:
+    raw = config.get("adb_paths", [])
+    values = raw if isinstance(raw, list) else []
+    current = str(config.get("adb_path", "")).strip()
+    return merge_adb_paths([str(item) for item in values if str(item).strip()], [current])
+
+
+def merge_adb_paths(*groups: list[str] | tuple[str, ...] | str) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        items = [group] if isinstance(group, str) else group
+        for item in items:
+            path = str(item).strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            merged.append(path)
+    return merged
 
 
 def gui_config_path() -> Path:

@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>测试用例</title>
+<style>
+  :root {
+    --bg: #f4f1ea;
+    --paper: #fffdf8;
+    --ink: #1c1915;
+    --muted: #6f675c;
+    --line: #e4ddd0;
+    --accent: #1f6b4a;
+    --accent-soft: #e7f3ec;
+    --warn: #8a5a12;
+    --warn-soft: #f8efd8;
+    --bad: #8d2f2a;
+    --bad-soft: #f8e6e4;
+    --skip: #4d5d73;
+    --skip-soft: #e8eef5;
+    --todo: #6f675c;
+    --todo-soft: #f0ece4;
+    --shadow: 0 10px 30px rgba(40, 32, 18, .06);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, "Songti SC", "Noto Serif SC", serif;
+    background:
+      radial-gradient(1200px 400px at 10% -10%, #efe6d4 0%, transparent 60%),
+      var(--bg);
+    color: var(--ink);
+    min-height: 100vh;
+  }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  button { cursor: pointer; }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 80px; }
+  header.top {
+    display: flex; justify-content: space-between; gap: 20px; align-items: flex-end;
+    margin-bottom: 18px;
+  }
+  .kicker { letter-spacing: .18em; text-transform: uppercase; font-size: 12px; color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; }
+  h1 { margin: 4px 0 0; font-weight: 560; font-size: 34px; letter-spacing: -.02em; }
+  .sub { margin: 6px 0 0; color: var(--muted); font-size: 15px; }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .btn, .ghost {
+    border: 1px solid var(--line); background: var(--paper); border-radius: 999px;
+    padding: 8px 14px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px;
+  }
+  .btn { background: var(--ink); color: #f7f3ea; border-color: var(--ink); }
+  .ghost:hover, .btn:hover { transform: translateY(-1px); }
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; margin: 8px 0 16px; }
+  .stat {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px;
+    box-shadow: var(--shadow);
+  }
+  .stat b { display: block; font-size: 26px; font-variant-numeric: tabular-nums; }
+  .stat span { color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; }
+  .toolbar {
+    display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap;
+  }
+  .search {
+    flex: 1; min-width: 220px; background: var(--paper); border: 1px solid var(--line);
+    border-radius: 12px; padding: 10px 12px;
+  }
+  .filters { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    border: 1px solid var(--line); background: transparent; border-radius: 999px;
+    padding: 6px 10px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; color: var(--muted);
+  }
+  .chip.on { background: var(--ink); color: #f7f3ea; border-color: var(--ink); }
+  .case {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 16px;
+    margin-bottom: 10px; box-shadow: var(--shadow); overflow: hidden;
+  }
+  .case summary {
+    list-style: none; display: grid; grid-template-columns: 72px 1fr auto; gap: 12px;
+    align-items: center; padding: 14px 16px; cursor: pointer;
+  }
+  .case summary::-webkit-details-marker { display: none; }
+  .id { font-family: ui-sans-serif, system-ui, sans-serif; font-weight: 650; letter-spacing: .04em; }
+  .title { font-size: 16px; }
+  .meta { color: var(--muted); font-size: 13px; margin-top: 3px; }
+  .badge {
+    font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; border-radius: 999px;
+    padding: 4px 10px; white-space: nowrap;
+  }
+  .pass { background: var(--accent-soft); color: var(--accent); }
+  .fail { background: var(--bad-soft); color: var(--bad); }
+  .blocked { background: var(--warn-soft); color: var(--warn); }
+  .unverified { background: var(--skip-soft); color: var(--skip); }
+  .todo { background: var(--todo-soft); color: var(--todo); }
+  .body { padding: 0 16px 16px 100px; display: grid; gap: 10px; }
+  .pair { display: grid; grid-template-columns: 88px 1fr; gap: 8px; font-size: 14.5px; }
+  .pair dt { color: var(--muted); font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; padding-top: 3px; }
+  .pair dd { margin: 0; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  select.status, textarea.note, input.env {
+    background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px;
+  }
+  select.status { font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
+  textarea.note { width: min(640px, 100%); min-height: 64px; resize: vertical; }
+  textarea.note[data-need="1"] { border-color: var(--bad); background: var(--bad-soft); }
+  button[disabled] { opacity: .45; cursor: default; }
+  input.env { width: min(280px, 100%); }
+  .empty { padding: 40px 10px; text-align: center; color: var(--muted); }
+  dialog {
+    border: none; border-radius: 18px; padding: 0; width: min(640px, calc(100vw - 24px));
+    box-shadow: 0 30px 80px rgba(0,0,0,.18);
+  }
+  dialog::backdrop { background: rgba(28, 25, 21, .35); }
+  .dlg { padding: 18px 18px 16px; background: var(--paper); }
+  .dlg h2 { margin: 0 0 12px; font-size: 22px; font-weight: 560; }
+  label.field { display: block; margin-bottom: 10px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 12px; color: var(--muted); }
+  label.field input, label.field textarea, label.field select {
+    display: block; width: 100%; margin-top: 4px; background: #fff; border: 1px solid var(--line);
+    border-radius: 10px; padding: 8px 10px; font-size: 15px;
+  }
+  label.field textarea { min-height: 72px; }
+  .dlg .row { justify-content: flex-end; margin-top: 6px; }
+  .prep { color: var(--muted); font-size: 14px; margin: 0 0 14px; }
+  @media (max-width: 760px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .case summary, .body, .pair { grid-template-columns: 1fr; }
+    .body { padding-left: 16px; }
+    header.top { flex-direction: column; align-items: flex-start; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <div class="kicker">Manual test board</div>
+      <h1 id="featureTitle">测试用例</h1>
+      <p class="sub" id="featureNote"></p>
+    </div>
+    <div class="actions">
+      <button class="ghost" id="openBtn" type="button">打开用例文档</button>
+      <button class="btn" id="exportBtn" type="button">写回文档</button>
+      <input id="file" type="file" accept=".md,text/markdown" hidden>
+    </div>
+  </header>
+  <p class="prep" id="prep"></p>
+  <section class="stats" id="stats"></section>
+  <div class="toolbar">
+    <input class="search" id="q" type="search" placeholder="搜索编号、操作、通过标准">
+    <div class="filters" id="filters"></div>
+  </div>
+  <div id="list"></div>
+</div>
+
+<script>
+const SOURCE = "../tech/adb-wifi-manual-test-cases.md";
+const STATUS_NAME = { todo: "未测", pass: "通过", fail: "失败", blocked: "阻塞", unverified: "未验证" };
+const STATUS_KEY = Object.fromEntries(Object.entries(STATUS_NAME).map(([key, name]) => [name, key]));
+const STATUSES = Object.entries(STATUS_NAME);
+const $ = (id) => document.getElementById(id);
+
+let board = null;
+let sourceName = SOURCE.split("/").pop();
+let filter = "all";
+let query = "";
+
+function splitRow(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+function linesOf(text) { return String(text).split(String.fromCharCode(10)); }
+function section(text, title) {
+  const lines = linesOf(text);
+  const start = lines.findIndex((line) => line.trim() === "## " + title);
+  if (start < 0) return "";
+  const end = lines.findIndex((line, index) => index > start && line.startsWith("## "));
+  return lines.slice(start + 1, end < 0 ? lines.length : end).join(String.fromCharCode(10));
+}
+function table(text, headings) {
+  const rows = linesOf(text).filter((line) => line.trim().startsWith("|")).map(splitRow);
+  const actual = (rows[0] || []).join("|");
+  if (actual !== headings.join("|") || rows.length < 2) {
+    throw new Error("表头必须是「" + headings.join("、") + "」");
+  }
+  return rows.slice(2);
+}
+function parseBoard(text) {
+  for (const title of ["准备", "用例", "结果", "记录"]) {
+    if (!linesOf(text).some((line) => line.trim() === "## " + title)) {
+      throw new Error("缺少「" + title + "」一节。请按 docs/test-board/TEMPLATE.md 写");
+    }
+  }
+  const title = (text.match(/^#\s+(.+)$/m) || [])[1];
+  if (!title) throw new Error("第一行必须是一级标题");
+  const intro = text.split(/^## /m)[0].replace(/^#.+$/m, "").trim();
+  const prep = [...section(text, "准备").matchAll(/^- (.+)$/gm)].map((item) => item[1]);
+  const cases = table(section(text, "用例"), ["编号", "分组", "操作", "通过标准"])
+    .map(([id, group, action, expect]) => ({ id, group, action, expect }));
+  const seen = new Set();
+  for (const item of cases) {
+    if (!item.id || !item.action || !item.expect) throw new Error(item.id || "有一行用例" + "缺字段");
+    if (seen.has(item.id)) throw new Error("编号重复：" + item.id);
+    seen.add(item.id);
+  }
+  const results = new Map(table(section(text, "结果"), ["编号", "状态", "环境", "记录"]).map(([id, status, env, note]) => {
+    if (!STATUS_KEY[status]) throw new Error(id + " 的状态不在允许范围内：" + (status || "空"));
+    return [id, { status: STATUS_KEY[status], env: env || "", note: note || "" }];
+  }));
+  for (const id of results.keys()) {
+    if (!seen.has(id)) throw new Error("结果里有用例表没有的编号：" + id);
+  }
+  return {
+    title, note: intro, prep,
+    cases: cases.map((item) => ({ ...item, ...(results.get(item.id) || { status: "todo", env: "", note: "" }) }))
+  };
+}
+
+function counts() {
+  const c = { all: board.cases.length, todo: 0, pass: 0, fail: 0, blocked: 0, unverified: 0 };
+  for (const item of board.cases) c[item.status] = (c[item.status] || 0) + 1;
+  return c;
+}
+
+function render() {
+  $("featureTitle").textContent = board.title || "测试用例";
+  $("featureNote").textContent = board.note || "";
+  $("prep").textContent = (board.prep || []).join(" ");
+  document.title = board.title || "测试用例";
+  const c = counts();
+  $("stats").innerHTML = [
+    ["全部", c.all], ["通过", c.pass], ["失败", c.fail], ["未验证", c.unverified], ["未测", c.todo + c.blocked]
+  ].map(([name, n]) => `<div class="stat"><b>${n}</b><span>${name}</span></div>`).join("");
+
+  const chips = [["all", "全部"], ...STATUSES];
+  $("filters").innerHTML = chips.map(([key, name]) =>
+    `<button class="chip ${filter === key ? "on" : ""}" data-filter="${key}" type="button">${name}</button>`
+  ).join("");
+
+  const q = query.trim().toLowerCase();
+  const items = board.cases.filter((item) => {
+    if (filter !== "all" && item.status !== filter) return false;
+    if (!q) return true;
+    return [item.id, item.action, item.expect, item.group, item.note, item.env].join(" ").toLowerCase().includes(q);
+  });
+  $("list").innerHTML = items.length ? items.map(card).join("") : `<div class="empty">没有匹配的用例</div>`;
+}
+
+function card(item) {
+  const label = STATUSES.find(([k]) => k === item.status)?.[1] || item.status;
+  const options = STATUSES.map(([k, name]) => `<option value="${k}" ${k === item.status ? "selected" : ""}>${name}</option>`).join("");
+  return `<details class="case" data-id="${esc(item.id)}">
+    <summary>
+      <span class="id">${esc(item.id)}</span>
+      <span><div class="title">${esc(item.action)}</div><div class="meta">${esc(item.group || "未分组")}${item.env ? " · " + esc(item.env) : ""}</div></span>
+      <span class="badge ${esc(item.status)}">${label}</span>
+    </summary>
+    <div class="body">
+      <dl class="pair"><dt>通过标准</dt><dd>${esc(item.expect)}</dd></dl>
+      <div class="row">
+        <select class="status" data-field="status">${options}</select>
+        <input class="env" data-field="env" placeholder="环境，例如 macOS · adb 37.0.0 · Android 15" value="${esc(item.env || "")}">
+      </div>
+      <textarea class="note" data-field="note" placeholder="${item.status === "fail" ? "失败现象。写看到的提示、时间和环境" : "记录实际现象、时间、下一步"}" ${item.status === "fail" && !item.note ? "data-need=\"1\"" : ""}>${esc(item.note || "")}</textarea>
+      ${item.status === "fail" ? `<div class="row"><button class="btn" data-act="send" type="button" ${item.note ? "" : "disabled"}>发给对话</button><span class="meta" data-send="1"></span></div>` : ""}
+    </div>
+  </details>`;
+}
+
+function esc(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+}
+
+function find(id) { return board.cases.find((item) => item.id === id); }
+
+function failureText(item) {
+  return [
+    "人工测试失败",
+    "功能：" + board.title,
+    "用例：" + item.id + (item.group ? "（" + item.group + "）" : ""),
+    "操作：" + item.action,
+    "通过标准：" + item.expect,
+    "环境：" + (item.env || "未记录"),
+    "现象：" + item.note
+  ].join(String.fromCharCode(10));
+}
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const box = document.createElement("textarea");
+    box.value = text;
+    document.body.appendChild(box);
+    box.select();
+    const copied = document.execCommand("copy");
+    box.remove();
+    return copied;
+  }
+}
+function askHostToSend(text) {
+  const request = { source: "adbpilot-test-board", type: "send-to-chat", text: text };
+  let delivered = false;
+  try {
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage(request, "*");
+      delivered = true;
+    }
+  } catch (_) {}
+  return delivered;
+}
+async function sendFailure(item, label) {
+  const text = failureText(item);
+  const copied = await copyText(text);
+  if (askHostToSend(text) && copied) {
+    label.textContent = "已推到对话框，也放进了剪贴板";
+  } else if (copied) {
+    label.textContent = "这个窗口发不进对话框，已放到剪贴板。直接粘贴即可";
+  } else {
+    label.textContent = "没能复制，请手动选择现象文字";
+  }
+}
+
+$("list").addEventListener("change", (event) => {
+  const field = event.target.dataset.field;
+  const root = event.target.closest(".case");
+  if (!field || !root) return;
+  const item = find(root.dataset.id);
+  if (!item) return;
+  item[field] = event.target.value;
+  if (field === "status") render();
+});
+$("list").addEventListener("input", (event) => {
+  const field = event.target.dataset.field;
+  const root = event.target.closest(".case");
+  if (!field || !root || field === "status") return;
+  const item = find(root.dataset.id);
+  if (!item) return;
+  item[field] = event.target.value;
+});
+$("list").addEventListener("click", async (event) => {
+  if (event.target.dataset.act !== "send") return;
+  const root = event.target.closest(".case");
+  const item = root && find(root.dataset.id);
+  const label = root.querySelector("[data-send]");
+  if (!item || !item.note || !label) return;
+  event.target.disabled = true;
+  await sendFailure(item, label);
+  event.target.disabled = false;
+});
+$("filters").addEventListener("click", (event) => {
+  const key = event.target.dataset.filter;
+  if (!key) return;
+  filter = key;
+  render();
+});
+$("q").addEventListener("input", () => { query = $("q").value; render(); });
+
+function cell(value) { return String(value ?? "").replace(/\|/g, "\\|").replace(new RegExp(String.fromCharCode(10), "g"), " "); }
+function resultSection() {
+  const rows = board.cases.map((item) =>
+    `| ${cell(item.id)} | ${STATUS_NAME[item.status] || "未测"} | ${cell(item.env)} | ${cell(item.note)} |`
+  );
+  return [
+    "## 结果", "",
+    "状态只用：未测、通过、失败、阻塞、未验证。网页导出的 Markdown 整段替换这一节。", "",
+    "| 编号 | 状态 | 环境 | 记录 |", "| --- | --- | --- | --- |",
+    ...rows, ""
+  ].join(String.fromCharCode(10));
+}
+$("exportBtn").onclick = () => {
+  if (!board) return;
+  const blob = new Blob([resultSection()], { type: "text/markdown" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = sourceName.replace(/\.md$/i, "") + ".results.md";
+  a.click();
+  URL.revokeObjectURL(a.href);
+};
+$("openBtn").onclick = () => $("file").click();
+$("file").onchange = async () => {
+  const file = $("file").files?.[0];
+  $("file").value = "";
+  if (!file) return;
+  try {
+    board = parseBoard(await file.text());
+    sourceName = file.name;
+    render();
+  } catch (error) { alert(error.message); }
+};
+
+async function openDefault() {
+  try {
+    const response = await fetch(SOURCE);
+    if (!response.ok) throw new Error(String(response.status));
+    board = parseBoard(await response.text());
+    render();
+  } catch (_) {
+    $("featureTitle").textContent = "还没有读到用例文档";
+    $("featureNote").textContent = "直接打开网页时读不到旁边的文件。点「打开用例文档」，选择对应的 Markdown。";
+    $("list").innerHTML = `<div class="empty">当前文档：docs/tech/${sourceName}</div>`;
+  }
+}
+
+$("list").addEventListener("toggle", (event) => {
+  if (event.target.open) event.target.querySelector("textarea")?.focus();
+}, true);
+
+openDefault();
+</script>
+</body>
+</html>

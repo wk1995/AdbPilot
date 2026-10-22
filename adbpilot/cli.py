@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import subprocess
 import sys
@@ -10,9 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .client import AdbClient
+from .client import AdbClient, capability_summary, pairing_status_text
 from .errors import AdbPilotError, suggestion_for_device_state
-from .models import Device, DeviceInfo, RunningProcess
+from .history import format_device_row, load_devices, log_path, recent_events
+from .models import AdbWifiCapabilities, Device, DeviceInfo, RunningProcess, WirelessPairingResult
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -48,6 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_simple_command(subparsers, "version", "显示 adb 版本", handle_version)
     add_simple_command(subparsers, "restart-server", "重启 adb server", handle_restart_server)
 
+    history = subparsers.add_parser("history", help="查看已保存的连接历史和诊断日志")
+    history.add_argument("--limit", type=int, default=40, help="显示最近多少条日志")
+    history.add_argument("--json", action="store_true", help="以 JSON 输出设备历史")
+    history.set_defaults(handler=handle_history)
+
     devices = subparsers.add_parser("devices", help="列出设备")
     devices.add_argument("--json", action="store_true", help="以 JSON 输出")
     devices.set_defaults(handler=handle_devices)
@@ -61,9 +68,13 @@ def build_parser() -> argparse.ArgumentParser:
     connect.add_argument("address")
     connect.set_defaults(handler=handle_connect)
 
-    pair = subparsers.add_parser("pair", help="配对 Android 11+ 无线调试设备，例如 192.168.1.10:37123 123456")
-    pair.add_argument("address")
-    pair.add_argument("code")
+    capabilities = subparsers.add_parser("wifi-capabilities", help="查看本机 adb 的无线调试能力")
+    capabilities.add_argument("--json", action="store_true", help="以 JSON 输出")
+    capabilities.set_defaults(handler=handle_wifi_capabilities)
+
+    pair = subparsers.add_parser("pair", help="配对 Android 11+ 无线调试设备；配对码会单独询问，不进入命令参数")
+    pair.add_argument("address", help="手机配对页面上的地址，例如 192.168.1.10:37123")
+    pair.add_argument("--connect", dest="connect_address", help="可选。无线调试主页上的连接地址")
     pair.set_defaults(handler=handle_pair)
 
     disconnect = subparsers.add_parser("disconnect", help="断开无线调试设备")
@@ -251,14 +262,78 @@ def handle_info(client: AdbClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def handle_history(client: AdbClient, args: argparse.Namespace) -> int:
+    devices = load_devices()
+    if args.json:
+        print(json.dumps({"log": str(log_path()), "devices": devices}, ensure_ascii=False, indent=2))
+        return 0
+    print(f"日志文件：{log_path()}")
+    if not devices:
+        print("还没有连接历史。")
+    else:
+        print("连接历史：")
+        for device in devices:
+            print(format_device_row(device))
+    events = recent_events(max(args.limit, 0))
+    if events:
+        print("最近日志：")
+        for line in events:
+            print(line)
+    return 0
+
+
 def handle_connect(client: AdbClient, args: argparse.Namespace) -> int:
     print(client.connect(args.address))
     return 0
 
 
-def handle_pair(client: AdbClient, args: argparse.Namespace) -> int:
-    print(client.pair(args.address, args.code))
+def handle_wifi_capabilities(client: AdbClient, args: argparse.Namespace) -> int:
+    capabilities = client.wifi_capabilities(probe_network=True)
+    if args.json:
+        print(json.dumps(capabilities_to_dict(capabilities), ensure_ascii=False, indent=2))
+        return 0
+    print(capability_summary(capabilities))
+    print(f"adb: {capabilities.adb_path}")
+    print(f"revision: {capabilities.platform_tools_revision or '未知'}")
+    for warning in capabilities.warnings:
+        print(f"提示：{warning}")
     return 0
+
+
+def handle_pair(client: AdbClient, args: argparse.Namespace) -> int:
+    code = getpass.getpass("配对码: ")
+    result = client.pair(args.address, code, connect_address=args.connect_address)
+    print(pairing_status_text(result))
+    return 0
+
+
+def capabilities_to_dict(capabilities: AdbWifiCapabilities) -> dict[str, Any]:
+    return {
+        "adb_path": capabilities.adb_path,
+        "platform_tools_revision": capabilities.platform_tools_revision,
+        "supports_connect": capabilities.supports_connect,
+        "supports_pair": capabilities.supports_pair,
+        "mdns_enabled": capabilities.mdns_enabled,
+        "mdns_backend": capabilities.mdns_backend,
+        "network_mdns_status": capabilities.network_mdns_status,
+        "wifi2_host_compatible": capabilities.wifi2_host_compatible,
+        "device_generation": capabilities.device_generation,
+        "warnings": list(capabilities.warnings),
+        "summary": capability_summary(capabilities),
+    }
+
+
+def pairing_result_to_dict(result: WirelessPairingResult) -> dict[str, Any]:
+    return {
+        "status": result.status,
+        "paired": result.paired,
+        "connected": result.connected,
+        "pairing_address": result.pairing_address,
+        "connection_address": result.connection_address,
+        "device_serial": result.device_serial,
+        "next_action": result.next_action,
+        "capabilities": capabilities_to_dict(result.capabilities) if result.capabilities else None,
+    }
 
 
 def handle_disconnect(client: AdbClient, args: argparse.Namespace) -> int:

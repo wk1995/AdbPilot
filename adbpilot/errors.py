@@ -11,6 +11,10 @@ class AdbNotFoundError(AdbPilotError):
     """Raised when the adb executable cannot be found."""
 
 
+class AdbDownloadError(AdbPilotError):
+    """Raised when a platform-tools package cannot be downloaded or unpacked."""
+
+
 class AdbCommandError(AdbPilotError):
     """Raised when an adb command exits with a non-zero status."""
 
@@ -23,6 +27,56 @@ class AdbCommandError(AdbPilotError):
 
 class DeviceSelectionError(AdbPilotError):
     """Raised when a command cannot safely infer the target device."""
+
+
+class WirelessAddressError(AdbPilotError):
+    """Raised when a wireless address fails local validation."""
+
+    category = "invalid_address"
+
+
+class PairingCodeError(AdbPilotError):
+    """Raised when a pairing code is not six digits."""
+
+    category = "invalid_code"
+
+
+class AdbWifiCapabilityError(AdbPilotError):
+    """Raised when the selected adb cannot perform secure pairing."""
+
+    category = "pair_unsupported"
+
+
+class AdbPairingError(AdbCommandError):
+    """Raised when secure wireless pairing fails."""
+
+    def __init__(
+        self,
+        message: str,
+        returncode: int,
+        stdout: str = "",
+        stderr: str = "",
+        *,
+        category: str = "unknown",
+    ) -> None:
+        super().__init__(message, returncode, stdout, stderr)
+        self.category = category
+
+
+class AdbConnectionError(AdbCommandError):
+    """Raised when a wireless connect attempt fails after pairing."""
+
+    def __init__(
+        self,
+        message: str,
+        returncode: int,
+        stdout: str = "",
+        stderr: str = "",
+        *,
+        category: str = "connect_failed",
+    ) -> None:
+        super().__init__(message, returncode, stdout, stderr)
+        self.category = category
 
 
 def suggestion_for_device_state(state: str) -> str:

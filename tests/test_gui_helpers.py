@@ -1,7 +1,8 @@
 import os
+import queue
 import threading
-import tkinter as tk
 import unittest
+from tkinter import TclError
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -17,8 +18,11 @@ from adbpilot.gui import (
     floating_topmost_locked_from_config,
     floating_topmost_style,
     generate_adb_qr_pairing_payload,
+    qr_pairing_mosaic,
     gui_config_path,
     load_gui_config,
+    merge_adb_paths,
+    saved_adb_paths,
     macos_floating_helper_build_path,
     macos_floating_helper_needs_build,
     macos_floating_helper_source_path,
@@ -26,6 +30,49 @@ from adbpilot.gui import (
     save_gui_config,
     ui_font,
 )
+
+
+class FakeVar:
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+
+class FakeWidget:
+    def __init__(self, text: str = "", *, parent: "FakeContainer | None" = None, exists: bool = True) -> None:
+        self.text = text
+        self.exists = exists
+        self.parent = parent
+
+    def winfo_exists(self) -> bool:
+        return self.exists
+
+    def destroy(self) -> None:
+        self.exists = False
+        if self.parent is not None:
+            self.parent.children = [child for child in self.parent.children if child is not self]
+
+    def pack(self, *_args: object, **_kwargs: object) -> None:
+        if self.parent is not None and self not in self.parent.children:
+            self.parent.children.append(self)
+
+
+class FakeContainer:
+    def __init__(self, *children: FakeWidget) -> None:
+        self.children = list(children)
+        for child in self.children:
+            child.parent = self
+
+    def winfo_children(self) -> list[FakeWidget]:
+        return list(self.children)
+
+    def winfo_exists(self) -> bool:
+        return True
 
 
 class GuiHelperTests(unittest.TestCase):
@@ -63,7 +110,7 @@ class GuiHelperTests(unittest.TestCase):
     def test_windows_adb_browser_retries_without_filter_on_tcl_error(self):
         gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
         with patch("adbpilot.gui.platform.system", return_value="Windows"), patch(
-            "adbpilot.gui.filedialog.askopenfilename", side_effect=[tk.TclError("filter error"), ""]
+            "adbpilot.gui.filedialog.askopenfilename", side_effect=[TclError("filter error"), ""]
         ) as dialog:
             AdbPilotGui._browse_adb(gui)
         self.assertEqual(dialog.call_count, 2)
@@ -112,6 +159,80 @@ class GuiHelperTests(unittest.TestCase):
         self.assertEqual(len(password), 12)
         self.assertEqual(payload, f"WIFI:T:ADB;S:{service_name};P:{password};;")
 
+    def test_qr_pairing_mosaic_hides_the_expired_code(self):
+        mosaic = qr_pairing_mosaic()
+
+        self.assertNotIn("WIFI:T:ADB", mosaic)
+        self.assertGreater(len(mosaic.splitlines()), 1)
+        self.assertIn("██", mosaic)
+        self.assertIn("░░", mosaic)
+
+    def test_finished_qr_pairing_covers_code_and_offers_restart(self):
+        old_code = FakeWidget("可扫描二维码")
+        content = FakeContainer(old_code)
+        status = FakeVar("等待手机扫描")
+        actions = FakeContainer()
+        restart = FakeWidget("重新生成", parent=actions)
+        labels: list[FakeWidget] = []
+
+        def label_factory(parent, **kwargs):
+            widget = FakeWidget(str(kwargs.get("text", "")), parent=parent)
+            labels.append(widget)
+            return widget
+
+        gui = SimpleNamespace(
+            qr_pair_content=content,
+            qr_pair_window=FakeWidget(exists=True),
+            qr_pair_status_var=status,
+            qr_pair_restart_button=restart,
+        )
+
+        with patch("adbpilot.gui.ttk.Label", side_effect=label_factory), patch("adbpilot.gui.mono_font", return_value=("Menlo", 11)):
+            AdbPilotGui._finish_qr_pairing(gui, "扫码配对已结束，这个二维码不能再用。")
+
+        self.assertFalse(old_code.exists)
+        self.assertTrue(labels)
+        self.assertTrue(any("██" in widget.text for widget in labels))
+        self.assertNotIn("WIFI:T:ADB", " ".join(widget.text for widget in labels))
+        self.assertIn("不能再用", status.value)
+        self.assertIn(restart, actions.children)
+
+    def test_successful_qr_pairing_closes_window_without_cancelling(self):
+        window = FakeWidget(exists=True)
+        cancel_event = threading.Event()
+        gui = SimpleNamespace(
+            qr_pair_session=0,
+            qr_pair_cancel_event=None,
+            qr_pair_window=window,
+            qr_pair_status_var=FakeVar(),
+            _append_output=Mock(),
+            _show_qr_pairing_window=Mock(return_value=True),
+            _get_client=Mock(return_value=Mock()),
+            refresh_devices=Mock(),
+            _close_qr_pairing_window=lambda cancel=True: AdbPilotGui._close_qr_pairing_window(gui, cancel),
+        )
+        gui.qr_pair_cancel_event = cancel_event
+
+        done = None
+
+        def capture_run_async(_self, _label, _work, on_done, _on_error):
+            nonlocal done
+            done = on_done
+
+        gui._run_async = lambda *args: capture_run_async(gui, *args)
+        with patch(
+            "adbpilot.gui.generate_adb_qr_pairing_payload", return_value=("studio-test", "secret", "payload")
+        ):
+            AdbPilotGui.qr_pair_device(gui)
+
+        self.assertIsNotNone(done)
+        cancel_event.clear()
+        done("已连接 192.168.1.8:5555")
+
+        self.assertFalse(cancel_event.is_set())
+        self.assertFalse(window.exists)
+        gui.refresh_devices.assert_called_once()
+
     def test_device_connection_type(self):
         self.assertEqual(device_connection_type("emulator-5554"), "USB")
         self.assertEqual(device_connection_type("5ENDU19B01011261"), "USB")
@@ -138,6 +259,86 @@ class GuiHelperTests(unittest.TestCase):
 
     def test_device_display_name_falls_back_to_serial(self):
         self.assertEqual(device_display_name("abc", {}), "abc")
+
+    def test_saved_adb_paths_keep_history_and_current_path(self):
+        paths = saved_adb_paths(
+            {
+                "adb_path": "/sdk/current/adb",
+                "adb_paths": ["/sdk/old/adb", "/sdk/current/adb", "  "],
+            }
+        )
+        self.assertEqual(paths, ["/sdk/old/adb", "/sdk/current/adb"])
+
+    def test_merge_adb_paths_drops_duplicates_and_blanks(self):
+        self.assertEqual(
+            merge_adb_paths(["/a/adb", ""], ["/a/adb", "/b/adb"], "/b/adb"),
+            ["/a/adb", "/b/adb"],
+        )
+
+    def test_download_progress_updates_bar_without_spamming_log(self):
+        output = Mock()
+
+        class Bar(dict):
+            def winfo_exists(self) -> bool:
+                return True
+
+            def stop(self) -> None:
+                return None
+
+            def configure(self, **_kwargs: object) -> None:
+                return None
+
+        bar = Bar()
+        status = Mock()
+        gui = SimpleNamespace(
+            qr_pair_session=0,
+            result_queue=Mock(),
+            status_var=Mock(),
+            output=output,
+            adb_download_status_var=status,
+            adb_download_progress=bar,
+            _append_output=output,
+            _update_adb_download_progress=lambda message: AdbPilotGui._update_adb_download_progress(gui, message),
+            _update_dependency_progress=Mock(),
+            after=lambda _delay, callback: callback,
+        )
+        gui.result_queue.get_nowait.side_effect = [("progress", "下载 adb", "下载进度 40%", None), queue.Empty()]
+        with patch("adbpilot.gui.time.strftime", return_value="14:00:00"):
+            AdbPilotGui._process_results(gui)
+        status.set.assert_called_once_with("下载进度 40%")
+        self.assertEqual(bar["value"], 40)
+        output.assert_not_called()
+
+    def test_download_completion_switches_to_new_adb(self):
+        gui = SimpleNamespace(
+            adb_version_var=Mock(**{"get.return_value": "37.0.0"}),
+            adb_download_dir_var=Mock(**{"get.return_value": "/work/AdbPilot"}),
+            adb_path_var=Mock(),
+            client="old",
+            result_queue=Mock(),
+            _saved_download_dir=lambda: "/work/AdbPilot",
+            _remember_download_dir=Mock(),
+            _remember_adb_path=Mock(),
+            _refresh_adb_path_choices=Mock(),
+            _append_output=Mock(),
+        )
+        captured: dict[str, object] = {}
+        gui._run_async = lambda label, func, on_success=None, on_error=None: captured.update(done=on_success)
+        AdbPilotGui._start_adb_download(gui)
+        done = captured["done"]
+        path = Path("/work/AdbPilot/tools/platform-tools-37.0.0/platform-tools/adb")
+        done(path)
+        gui.adb_path_var.set.assert_called_once_with(str(path))
+        gui._remember_adb_path.assert_called_once_with(str(path))
+        self.assertIsNone(gui.client)
+
+    def test_remember_adb_path_appends_without_replacing_history(self):
+        gui = SimpleNamespace(gui_config={"adb_path": "/old/adb", "adb_paths": ["/old/adb"]})
+        with patch("adbpilot.gui.save_gui_config") as save:
+            AdbPilotGui._remember_adb_path(gui, "/new/adb")
+        self.assertEqual(gui.gui_config["adb_path"], "/new/adb")
+        self.assertEqual(gui.gui_config["adb_paths"], ["/old/adb", "/new/adb"])
+        save.assert_called_once_with(gui.gui_config)
 
     def test_gui_config_round_trip(self):
         with TemporaryDirectory() as temp_dir:

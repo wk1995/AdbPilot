@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import __version__
+from .cli import capabilities_to_dict, pairing_result_to_dict
 from .client import AdbClient
 from .errors import AdbPilotError
+from .history import load_devices, log_path, recent_events
 from .models import Device, DeviceInfo, RunningProcess
 
 
@@ -163,7 +165,20 @@ def operation_schema() -> JsonMap:
             "devices": {"description": "List connected devices", "params": {}},
             "info": {"description": "Get device info", "params": {"serial": "optional string"}},
             "connect": {"description": "Connect wireless adb device", "params": {"address": "host:port string"}},
-            "pair": {"description": "Pair Android 11+ wireless adb device", "params": {"address": "pairing host:port string", "code": "pairing code string"}},
+            "history": {
+                "description": "Read saved connection history and recent diagnostic log lines",
+                "params": {"limit": "optional int"},
+            },
+            "wifi-capabilities": {"description": "Inspect adb wireless capabilities", "params": {}},
+            "pair": {
+                "description": "Pair a wireless adb device",
+                "params": {
+                    "address": "host:port string",
+                    "pairing_code": "required sensitive 6-digit string",
+                    "connect_address": "optional host:port string",
+                },
+                "sensitive_params": ["pairing_code"],
+            },
             "disconnect": {"description": "Disconnect wireless adb device", "params": {"address": "optional host:port string"}},
             "install": {
                 "description": "Install APK",
@@ -237,8 +252,31 @@ def op_connect(client: AdbClient, params: JsonMap) -> JsonMap:
     return {"message": client.connect(required_str(params, "address"))}
 
 
+def op_history(client: AdbClient, params: JsonMap) -> JsonMap:
+    limit = params.get("limit", 40)
+    try:
+        count = max(int(limit), 0)
+    except (TypeError, ValueError):
+        count = 40
+    return {"log": str(log_path()), "devices": load_devices(), "events": recent_events(count)}
+
+
+def op_wifi_capabilities(client: AdbClient, params: JsonMap) -> JsonMap:
+    return capabilities_to_dict(client.wifi_capabilities(probe_network=True))
+
+
 def op_pair(client: AdbClient, params: JsonMap) -> JsonMap:
-    return {"message": client.pair(required_str(params, "address"), required_str(params, "code"))}
+    result = client.pair(
+        required_str(params, "address"),
+        required_str(params, "pairing_code"),
+        connect_address=optional_str(params, "connect_address"),
+    )
+    data = pairing_result_to_dict(result)
+    rendered = json.dumps(data, ensure_ascii=False)
+    secret = required_str(params, "pairing_code")
+    if secret and secret in rendered:
+        raise AdbPilotError("配对结果意外包含配对码，已中止输出。")
+    return data
 
 
 def op_disconnect(client: AdbClient, params: JsonMap) -> JsonMap:
@@ -468,6 +506,8 @@ OPERATIONS: dict[str, Operation] = {
     "devices": op_devices,
     "info": op_info,
     "connect": op_connect,
+    "history": op_history,
+    "wifi-capabilities": op_wifi_capabilities,
     "pair": op_pair,
     "disconnect": op_disconnect,
     "install": op_install,

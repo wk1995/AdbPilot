@@ -24,20 +24,10 @@ class PlatformAdapter:
         return "adb.exe" if self.system == "windows" else "adb"
 
     def resolve_adb(self, configured_path: str | None = None) -> Path:
-        candidates = list(self._candidate_paths(configured_path))
-        for candidate in candidates:
-            if candidate and candidate.exists() and candidate.is_file():
-                return candidate
+        for candidate in self.discover_adb_paths(configured_path):
+            return candidate
 
-        path_hit = shutil.which(self.executable_name) or shutil.which("adb")
-        if path_hit:
-            return Path(path_hit)
-
-        shell_path_hit = self._which_from_login_shell()
-        if shell_path_hit:
-            return shell_path_hit
-
-        searched = "\n".join(f"- {path}" for path in candidates)
+        searched = "\n".join(f"- {path}" for path in self._candidate_paths(configured_path))
         raise AdbNotFoundError(
             "未找到 adb。请安装 Android platform-tools，或通过 --adb-path / ADBPILOT_ADB 指定路径。\n"
             f"已检查路径：\n{searched}"
@@ -82,6 +72,33 @@ class PlatformAdapter:
             )
 
         return [Path(value).expanduser() for value in values if value]
+
+    def discover_adb_paths(self, configured_path: str | None = None) -> list[Path]:
+        """Return existing adb executables, keeping the first occurrence of each file."""
+        found: list[Path] = []
+        seen: set[Path] = set()
+        for candidate in self._candidate_paths(configured_path):
+            self._add_existing_adb(found, seen, candidate)
+
+        for name in (self.executable_name, "adb"):
+            path_hit = shutil.which(name)
+            if path_hit:
+                self._add_existing_adb(found, seen, Path(path_hit))
+
+        self._add_existing_adb(found, seen, self._which_from_login_shell())
+        return found
+
+    def _add_existing_adb(self, found: list[Path], seen: set[Path], candidate: Path | None) -> None:
+        if candidate is None or not candidate.exists() or not candidate.is_file():
+            return
+        try:
+            identity = candidate.resolve()
+        except OSError:
+            identity = candidate
+        if identity in seen:
+            return
+        seen.add(identity)
+        found.append(candidate)
 
     def _which_from_login_shell(self) -> Path | None:
         if self.system != "darwin":
