@@ -108,6 +108,18 @@ ZYX987 no permissions usb:2-1
         )
         self.assertIn("5038", client._record.call_args.kwargs["detail"])
 
+    def test_mdns_wait_does_not_accept_a_different_host(self):
+        client = AdbClient("adb")
+        client.mdns_services = Mock(
+            return_value="List of discovered mdns services\nother-phone _adb-tls-connect._tcp 192.168.1.9:42111\n"
+        )
+
+        with patch("adbpilot.client.time.monotonic", side_effect=[0, 0, 1]):
+            with patch("adbpilot.client.time.sleep"):
+                found = client.wait_for_mdns_connect_service(host="192.168.1.8", timeout=1)
+
+        self.assertIsNone(found)
+
     def test_parse_adb_listener_ports(self):
         lsof = """COMMAND   PID      USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
 adb     23710 chengpeng    7u  IPv4 0x1      0t0  TCP *:5037 (LISTEN)
