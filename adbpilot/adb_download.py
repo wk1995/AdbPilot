@@ -162,6 +162,6 @@ def _extract_platform_tools(package: zipfile.ZipFile, target_dir: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         with package.open(member) as source, destination.open("wb") as handle:
             shutil.copyfileobj(source, handle)
-        mode = member.external_attr >> 16
+        mode = (member.external_attr >> 16) & 0o777
         if mode:
             destination.chmod(mode)
