@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 import re
@@ -131,9 +132,14 @@ class AdbClient:
         return self.run(["version"]).stdout.strip()
 
     def restart_server(self) -> None:
+        # Another adb (Android Studio, a second SDK) can hold the USB device
+        # on a different port. kill-server only stops the server this client
+        # talks to, so the phone stays invisible after a "successful" restart.
+        stopped = self._stop_competing_adb_servers()
         self.run(["kill-server"], check=False)
         self.run(["start-server"])
-        self._record("restart-server", ok=True, message="adb server 已重启")
+        detail = f"stopped competing adb: {', '.join(stopped)}" if stopped else ""
+        self._record("restart-server", ok=True, message="adb server 已重启", detail=detail)
 
     def devices(self) -> list[Device]:
         result = self.run(["devices", "-l"])
@@ -978,6 +984,53 @@ class AdbClient:
         except OSError:
             return
 
+    def _stop_competing_adb_servers(self) -> list[str]:
+        """Stop adb servers that are not the one this client uses.
+
+        A second server keeps the USB interface exclusively, so `adb devices`
+        on the default port stays empty even though the phone says it is connected.
+        """
+        own_port = os.environ.get("ANDROID_ADB_SERVER_PORT", "5037")
+        stopped: list[str] = []
+        for port, pid in self._listening_adb_servers():
+            if port == own_port:
+                continue
+            completed = subprocess.run(
+                [str(self.adb_path), "-P", port, "kill-server"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout,
+            )
+            if completed.returncode == 0:
+                stopped.append(f"{port} (pid {pid})" if pid else port)
+        return stopped
+
+    def _listening_adb_servers(self) -> list[tuple[str, str]]:
+        system = os.uname().sysname.lower() if hasattr(os, "uname") else ""
+        if system == "darwin":
+            completed = subprocess.run(
+                ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-c", "adb"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+            return _parse_lsof_adb_listeners(completed.stdout)
+        if system == "linux":
+            completed = subprocess.run(
+                ["ss", "-ltnp"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+            return _parse_ss_adb_listeners(completed.stdout)
+        return []
+
     def _build_command(self, args: Iterable[str], *, serial: str | None = None) -> list[str]:
         command = [str(self.adb_path)]
         if serial:
@@ -992,6 +1045,41 @@ class AdbClient:
             stderr = f"{stderr.strip()}\nstdout:\n{stdout.strip()}".strip()
         detail = stderr.strip() or "无 stdout/stderr 输出"
         return f"ADB 命令执行失败，退出码 {returncode}: {rendered}\n{detail}"
+
+
+def _parse_lsof_adb_listeners(output: str) -> list[tuple[str, str]]:
+    listeners: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for raw_line in output.splitlines():
+        parts = raw_line.split()
+        if len(parts) < 9 or parts[0] != "adb" or not parts[-1].startswith("(LISTEN)"):
+            continue
+        name = parts[-2]
+        port = name.rsplit(":", 1)[-1]
+        pid = parts[1]
+        if not port.isdigit() or port in seen:
+            continue
+        seen.add(port)
+        listeners.append((port, pid))
+    return listeners
+
+
+def _parse_ss_adb_listeners(output: str) -> list[tuple[str, str]]:
+    listeners: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in output.splitlines():
+        if "adb" not in line:
+            continue
+        port_match = re.search(r":(\d+)\s", line)
+        pid_match = re.search(r"pid=(\d+)", line)
+        if not port_match:
+            continue
+        port = port_match.group(1)
+        if port in seen:
+            continue
+        seen.add(port)
+        listeners.append((port, pid_match.group(1) if pid_match else ""))
+    return listeners
 
 
 def parse_mdns_services(output: str) -> list[dict[str, str]]:

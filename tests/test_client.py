@@ -1,9 +1,11 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from adbpilot.client import (
     AdbClient,
+    _parse_lsof_adb_listeners,
+    _parse_ss_adb_listeners,
     find_mdns_service,
     parse_devices,
     parse_foreground_package,
@@ -88,6 +90,38 @@ ZYX987 no permissions usb:2-1
 
         self.assertEqual([device.serial for device in result], ["192.168.1.71:44177"])
         self.assertEqual(client.run.call_count, 2)
+
+    def test_restart_server_stops_adb_holding_usb_on_another_port(self):
+        client = AdbClient("adb")
+        client.run = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        client._record = Mock()
+        client._listening_adb_servers = Mock(return_value=[("5037", "11"), ("5038", "99")])
+
+        with patch("adbpilot.client.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run:
+            client.restart_server()
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [str(client.adb_path), "-P", "5038", "kill-server"])
+        self.assertEqual(
+            [call.args[0] for call in client.run.call_args_list],
+            [["kill-server"], ["start-server"]],
+        )
+        self.assertIn("5038", client._record.call_args.kwargs["detail"])
+
+    def test_parse_adb_listener_ports(self):
+        lsof = """COMMAND   PID      USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+adb     23710 chengpeng    7u  IPv4 0x1      0t0  TCP *:5037 (LISTEN)
+adb     53986 chengpeng   14u  IPv4 0x2      0t0  TCP 127.0.0.1:5038 (LISTEN)
+chrome   1000 chengpeng    8u  IPv4 0x3      0t0  TCP *:8080 (LISTEN)
+"""
+        ss = """State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      128          0.0.0.0:5037      0.0.0.0:*    users:(("adb",pid=11,fd=7))
+LISTEN 0      128        127.0.0.1:5038      0.0.0.0:*    users:(("adb",pid=22,fd=8))
+LISTEN 0      128          0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=3,fd=3))
+"""
+
+        self.assertEqual(_parse_lsof_adb_listeners(lsof), [("5037", "23710"), ("5038", "53986")])
+        self.assertEqual(_parse_ss_adb_listeners(ss), [("5037", "11"), ("5038", "22")])
 
     def test_pair_by_qr_can_be_cancelled_and_logs_exit(self):
         client = AdbClient("adb")
