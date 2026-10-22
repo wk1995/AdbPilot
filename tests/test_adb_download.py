@@ -90,6 +90,22 @@ class AdbDownloadTests(unittest.TestCase):
             result = download_platform_tools("37.0.0", root, system_name="Linux", opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not download")))
         self.assertEqual(result, existing)
 
+    def test_download_drops_special_permission_bits(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            info = zipfile.ZipInfo("platform-tools/adb")
+            info.external_attr = (0o4755 & 0xFFFF) << 16
+            archive.writestr(info, b"adb")
+        with TemporaryDirectory() as temp_dir:
+            result = download_platform_tools(
+                "37.0.0",
+                Path(temp_dir),
+                system_name="Linux",
+                opener=lambda *_args, **_kwargs: FakeResponse(buffer.getvalue()),
+            )
+            self.assertFalse(result.stat().st_mode & stat.S_ISUID)
+            self.assertTrue(result.stat().st_mode & stat.S_IXUSR)
+
     def test_download_rejects_archive_paths_outside_destination(self):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
