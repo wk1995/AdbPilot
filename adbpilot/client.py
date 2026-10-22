@@ -949,7 +949,7 @@ class AdbClient:
         for device in devices:
             if device.serial == address or address in device.serial:
                 return device
-        return next((device for device in devices if device.is_ready), None)
+        return None
 
     @staticmethod
     def _device_model(device: Device | None) -> str:
@@ -1299,9 +1299,9 @@ def normalize_pairing_code(value: str) -> str:
 
 def classify_pair_output(returncode: int, stdout: str, stderr: str) -> str:
     text = f"{stdout}\n{stderr}".lower()
-    if returncode != 0:
+    if returncode != 0 or re.search(r"\bunsuccessful\b|\bfailed\b", text):
         return "failed"
-    if any(token in text for token in ("successfully paired", "paired to", "success")):
+    if any(token in text for token in ("successfully paired", "paired to")):
         return "success"
     return "ambiguous"
 
