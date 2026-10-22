@@ -636,10 +636,6 @@ class AdbClient:
             )
             if last_match:
                 return last_match
-            if host is not None:
-                last_match = find_mdns_service(services, service_type="_adb-tls-connect._tcp")
-                if last_match:
-                    return last_match
             time.sleep(1)
         return None
 
