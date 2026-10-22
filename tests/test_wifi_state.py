@@ -72,6 +72,8 @@ class WifiParsingTests(unittest.TestCase):
     def test_pair_output_classification(self):
         self.assertEqual(classify_pair_output(0, "Successfully paired to 192.168.1.10:1", ""), "success")
         self.assertEqual(classify_pair_output(1, "", "Failed: wrong code"), "failed")
+        self.assertEqual(classify_pair_output(0, "", "Failed: unsuccessful pairing"), "failed")
+        self.assertEqual(classify_pair_output(0, "pairing unsuccessful", ""), "failed")
         self.assertEqual(classify_pair_output(0, "", ""), "ambiguous")
         self.assertEqual(classify_pair_failure("", "connection refused"), "pair_unreachable")
         self.assertEqual(classify_pair_failure("", "timed out"), "pair_unreachable")

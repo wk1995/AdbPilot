@@ -93,6 +93,23 @@ class ClientHistoryTests(unittest.TestCase):
         self.assertFalse(devices[0]["events"][0]["ok"])
         self.assertIn("connect cli fail", "\n".join(connection_history.recent_events()))
 
+    def test_successful_connect_does_not_claim_another_ready_device(self):
+        usb = Device("e8d3d34b", "device", {"model": "2410DPN6CC"})
+
+        def fake_run(args, **kwargs):
+            if args[:2] == ["devices", "-l"]:
+                return subprocess.CompletedProcess(args, 0, "List of devices attached\ne8d3d34b device product:haotian model:2410DPN6CC\n", "")
+            return subprocess.CompletedProcess(args, 0, "connected to 192.168.1.8:5555\n", "")
+
+        with patch.object(self.client, "run", side_effect=fake_run):
+            output = self.client.connect("192.168.1.8:5555")
+
+        self.assertIn("connected to", output)
+        devices = connection_history.load_devices()
+        self.assertEqual(devices[0]["address"], "192.168.1.8:5555")
+        self.assertEqual(devices[0]["serial"], "")
+        self.assertNotEqual(devices[0].get("model"), "2410DPN6CC")
+
     def test_device_appearance_and_departure_are_recorded(self):
         before = [Device("usb-1", "device", {"model": "Old"})]
         after = [Device("wifi-1:5555", "device", {"model": "Phone"})]
