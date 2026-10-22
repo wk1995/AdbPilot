@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 from .errors import AdbNotFoundError
+from .mdns import SystemMdnsDiscovery, TLS_SERVICE_TYPES, parse_dns_sd_services
 
 
 class PlatformAdapter:
@@ -18,6 +22,86 @@ class PlatformAdapter:
     def __init__(self, env: dict[str, str] | None = None) -> None:
         self.env = env if env is not None else os.environ
         self.system = platform.system().lower()
+        self._mdns_lock = threading.Lock()
+        self._mdns_processes: set[subprocess.Popen] = set()
+        self._mdns_closed = False
+
+    def cancel_mdns_discovery(self) -> None:
+        """Prevent new browsers and terminate active ones; their worker reaps them."""
+        with self._mdns_lock:
+            self._mdns_closed = True
+            for process in self._mdns_processes:
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _finish_mdns_browser(process: subprocess.Popen) -> str:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            output, _ = process.communicate(timeout=0.3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            output, _ = process.communicate(timeout=0.3)
+        return output
+
+    def discover_system_adb_mdns_services(self, *, timeout: float = 1.2) -> SystemMdnsDiscovery:
+        """Browse both local TLS service types concurrently under one deadline."""
+        executable = shutil.which("dns-sd", path=self.env.get("PATH", os.defpath))
+        if executable is None and self.system == "darwin" and Path("/usr/bin/dns-sd").is_file():
+            executable = "/usr/bin/dns-sd"
+        if executable is None:
+            return SystemMdnsDiscovery(False)
+        processes: list[subprocess.Popen] = []
+        services = []
+        deadline = time.monotonic() + max(0.1, min(timeout, 5))
+        try:
+            # Hold the registration lock through spawn so shutdown cannot miss a child.
+            with self._mdns_lock:
+                if self._mdns_closed:
+                    return SystemMdnsDiscovery(False)
+                for service_type in TLS_SERVICE_TYPES:
+                    process = subprocess.Popen(
+                        [executable, "-B", service_type, "local."],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    processes.append(process)
+                    self._mdns_processes.add(process)
+            for process in processes:
+                try:
+                    output, _ = process.communicate(timeout=max(0.001, deadline - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    # communicate() after terminate preserves the buffered partial output.
+                    output = self._finish_mdns_browser(process)
+                else:
+                    # A browser normally runs until stopped. An early failure is not evidence.
+                    if process.returncode != 0:
+                        return SystemMdnsDiscovery(False)
+                if re.search(r"\bError code\s+-?\d+", output):
+                    return SystemMdnsDiscovery(False)
+                services.extend(parse_dns_sd_services(output))
+            return SystemMdnsDiscovery(True, tuple(dict.fromkeys(services)))
+        except (OSError, subprocess.SubprocessError):
+            return SystemMdnsDiscovery(False)
+        finally:
+            for process in processes:
+                try:
+                    self._finish_mdns_browser(process)
+                except (OSError, subprocess.SubprocessError):
+                    # Still attempt cleanup of the other browser if this one failed.
+                    try:
+                        process.kill()
+                        process.wait(timeout=0.3)
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                with self._mdns_lock:
+                    self._mdns_processes.discard(process)
 
     @property
     def executable_name(self) -> str:

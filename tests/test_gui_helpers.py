@@ -7,6 +7,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+from adbpilot.mdns import MdnsRecoveryController, MdnsRecoveryResult, MdnsRecoveryState
+from adbpilot.models import Device
 
 from adbpilot.gui import (
     AdbPilotGui,
@@ -129,7 +131,8 @@ class GuiHelperTests(unittest.TestCase):
         client = Mock()
         client.restart_server.side_effect = restart
         client.devices.side_effect = lambda: query_started.set() or []
-        gui = SimpleNamespace(adb_service_lock=threading.Lock(), _get_client=lambda: client)
+        gui = SimpleNamespace(adb_service_lock=threading.Lock(), _get_client=lambda: client,
+                              mdns_recovery=MdnsRecoveryController())
 
         def query():
             query_attempted.set()
@@ -151,6 +154,150 @@ class GuiHelperTests(unittest.TestCase):
         self.assertTrue(query_started.is_set())
         client.restart_server.assert_called_once()
         client.devices.assert_called_once()
+        self.assertEqual(gui.mdns_recovery.state, MdnsRecoveryState.COOLDOWN)
+
+    def make_mdns_gui(self, client):
+        return SimpleNamespace(
+            adb_service_lock=threading.Lock(), client=client,
+            mdns_recovery=MdnsRecoveryController(), mdns_adapter=Mock(),
+            mdns_stop=threading.Event(), result_queue=queue.Queue(),
+        )
+
+    def test_background_poll_updates_devices_after_recovery_via_queue(self):
+        phone = Device("example:5555", "device")
+        client = Mock()
+        client.devices.return_value = []
+        def recover(**kwargs):
+            self.assertFalse(kwargs["cancelled"]())
+            kwargs["progress"]("恢复服务发现")
+            return MdnsRecoveryResult("recovered", restarted=True, devices_after=(phone,))
+        client.recover_stale_mdns.side_effect = recover
+        gui = self.make_mdns_gui(client)
+        gui._get_client = Mock(side_effect=AssertionError("worker must not access Tk variables"))
+        devices, result = AdbPilotGui._read_devices_and_recover(gui, client)
+        self.assertEqual(devices, [phone])
+        self.assertEqual(result.status, "recovered")
+        self.assertEqual(gui.result_queue.get_nowait(), ("progress", "mDNS 自动恢复", "恢复服务发现", None))
+        self.assertIs(client.recover_stale_mdns.call_args.kwargs["controller"], gui.mdns_recovery)
+
+    def test_poll_with_any_device_skips_recovery(self):
+        for state in ("device", "offline", "unauthorized"):
+            client = Mock()
+            phone = Device("example", state)
+            client.devices.return_value = [phone]
+            gui = self.make_mdns_gui(client)
+            self.assertEqual(AdbPilotGui._read_devices_and_recover(gui, client), ([phone], None))
+            client.recover_stale_mdns.assert_not_called()
+
+    def test_closed_poll_does_not_query_or_recover(self):
+        client = Mock()
+        gui = self.make_mdns_gui(client)
+        gui.mdns_stop.set()
+        self.assertEqual(AdbPilotGui._read_devices_and_recover(gui, client), ([], None))
+        client.devices.assert_not_called()
+        client.recover_stale_mdns.assert_not_called()
+
+    def test_recovery_callback_detects_adb_client_change(self):
+        client = Mock()
+        client.devices.return_value = []
+        gui = self.make_mdns_gui(client)
+        def recover(**kwargs):
+            gui.client = Mock()
+            self.assertTrue(kwargs["cancelled"]())
+            return MdnsRecoveryResult("cancelled")
+        client.recover_stale_mdns.side_effect = recover
+        AdbPilotGui._read_devices_and_recover(gui, client)
+
+    def test_recovery_and_refresh_are_serialized(self):
+        entered = threading.Event()
+        finish = threading.Event()
+        query_attempted = threading.Event()
+        queried = threading.Event()
+        client = Mock()
+        client.devices.return_value = []
+        def recover(**_kwargs):
+            entered.set()
+            finish.wait(2)
+            return MdnsRecoveryResult("no_system_evidence")
+        client.recover_stale_mdns.side_effect = recover
+        gui = self.make_mdns_gui(client)
+        refresh_client = Mock()
+        refresh_client.devices.side_effect = lambda: queried.set() or []
+        def refresh():
+            query_attempted.set()
+            AdbPilotGui._read_devices(gui, refresh_client)
+        worker = threading.Thread(target=AdbPilotGui._read_devices_and_recover, args=(gui, client))
+        refresh_worker = threading.Thread(target=refresh)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            refresh_worker.start()
+            self.assertTrue(query_attempted.wait(1))
+            self.assertFalse(queried.wait(0.1))
+        finally:
+            finish.set()
+            worker.join(2)
+            if refresh_worker.ident is not None:
+                refresh_worker.join(2)
+        self.assertTrue(queried.is_set())
+
+    def test_repeated_warning_is_quiet_but_new_restart_is_reported(self):
+        gui = SimpleNamespace(mdns_last_status="", _append_output=Mock(), _render_polled_devices=Mock())
+        warning = MdnsRecoveryResult("suspected_name_conflict")
+        for result in (warning, MdnsRecoveryResult("interval"), warning):
+            AdbPilotGui._render_device_poll_result(gui, ([], result))
+        gui._append_output.assert_called_once_with(warning.message + "\n")
+        restarted = MdnsRecoveryResult("suspected_name_conflict", restarted=True)
+        AdbPilotGui._render_device_poll_result(gui, ([], restarted))
+        self.assertEqual(gui._append_output.call_count, 2)
+        self.assertEqual(gui._render_polled_devices.call_count, 4)
+
+    def test_manual_restart_failure_still_starts_cooldown(self):
+        client = Mock()
+        client.restart_server.side_effect = RuntimeError("cannot start")
+        gui = self.make_mdns_gui(client)
+        with self.assertRaises(RuntimeError):
+            AdbPilotGui._restart_adb_server(gui, client)
+        self.assertEqual(gui.mdns_recovery.state, MdnsRecoveryState.COOLDOWN)
+
+    def test_poll_result_is_only_rendered_for_current_client(self):
+        for replace_client in (False, True):
+            with self.subTest(replace_client=replace_client):
+                client = Mock()
+                gui = self.make_mdns_gui(client)
+                gui.device_poll_running = False
+                gui.DEVICE_POLL_INTERVAL_MS = 3000
+                gui._get_client = Mock(return_value=client)
+                gui._read_devices_and_recover = Mock(return_value=([], MdnsRecoveryResult("no_system_evidence")))
+                gui._render_device_poll_result = Mock()
+                gui._finish_device_poll = Mock()
+                gui._poll_devices = Mock()
+                gui.after = Mock()
+                AdbPilotGui._poll_devices(gui)
+                kind, label, payload, callback = gui.result_queue.get(timeout=2)
+                self.assertEqual((kind, label), ("ok", "设备监听"))
+                gui._get_client.assert_called_once()
+                gui._render_device_poll_result.assert_not_called()
+                if replace_client:
+                    gui.client = Mock()
+                callback(payload)
+                if replace_client:
+                    gui._render_device_poll_result.assert_not_called()
+                    gui._finish_device_poll.assert_called_once()
+                else:
+                    gui._render_device_poll_result.assert_called_once_with(payload)
+
+    def test_close_cancels_discovery_before_destroying_gui(self):
+        gui = SimpleNamespace(
+            mdns_stop=threading.Event(), mdns_adapter=Mock(),
+            _stop_macos_floating_window=Mock(), floating_window=None,
+            destroy=Mock(),
+        )
+        gui.destroy.side_effect = lambda: self.assertTrue(gui.mdns_stop.is_set())
+        AdbPilotGui._close_app(gui)
+        gui.mdns_adapter.cancel_mdns_discovery.assert_called_once()
+        gui.destroy.assert_called_once()
+
     def test_generate_adb_qr_pairing_payload(self):
         service_name, password, payload = generate_adb_qr_pairing_payload()
 

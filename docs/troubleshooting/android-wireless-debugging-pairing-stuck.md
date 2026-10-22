@@ -27,14 +27,18 @@ Android 设备曾通过 Android Studio 的 Wi-Fi 无线调试正常连接。电�
 
 ## 处理步骤
 
+AdbPilot GUI 已增加 [mDNS 异常自动恢复](../../doc/tech/adb-mdns-auto-recovery-design.md)：无设备记录、ADB 明确启用 mDNS、系统能发现服务但 ADB 二次查询均为空时，自动重启当前 ADB Server。默认探测间隔 15 秒、重启冷却 60 秒。此功能不能代替手机侧重复配对实例的处理；旁路能力不可用时仍可使用下面的手动步骤。
+
 先确认 ADB 与 mDNS 状态：
 
 ```bash
 adb version
 adb devices -l
-adb mdns check
+adb server-status
 adb mdns services
 ```
+
+`server-status` 中的 `mdns_enabled: true` 用于确认发现功能已开启；旧版 ADB 不支持该命令或字段未知时，GUI 会跳过自动恢复。这里的手动步骤仍可用于诊断。
 
 如果手机与电脑网络可达，但 ADB 长时间发现不到配对服务，重启 ADB Server：
 

@@ -16,6 +16,7 @@ AdbPilot 是一个围绕 Android ADB 能力构建的跨平台命令行工具，�
 - Shell 执行：执行单条 adb shell 命令。
 - 屏幕操作：截屏、录屏、点击、滑动、输入和按键事件。
 - 无线调试：连接和断开 `host:port` 形式的无线 ADB 设备。
+- GUI mDNS 自动恢复：系统能发现无线调试服务但 ADB 持续发现不到时，在无设备的条件下自动重启当前 ADB 服务，带二次确认和冷却保护。
 
 ## 平台支持
 
@@ -389,6 +390,8 @@ adb executable
 无线设备 IP／端口变化后的自动重连设计：[PRD](./doc/wireless-auto-reconnect/prd.md) · [技术方案](./doc/wireless-auto-reconnect/technical-design.md)（设计稿，尚未实现）。
 
 无线调试扫码后一直显示“正在配对设备”时，参见 [Android 无线调试配对卡住排查](./docs/troubleshooting/android-wireless-debugging-pairing-stuck.md)。
+
+GUI 已实现 [mDNS 异常自动恢复](./doc/tech/adb-mdns-auto-recovery-design.md)（[AI 状态机规范 JSON](./doc/tech/adb-mdns-auto-recovery-state-machine.json)）。默认每 15 秒探测，重启后冷却 60 秒；任何设备记录（含 offline、unauthorized）存在时不自动重启。需要 ADB `server-status` 明确报告 `mdns_enabled: true`，以及系统可用的 `dns-sd`（macOS 自带，其他平台缺失时自动跳过）。可在 `~/.adbpilot/gui.json` 中设置 `"wireless_recovery": {"enabled": false}`，重启 GUI 后关闭此功能。
 
 ## 开发和测试
 
