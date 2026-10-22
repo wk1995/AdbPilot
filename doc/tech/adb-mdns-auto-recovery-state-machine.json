@@ -1,0 +1,151 @@
+{
+  "spec_version": "1.0",
+  "id": "adb-mdns-auto-recovery",
+  "title": "ADB mDNS 异常自动恢复状态机",
+  "updated_at": "2026-10-22",
+  "implementation_status": "implemented_pending_device_validation",
+  "technical_design": "adb-mdns-auto-recovery-design.md",
+  "implementation": {
+    "controller": "../../adbpilot/mdns.py#MdnsRecoveryController",
+    "state_enum": "../../adbpilot/mdns.py#MdnsRecoveryState",
+    "client": "../../adbpilot/client.py#AdbClient.recover_stale_mdns",
+    "gui": "../../adbpilot/gui.py#AdbPilotGui._read_devices_and_recover"
+  },
+  "semantics": {
+    "purpose": "供 AI 实现、审查和推导测试用例的结构化行为规范",
+    "execution_model": "procedural",
+    "events": "事件表示现有顺序执行代码中的阶段结果，不要求实现额外的事件总线",
+    "guards": "条件表达式使用 Python 风格伪代码，仅作规范数据，不交给 eval 执行",
+    "transition_selection": "按数组顺序选择首个匹配当前状态、事件和条件的转移",
+    "terminal_transition": "finish=true 表示返回本轮结果，再执行 finalizer 选择常驻状态",
+    "scope": "一个 GUI 进程内复用控制器；多个 GUI 进程之间不共享锁或冷却"
+  },
+  "initial_state": "idle",
+  "states": {
+    "idle": {"description": "等待探测；本轮准入检查及最初的设备查询也在此状态完成"},
+    "probing": {"description": "检查 ADB 能力及 ADB/系统 mDNS 可见性"},
+    "confirming": {"description": "等待确认间隔，再查 ADB 服务并复查设备、取消条件"},
+    "restarting": {"description": "执行当前 ADB Server 的 kill/start"},
+    "verifying": {"description": "稳定等待后查询恢复结果"},
+    "cooldown": {"description": "重启尝试后的保护期，不执行自动恢复探测"}
+  },
+  "context": {
+    "last_probe": {"type": "monotonic_seconds_or_null", "initial": null},
+    "last_restart": {"type": "monotonic_seconds_or_null", "initial": null},
+    "attempted": {"type": "boolean", "initial": false, "reset": "each_call"},
+    "restarted": {"type": "boolean", "initial": false, "reset": "each_call"},
+    "adb_services_before": {"type": "MdnsService[]", "initial": [], "reset": "each_call"},
+    "system_services": {"type": "MdnsService[]", "initial": [], "reset": "each_call"},
+    "adb_services_after": {"type": "MdnsService[]", "initial": [], "reset": "each_call"},
+    "devices_after": {"type": "Device[]", "initial": [], "reset": "each_call"}
+  },
+  "parameters": {
+    "enabled": {"default": true},
+    "probe_interval_seconds": {"default": 15, "minimum": 5, "maximum": 3600},
+    "restart_cooldown_seconds": {"default": 60, "minimum": 30, "maximum": 86400},
+    "system_browse_timeout_seconds": {"default": 1.2, "minimum": 0.1, "maximum": 5},
+    "confirm_delay_seconds": {"default": 0.3, "minimum": 0.1, "maximum": 2},
+    "adb_command_timeout_seconds": {"fixed": 3}
+  },
+  "guards": {
+    "cancelled": "application_closed or selected_client_replaced or caller_cancelled",
+    "disabled": "not config.enabled",
+    "cooldown_active": "last_restart is not None and now - last_restart < config.restart_cooldown_seconds",
+    "interval_pending": "last_probe is not None and now - last_probe < config.probe_interval_seconds",
+    "has_devices": "len(raw_devices) > 0",
+    "mdns_enabled": "server_status.returncode == 0 and server_status.mdns_enabled == 'true'",
+    "adb_visible": "len(observed_adb_tls_services) > 0",
+    "name_conflict": "any(service.name_conflict for service in observed_adb_tls_services)",
+    "system_supported": "system_discovery.supported",
+    "system_visible": "len(system_discovery.services) > 0",
+    "stale_confirmed": "system_supported and system_visible and not adb_before_visible and not adb_confirm_visible and not has_devices and not cancelled",
+    "verified_conflict": "not has_devices and name_conflict",
+    "recovery_visible": "adb_visible or has_devices",
+    "always": "True"
+  },
+  "events": [
+    "initial_devices_read", "capability_checked", "adb_services_observed",
+    "system_discovery_completed", "confirmation_passed", "start_succeeded",
+    "verification_completed", "cancel_checked", "command_failed", "manual_restart_finished"
+  ],
+  "call_entry": {
+    "lock": "try_acquire_nonblocking",
+    "on_lock_busy": {"result": "busy", "change_state": false, "run_finalizer": false},
+    "ordered_rules": [
+      {"when": "cancelled", "result": "cancelled"},
+      {"when": "disabled", "result": "disabled"},
+      {"when": "cooldown_active", "result": "cooldown"},
+      {"action": "set_state_idle"},
+      {"when": "interval_pending", "result": "interval"},
+      {"action": "record_probe_and_read_devices"}
+    ]
+  },
+  "actions": {
+    "set_state_idle": "state = idle",
+    "record_probe_and_read_devices": "last_probe = monotonic_now(); read raw adb devices with 3s timeout",
+    "probe": "check server-status; query ADB TLS services; if empty and not cancelled, browse both system TLS types concurrently",
+    "confirm": "emit redacted progress; wait confirm_delay_seconds; check cancellation; query ADB TLS services again; if still empty, re-read raw devices and check cancellation",
+    "restart": "attempted = True; last_restart = monotonic_now(); emit redacted progress; kill-server(check=False, timeout=3); start-server(timeout=3)",
+    "verify": "restarted = True; wait confirm_delay_seconds; check cancellation; query ADB TLS services and raw devices with 3s timeouts",
+    "note_manual_restart": "last_restart = monotonic_now(); state = cooldown",
+    "release_lock": "release controller lock acquired by this call"
+  },
+  "transitions": [
+    {"from": ["idle"], "event": "initial_devices_read", "when": "has_devices", "finish": true, "result": "device_present"},
+    {"from": ["idle"], "event": "initial_devices_read", "when": "not has_devices", "to": "probing", "actions": ["probe"]},
+    {"from": ["probing"], "event": "capability_checked", "when": "not mdns_enabled", "finish": true, "result": "unsupported"},
+    {"from": ["probing", "confirming"], "event": "adb_services_observed", "when": "adb_visible and name_conflict", "finish": true, "result": "suspected_name_conflict"},
+    {"from": ["probing", "confirming"], "event": "adb_services_observed", "when": "adb_visible", "finish": true, "result": "not_needed"},
+    {"from": ["probing"], "event": "system_discovery_completed", "when": "cancelled", "finish": true, "result": "cancelled"},
+    {"from": ["probing"], "event": "system_discovery_completed", "when": "not system_supported", "finish": true, "result": "unsupported"},
+    {"from": ["probing"], "event": "system_discovery_completed", "when": "not system_visible", "finish": true, "result": "no_system_evidence"},
+    {"from": ["probing"], "event": "system_discovery_completed", "when": "system_supported and system_visible", "to": "confirming", "actions": ["confirm"]},
+    {"from": ["confirming"], "event": "confirmation_passed", "when": "has_devices", "finish": true, "result": "device_present"},
+    {"from": ["confirming"], "event": "confirmation_passed", "when": "stale_confirmed", "to": "restarting", "actions": ["restart"]},
+    {"from": ["restarting"], "event": "start_succeeded", "when": "always", "to": "verifying", "actions": ["verify"]},
+    {"from": ["verifying"], "event": "verification_completed", "when": "verified_conflict", "finish": true, "result": "suspected_name_conflict"},
+    {"from": ["verifying"], "event": "verification_completed", "when": "recovery_visible", "finish": true, "result": "recovered"},
+    {"from": ["verifying"], "event": "verification_completed", "when": "always", "finish": true, "result": "restarted_unverified"},
+    {"from": ["idle", "probing", "confirming", "verifying"], "event": "cancel_checked", "when": "cancelled", "finish": true, "result": "cancelled"},
+    {"from": ["idle", "probing", "confirming"], "event": "command_failed", "when": "always", "finish": true, "result": "probe_failed"},
+    {"from": ["restarting"], "event": "command_failed", "when": "always", "finish": true, "result": "restart_failed"},
+    {"from": ["verifying"], "event": "command_failed", "when": "always", "finish": true, "result": "restarted_unverified"},
+    {"from": ["idle", "cooldown"], "event": "manual_restart_finished", "when": "always", "to": "cooldown", "actions": ["note_manual_restart"]}
+  ],
+  "finalizer": {
+    "applies_to": "every call that acquired the controller lock, including early returns and errors",
+    "ordered_state_rules": [
+      {"when": "cooldown_active", "to": "cooldown"},
+      {"when": "always", "to": "idle"}
+    ],
+    "actions": ["release_lock"],
+    "preserve": ["last_probe", "last_restart", "restarted", "result"]
+  },
+  "result_statuses": [
+    "busy", "cancelled", "disabled", "cooldown", "interval", "device_present",
+    "unsupported", "not_needed", "suspected_name_conflict", "no_system_evidence",
+    "recovered", "restarted_unverified", "restart_failed", "probe_failed"
+  ],
+  "invariants": [
+    {"id": "protect_all_transports", "rule": "Any raw device record, including offline, unauthorized or no permissions, forbids automatic restart."},
+    {"id": "require_positive_system_evidence", "rule": "Empty device/ADB lists alone are insufficient; require successful system discovery of a local ADB TLS service and two successful empty ADB observations."},
+    {"id": "errors_are_not_empty_snapshots", "rule": "Query failure, timeout and malformed output must never serve as empty-list evidence."},
+    {"id": "restart_current_server_only", "rule": "Automatic recovery must not call the manual restart path that stops competing servers on other ports."},
+    {"id": "kill_start_sequence", "rule": "A nonzero kill-server exit code does not prevent start-server; kill failure by exception/timeout ends this attempt. Cancellation is not checked between kill and start."},
+    {"id": "cooldown_after_attempt", "rule": "Record last_restart before kill; both successful and failed attempts remain subject to cooldown."},
+    {"id": "cancel_preserves_restart", "rule": "Cancellation after successful start preserves restarted=true and last_restart."},
+    {"id": "conflict_is_advice", "rule": "A numeric instance suffix alone never triggers restart. Visible services produce advice rather than restart."},
+    {"id": "serialize_gui_operations", "rule": "GUI polling/recovery, manual refresh and manual restart share adb_service_lock; control re-entry separately with a nonblocking controller lock."},
+    {"id": "reject_stale_results", "rule": "Closing GUI or replacing its selected client cancels work at checked boundaries and prevents old poll results from being rendered."},
+    {"id": "redact_diagnostics", "rule": "Recovery messages exclude raw instance names, GUIDs, full serials, passwords, pairing codes, QR payloads and Wi-Fi names."},
+    {"id": "bounded_children", "rule": "Browse both TLS types concurrently under one deadline; terminate, escalate to kill when needed, reap processes and close pipes."},
+    {"id": "connection_race_boundary", "rule": "The final empty device check reduces but cannot eliminate external device-arrival races before kill-server."}
+  ],
+  "tests": [
+    {"path": "../../tests/test_mdns_recovery.py", "covers": ["states", "transitions", "guards", "cooldown", "cancellation", "redaction", "reentry"]},
+    {"path": "../../tests/test_platform_adapter.py", "covers": ["system_discovery", "partial_failure", "timeout", "child_cleanup"]},
+    {"path": "../../tests/test_gui_helpers.py", "covers": ["queue_delivery", "serialization", "client_replacement", "shutdown", "manual_restart_cooldown"]}
+  ],
+  "validation_command": "python -m unittest discover -s tests -v",
+  "pending_validation": ["macOS physical-device fault reproduction", "Windows/Linux compatible dns-sd environments"]
+}

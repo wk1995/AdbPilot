@@ -25,6 +25,7 @@ from .history import load_devices, log_path, recent_events
 from .models import Device, RunningProcess
 from .packages import DependencyRequest, install_dependency
 from .platform_adapter import PlatformAdapter
+from .mdns import MdnsRecoveryConfig, MdnsRecoveryController, MdnsRecoveryResult
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -237,6 +238,10 @@ class AdbPilotGui(BaseTk):
         self.qr_pair_cancel_event: threading.Event | None = None
         self.macos_floating_process: subprocess.Popen[str] | None = None
         self.gui_config = load_gui_config()
+        self.mdns_recovery = MdnsRecoveryController(MdnsRecoveryConfig.from_gui_config(self.gui_config))
+        self.mdns_adapter = PlatformAdapter()
+        self.mdns_stop = threading.Event()
+        self.mdns_last_status = ""
         self.locked_serial_var = tk.StringVar()
         self.lock_status_var = tk.StringVar(value="未锁定")
         self.result_queue: queue.Queue[tuple[str, str, Any, ResultCallback | None]] = queue.Queue()
@@ -1220,6 +1225,8 @@ class AdbPilotGui(BaseTk):
         self._save_floating_window_position()
 
     def _close_app(self) -> None:
+        self.mdns_stop.set()
+        self.mdns_adapter.cancel_mdns_discovery()
         self._stop_macos_floating_window()
         if self.floating_window is not None and self.floating_window.winfo_exists():
             self._save_floating_window_position()
@@ -1588,43 +1595,101 @@ class AdbPilotGui(BaseTk):
         self._run_async("检测 ADB 版本", lambda: self._get_client().version())
 
     def restart_server(self) -> None:
-        self._run_async("重启 ADB 服务", self._restart_adb_server)
+        try:
+            client = self._get_client()
+        except AdbPilotError as exc:
+            messagebox.showerror("AdbPilot", str(exc))
+            return
+        self._run_async("重启 ADB 服务", lambda: self._restart_adb_server(client))
 
-    def _restart_adb_server(self) -> str:
+    def _restart_adb_server(self, client: AdbClient | None = None) -> str:
         # Device queries can auto-start ADB; keep them out of the kill/start gap.
         with self.adb_service_lock:
-            self._get_client().restart_server()
+            try:
+                (client or self._get_client()).restart_server()
+            finally:
+                self.mdns_recovery.note_restart()
         return "adb server 已重启"
 
-    def _read_devices(self) -> list[Device]:
+    def _read_devices(self, client: AdbClient | None = None) -> list[Device]:
         with self.adb_service_lock:
-            return self._get_client().devices()
+            return (client or self._get_client()).devices()
 
     def refresh_devices(self) -> None:
+        try:
+            client = self._get_client()
+        except AdbPilotError as exc:
+            messagebox.showerror("AdbPilot", str(exc))
+            return
         self.manual_refresh_in_progress = True
 
         def done(devices: list[Device]) -> None:
             self.manual_refresh_in_progress = False
             self._render_devices(devices, mark_disconnected=True, noisy=True)
 
-        self._run_async("刷新设备", self._read_devices, done)
+        def failed(_exc: Exception) -> None:
+            self.manual_refresh_in_progress = False
+
+        self._run_async("刷新设备", lambda: self._read_devices(client), done, failed)
 
     def _poll_devices(self) -> None:
+        if self.mdns_stop.is_set():
+            return
         if self.device_poll_running:
             self.after(self.DEVICE_POLL_INTERVAL_MS, self._poll_devices)
             return
 
         self.device_poll_running = True
 
+        # Resolve Tk variables on the main thread; the worker uses this snapshot.
+        try:
+            client = self._get_client()
+        except Exception:
+            self.device_poll_running = False
+            self.after(self.DEVICE_POLL_INTERVAL_MS, self._poll_devices)
+            return
+
         def worker() -> None:
             try:
-                devices = self._read_devices()
-                self.result_queue.put(("ok", "设备监听", devices, self._render_polled_devices))
+                result = self._read_devices_and_recover(client)
+                self.result_queue.put(("ok", "设备监听", result, done))
             except Exception as exc:  # noqa: BLE001 - listener should surface failures but keep retrying.
                 self.result_queue.put(("err", "设备监听", exc, self._finish_device_poll))
 
+        def done(payload: tuple[list[Device], MdnsRecoveryResult | None]) -> None:
+            if self.client is not client or self.mdns_stop.is_set():
+                self._finish_device_poll()
+                return
+            self._render_device_poll_result(payload)
+
         threading.Thread(target=worker, daemon=True).start()
         self.after(self.DEVICE_POLL_INTERVAL_MS, self._poll_devices)
+
+    def _read_devices_and_recover(self, client: AdbClient) -> tuple[list[Device], MdnsRecoveryResult | None]:
+        # Serialize the entire bounded probe/restart with refresh and manual restart.
+        with self.adb_service_lock:
+            if self.mdns_stop.is_set():
+                return [], None
+            devices = client.devices()
+            if devices:
+                return devices, None
+            result = client.recover_stale_mdns(
+                controller=self.mdns_recovery,
+                adapter=self.mdns_adapter,
+                cancelled=lambda: self.mdns_stop.is_set() or self.client is not client,
+                progress=lambda message: self.result_queue.put(("progress", "mDNS 自动恢复", message, None)),
+            )
+            if result.restarted or result.devices_after:
+                devices = list(result.devices_after)
+            return devices, result
+
+    def _render_device_poll_result(self, payload: tuple[list[Device], MdnsRecoveryResult | None]) -> None:
+        devices, result = payload
+        if result is not None and result.status not in {"interval", "cooldown", "busy", "cancelled"}:
+            if result.message and (result.restarted or result.status != self.mdns_last_status):
+                self._append_output(result.message + "\n")
+            self.mdns_last_status = result.status
+        self._render_polled_devices(devices)
 
     def _finish_device_poll(self, payload: Any = None) -> None:
         self.device_poll_running = False

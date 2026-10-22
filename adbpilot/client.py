@@ -22,6 +22,7 @@ from .errors import (
 from . import history as connection_history
 from .models import AdbWifiCapabilities, CommandResult, Device, DeviceInfo, RunningProcess, WirelessPairingResult
 from .platform_adapter import PlatformAdapter
+from .mdns import MdnsRecoveryController, MdnsRecoveryResult, MdnsService, has_name_conflict
 
 
 DEFAULT_TIMEOUT = 30
@@ -37,9 +38,11 @@ class AdbClient:
         *,
         history_source: str = "cli",
     ) -> None:
-        self.adb_path = PlatformAdapter().resolve_adb(adb_path)
+        self.platform_adapter = PlatformAdapter()
+        self.adb_path = self.platform_adapter.resolve_adb(adb_path)
         self.timeout = timeout
         self.history_source = history_source
+        self.mdns_recovery = MdnsRecoveryController()
 
     def run(
         self,
@@ -624,6 +627,38 @@ class AdbClient:
     def mdns_services(self) -> str:
         return self.run(["mdns", "services"], timeout=20).stdout
 
+    def mdns_recovery_supported(self) -> bool:
+        result = self.run(["server-status"], timeout=3, check=False)
+        return result.returncode == 0 and parse_server_status(result.stdout).get("mdns_enabled", "").lower() == "true"
+
+    def mdns_recovery_devices(self) -> tuple[Device, ...]:
+        # Raw transport snapshot: avoid extra property queries and protect every state.
+        return tuple(parse_devices(self.run(["devices", "-l"], timeout=3).stdout))
+
+    def mdns_recovery_services(self) -> tuple[MdnsService, ...]:
+        output = self.run(["mdns", "services"], timeout=3).stdout
+        services = parse_mdns_services(output)
+        unexpected = [line for line in output.splitlines()
+                      if line.strip() and line.strip() != "List of discovered mdns services"]
+        if unexpected and not services:
+            raise ValueError("Unrecognized mDNS output")
+        return tuple(
+            MdnsService("_" + normalize_mdns_service_type(s["type"]), s["address"], has_name_conflict(s["name"]))
+            for s in services
+        )
+
+    def recover_stale_mdns(
+        self,
+        *,
+        controller: MdnsRecoveryController | None = None,
+        adapter: PlatformAdapter | None = None,
+        cancelled: Callable[[], bool] = lambda: False,
+        progress: Callable[[str], None] | None = None,
+    ) -> MdnsRecoveryResult:
+        return (controller or self.mdns_recovery).recover(
+            self, adapter or self.platform_adapter, cancelled=cancelled, progress=progress,
+        )
+
     def wait_for_mdns_connect_service(self, *, host: str | None = None, timeout: int = 30) -> dict[str, str] | None:
         deadline = time.monotonic() + timeout
         last_match: dict[str, str] | None = None
@@ -1081,10 +1116,10 @@ def _parse_ss_adb_listeners(output: str) -> list[tuple[str, str]]:
 def parse_mdns_services(output: str) -> list[dict[str, str]]:
     services: list[dict[str, str]] = []
     for raw_line in output.splitlines():
-        parts = raw_line.split()
-        if len(parts) < 3 or not is_mdns_service_type(parts[1]):
+        match = re.fullmatch(r"\s*(.+?)\s+(_?adb-tls-(?:pairing|connect)\._tcp\.?)\s+(\S+)\s*", raw_line)
+        if not match:
             continue
-        services.append({"name": parts[0], "type": parts[1], "address": parts[2]})
+        services.append({"name": match[1], "type": match[2], "address": match[3]})
     return services
 
 
