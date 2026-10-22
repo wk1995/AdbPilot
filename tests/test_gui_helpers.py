@@ -1,9 +1,8 @@
 import os
 import queue
 import threading
-import tkinter as tk
-from tkinter import ttk
 import unittest
+from tkinter import TclError
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -31,6 +30,49 @@ from adbpilot.gui import (
     save_gui_config,
     ui_font,
 )
+
+
+class FakeVar:
+    def __init__(self, value: str = "") -> None:
+        self.value = value
+
+    def get(self) -> str:
+        return self.value
+
+    def set(self, value: str) -> None:
+        self.value = value
+
+
+class FakeWidget:
+    def __init__(self, text: str = "", *, parent: "FakeContainer | None" = None, exists: bool = True) -> None:
+        self.text = text
+        self.exists = exists
+        self.parent = parent
+
+    def winfo_exists(self) -> bool:
+        return self.exists
+
+    def destroy(self) -> None:
+        self.exists = False
+        if self.parent is not None:
+            self.parent.children = [child for child in self.parent.children if child is not self]
+
+    def pack(self, *_args: object, **_kwargs: object) -> None:
+        if self.parent is not None and self not in self.parent.children:
+            self.parent.children.append(self)
+
+
+class FakeContainer:
+    def __init__(self, *children: FakeWidget) -> None:
+        self.children = list(children)
+        for child in self.children:
+            child.parent = self
+
+    def winfo_children(self) -> list[FakeWidget]:
+        return list(self.children)
+
+    def winfo_exists(self) -> bool:
+        return True
 
 
 class GuiHelperTests(unittest.TestCase):
@@ -68,7 +110,7 @@ class GuiHelperTests(unittest.TestCase):
     def test_windows_adb_browser_retries_without_filter_on_tcl_error(self):
         gui = SimpleNamespace(adb_path_var=Mock(), _remember_adb_path=Mock())
         with patch("adbpilot.gui.platform.system", return_value="Windows"), patch(
-            "adbpilot.gui.filedialog.askopenfilename", side_effect=[tk.TclError("filter error"), ""]
+            "adbpilot.gui.filedialog.askopenfilename", side_effect=[TclError("filter error"), ""]
         ) as dialog:
             AdbPilotGui._browse_adb(gui)
         self.assertEqual(dialog.call_count, 2)
@@ -126,43 +168,43 @@ class GuiHelperTests(unittest.TestCase):
         self.assertIn("░░", mosaic)
 
     def test_finished_qr_pairing_covers_code_and_offers_restart(self):
-        root = tk.Tk()
-        root.withdraw()
-        self.addCleanup(root.destroy)
-        content = ttk.Frame(root)
-        content.pack()
-        ttk.Label(content, text="可扫描二维码").pack()
-        status = tk.StringVar(master=root, value="等待手机扫描")
-        actions = ttk.Frame(root)
-        restart = ttk.Button(actions, text="重新生成")
+        old_code = FakeWidget("可扫描二维码")
+        content = FakeContainer(old_code)
+        status = FakeVar("等待手机扫描")
+        actions = FakeContainer()
+        restart = FakeWidget("重新生成", parent=actions)
+        labels: list[FakeWidget] = []
+
+        def label_factory(parent, **kwargs):
+            widget = FakeWidget(str(kwargs.get("text", "")), parent=parent)
+            labels.append(widget)
+            return widget
+
         gui = SimpleNamespace(
             qr_pair_content=content,
-            qr_pair_window=root,
+            qr_pair_window=FakeWidget(exists=True),
             qr_pair_status_var=status,
             qr_pair_restart_button=restart,
         )
 
-        AdbPilotGui._finish_qr_pairing(gui, "扫码配对已结束，这个二维码不能再用。")
+        with patch("adbpilot.gui.ttk.Label", side_effect=label_factory), patch("adbpilot.gui.mono_font", return_value=("Menlo", 11)):
+            AdbPilotGui._finish_qr_pairing(gui, "扫码配对已结束，这个二维码不能再用。")
 
-        labels = [child.cget("text") for child in content.winfo_children() if isinstance(child, ttk.Label)]
+        self.assertFalse(old_code.exists)
         self.assertTrue(labels)
-        self.assertNotIn("可扫描二维码", labels)
-        self.assertTrue(any("██" in text for text in labels))
-        self.assertIn("不能再用", status.get())
-        self.assertIn(restart, actions.pack_slaves())
+        self.assertTrue(any("██" in widget.text for widget in labels))
+        self.assertNotIn("WIFI:T:ADB", " ".join(widget.text for widget in labels))
+        self.assertIn("不能再用", status.value)
+        self.assertIn(restart, actions.children)
 
     def test_successful_qr_pairing_closes_window_without_cancelling(self):
-        root = tk.Tk()
-        root.withdraw()
-        self.addCleanup(root.destroy)
-        window = tk.Toplevel(root)
-        self.addCleanup(window.destroy)
+        window = FakeWidget(exists=True)
         cancel_event = threading.Event()
         gui = SimpleNamespace(
             qr_pair_session=0,
             qr_pair_cancel_event=None,
             qr_pair_window=window,
-            qr_pair_status_var=Mock(),
+            qr_pair_status_var=FakeVar(),
             _append_output=Mock(),
             _show_qr_pairing_window=Mock(return_value=True),
             _get_client=Mock(return_value=Mock()),
@@ -188,7 +230,7 @@ class GuiHelperTests(unittest.TestCase):
         done("已连接 192.168.1.8:5555")
 
         self.assertFalse(cancel_event.is_set())
-        self.assertFalse(window.winfo_exists())
+        self.assertFalse(window.exists)
         gui.refresh_devices.assert_called_once()
 
     def test_device_connection_type(self):
