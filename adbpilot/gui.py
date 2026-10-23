@@ -1455,6 +1455,46 @@ class AdbPilotGui(BaseTk):
             self._remember_adb_path(str(self.client.adb_path))
         return self.client
 
+    def _client_settings(self) -> tuple[str | None, int]:
+        return self.adb_path_var.get().strip() or None, self._int_value(self.timeout_var, default=30)
+
+    def _prepare_client_async(
+        self, on_ready: ResultCallback, on_error: ResultCallback, *, label: str,
+    ) -> None:
+        """Read Tk settings here, discover ADB in a worker, publish on Tk thread."""
+        if self.mdns_stop.is_set():
+            on_error(None)
+            return
+        adb_path, timeout = self._client_settings()
+
+        def matches(client: AdbClient | None) -> bool:
+            return (client is not None and client.timeout == timeout
+                    and str(client.adb_path) == str(adb_path or client.adb_path))
+
+        if matches(self.client):
+            on_ready(self.client)
+            return
+
+        def publish(client: AdbClient) -> None:
+            if self.mdns_stop.is_set() or self._client_settings() != (adb_path, timeout):
+                on_error(None)
+                return
+            # Another UI request may have resolved these same settings meanwhile.
+            if not matches(self.client):
+                self.client = client
+                self.adb_path_var.set(str(client.adb_path))
+                self._remember_adb_path(str(client.adb_path))
+            on_ready(self.client)
+
+        def worker() -> None:
+            try:
+                client = AdbClient(adb_path=adb_path, timeout=timeout, history_source="gui")
+                self.result_queue.put(("ok", label, client, publish))
+            except Exception as exc:  # noqa: BLE001 - report resolution errors on Tk thread.
+                self.result_queue.put(("err", label, exc, on_error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _selected_serial(self) -> str | None:
         locked = self.locked_serial_var.get().strip()
         if locked:
@@ -1595,12 +1635,11 @@ class AdbPilotGui(BaseTk):
         self._run_async("检测 ADB 版本", lambda: self._get_client().version())
 
     def restart_server(self) -> None:
-        try:
-            client = self._get_client()
-        except AdbPilotError as exc:
-            messagebox.showerror("AdbPilot", str(exc))
-            return
-        self._run_async("重启 ADB 服务", lambda: self._restart_adb_server(client))
+        self._prepare_client_async(
+            lambda client: self._run_async("重启 ADB 服务", lambda: self._restart_adb_server(client)),
+            lambda _exc: None,
+            label="重启 ADB 服务",
+        )
 
     def _restart_adb_server(self, client: AdbClient | None = None) -> str:
         # Device queries can auto-start ADB; keep them out of the kill/start gap.
@@ -1616,11 +1655,6 @@ class AdbPilotGui(BaseTk):
             return (client or self._get_client()).devices()
 
     def refresh_devices(self) -> None:
-        try:
-            client = self._get_client()
-        except AdbPilotError as exc:
-            messagebox.showerror("AdbPilot", str(exc))
-            return
         self.manual_refresh_in_progress = True
 
         def done(devices: list[Device]) -> None:
@@ -1630,7 +1664,11 @@ class AdbPilotGui(BaseTk):
         def failed(_exc: Exception) -> None:
             self.manual_refresh_in_progress = False
 
-        self._run_async("刷新设备", lambda: self._read_devices(client), done, failed)
+        self._prepare_client_async(
+            lambda client: self._run_async("刷新设备", lambda: self._read_devices(client), done, failed),
+            failed,
+            label="刷新设备",
+        )
 
     def _poll_devices(self) -> None:
         if self.mdns_stop.is_set():
@@ -1641,28 +1679,23 @@ class AdbPilotGui(BaseTk):
 
         self.device_poll_running = True
 
-        # Resolve Tk variables on the main thread; the worker uses this snapshot.
-        try:
-            client = self._get_client()
-        except Exception:
-            self.device_poll_running = False
-            self.after(self.DEVICE_POLL_INTERVAL_MS, self._poll_devices)
-            return
+        def start(client: AdbClient) -> None:
+            def worker() -> None:
+                try:
+                    result = self._read_devices_and_recover(client)
+                    self.result_queue.put(("ok", "设备监听", result, done))
+                except Exception as exc:  # noqa: BLE001 - listener must keep retrying.
+                    self.result_queue.put(("err", "设备监听", exc, self._finish_device_poll))
 
-        def worker() -> None:
-            try:
-                result = self._read_devices_and_recover(client)
-                self.result_queue.put(("ok", "设备监听", result, done))
-            except Exception as exc:  # noqa: BLE001 - listener should surface failures but keep retrying.
-                self.result_queue.put(("err", "设备监听", exc, self._finish_device_poll))
+            def done(payload: tuple[list[Device], MdnsRecoveryResult | None]) -> None:
+                if self.client is not client or self.mdns_stop.is_set():
+                    self._finish_device_poll()
+                    return
+                self._render_device_poll_result(payload)
 
-        def done(payload: tuple[list[Device], MdnsRecoveryResult | None]) -> None:
-            if self.client is not client or self.mdns_stop.is_set():
-                self._finish_device_poll()
-                return
-            self._render_device_poll_result(payload)
+            threading.Thread(target=worker, daemon=True).start()
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._prepare_client_async(start, self._finish_device_poll, label="设备监听")
         self.after(self.DEVICE_POLL_INTERVAL_MS, self._poll_devices)
 
     def _read_devices_and_recover(self, client: AdbClient) -> tuple[list[Device], MdnsRecoveryResult | None]:

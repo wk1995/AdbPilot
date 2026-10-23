@@ -236,6 +236,9 @@ class MdnsRecoveryController:
             # Exceptions may contain command output/instance names; do not display them.
             return result("restarted_unverified" if restarted else "restart_failed" if attempted else "probe_failed")
         finally:
+            if attempted:
+                # A slow start/verification must not consume the cooldown itself.
+                self.note_restart()
             if self.last_restart is not None and time.monotonic() - self.last_restart < self.config.restart_cooldown_seconds:
                 self.state = MdnsRecoveryState.COOLDOWN
             else:

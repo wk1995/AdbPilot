@@ -1,5 +1,5 @@
 {
-  "spec_version": "1.1",
+  "spec_version": "1.2",
   "id": "adb-mdns-auto-recovery",
   "title": "ADB mDNS 异常自动恢复状态机",
   "updated_at": "2026-10-23",
@@ -31,7 +31,7 @@
   },
   "context": {
     "last_probe": {"type": "monotonic_seconds_or_null", "initial": null},
-    "last_restart": {"type": "monotonic_seconds_or_null", "initial": null},
+    "last_restart": {"type": "monotonic_seconds_or_null", "initial": null, "description": "尝试开始时先标记，finally 更新为尝试结束时间，以保留完整冷却"},
     "attempted": {"type": "boolean", "initial": false, "reset": "each_call"},
     "restarted": {"type": "boolean", "initial": false, "reset": "each_call"},
     "adb_services_before": {"type": "MdnsService[]", "initial": [], "reset": "each_call"},
@@ -90,6 +90,7 @@
     "restart": "attempted = True; last_restart = monotonic_now(); emit redacted progress; kill-server(check=False, timeout=3); start-server(timeout=30); remain in restarting until startup returns successfully or fails",
     "verify": "restarted = True; wait confirm_delay_seconds; check cancellation; query ADB TLS services and raw devices with 3s timeouts",
     "note_manual_restart": "last_restart = monotonic_now(); state = cooldown",
+    "refresh_cooldown_after_attempt": "if attempted: last_restart = monotonic_now(); state = cooldown",
     "release_lock": "release controller lock acquired by this call"
   },
   "transitions": [
@@ -116,6 +117,7 @@
   ],
   "finalizer": {
     "applies_to": "every call that acquired the controller lock, including early returns and errors",
+    "before_state_actions": ["refresh_cooldown_after_attempt"],
     "ordered_state_rules": [
       {"when": "cooldown_active", "to": "cooldown"},
       {"when": "always", "to": "idle"}
@@ -136,23 +138,25 @@
     {"id": "kill_start_sequence", "rule": "A nonzero kill-server exit code does not prevent start-server; kill failure by exception/timeout ends this attempt. Cancellation is not checked between kill and start."},
     {"id": "independent_startup_budget", "rule": "Queries and kill-server retain 3s timeouts; start-server uses its independent fixed 30s budget. Startup taking more than 3s within that budget must not be killed or treated as failed. Do not derive this budget from the GUI query timeout."},
     {"id": "startup_outcome", "rule": "Only successful start-server completion sets restarted=true and enters verifying. Exceeding 30s returns restart_failed and leaves the attempt subject to cooldown; never immediately retry startup."},
-    {"id": "cooldown_after_attempt", "rule": "Record last_restart before kill; both successful and failed attempts remain subject to cooldown."},
+    {"id": "cooldown_after_attempt", "rule": "Mark last_restart before kill and refresh it in finally after the attempt ends. The full cooldown begins after completion/failure, never consumed by slow startup or verification."},
     {"id": "cancel_preserves_restart", "rule": "Cancellation after successful start preserves restarted=true and last_restart."},
     {"id": "conflict_is_advice", "rule": "A numeric instance suffix alone never triggers restart. Visible services produce advice rather than restart."},
     {"id": "serialize_gui_operations", "rule": "GUI polling/recovery, manual refresh and manual restart share adb_service_lock; control re-entry separately with a nonblocking controller lock."},
     {"id": "reject_stale_results", "rule": "Closing GUI or replacing its selected client cancels work at checked boundaries and prevents old poll results from being rendered."},
+    {"id": "async_client_discovery", "rule": "Polling, refresh and restart capture Tk parameters on the main thread, resolve ADB in a worker, then publish via the main-thread queue only if parameters remain current and GUI is open. Concurrent results for identical settings reuse the first published client."},
     {"id": "redact_diagnostics", "rule": "Recovery messages exclude raw instance names, GUIDs, full serials, passwords, pairing codes, QR payloads and Wi-Fi names."},
     {"id": "bounded_children", "rule": "Browse both TLS types concurrently under one deadline; terminate, escalate to kill when needed, reap processes and close pipes."},
     {"id": "connection_race_boundary", "rule": "The final empty device check reduces but cannot eliminate external device-arrival races before kill-server."}
   ],
   "tests": [
-    {"path": "../../tests/test_mdns_recovery.py", "covers": ["states", "transitions", "guards", "cooldown", "cancellation", "redaction", "reentry", "slow_startup", "startup_timeout"]},
+    {"path": "../../tests/test_mdns_recovery.py", "covers": ["states", "transitions", "guards", "cooldown", "cancellation", "redaction", "reentry", "slow_startup", "startup_timeout", "full_cooldown_after_slow_attempt"]},
     {"path": "../../tests/test_platform_adapter.py", "covers": ["system_discovery", "partial_failure", "timeout", "child_cleanup"]},
-    {"path": "../../tests/test_gui_helpers.py", "covers": ["queue_delivery", "serialization", "client_replacement", "shutdown", "manual_restart_cooldown"]}
+    {"path": "../../tests/test_gui_helpers.py", "covers": ["queue_delivery", "serialization", "client_replacement", "shutdown", "manual_restart_cooldown", "async_client_discovery", "stale_resolution", "resolution_failure"]}
   ],
   "regression_cases": [
     {"test": "test_slow_server_start_exceeds_probe_timeout_and_recovers", "scenario": "Real surrogate startup ACK arrives after 3.2s through AdbClient.run", "expected_result": "recovered", "expected_restarted": true, "expected_final_state": "cooldown"},
-    {"test": "test_start_timeout_remains_bounded_and_enters_cooldown", "scenario": "start-server exceeds its 30s budget", "expected_result": "restart_failed", "expected_restarted": false, "expected_final_state": "cooldown", "immediate_retry": false}
+    {"test": "test_start_timeout_remains_bounded_and_enters_cooldown", "scenario": "start-server exceeds its 30s budget", "expected_result": "restart_failed", "expected_restarted": false, "expected_final_state": "cooldown", "immediate_retry": false},
+    {"test": "test_slow_attempt_gets_full_cooldown_after_completion", "scenario": "31s startup with a configured 30s cooldown, whether successful, unverified or failed", "expected_final_state": "cooldown", "cooldown_after_completion_seconds": 30, "immediate_retry": false}
   ],
   "validation_command": "python -m unittest discover -s tests -v",
   "pending_validation": ["macOS physical-device fault reproduction", "Windows/Linux compatible dns-sd environments"]

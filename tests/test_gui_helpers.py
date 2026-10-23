@@ -157,11 +157,19 @@ class GuiHelperTests(unittest.TestCase):
         self.assertEqual(gui.mdns_recovery.state, MdnsRecoveryState.COOLDOWN)
 
     def make_mdns_gui(self, client):
-        return SimpleNamespace(
+        if client is not None:
+            client.adb_path = Path("/test/adb")
+            client.timeout = 30
+        gui = SimpleNamespace(
             adb_service_lock=threading.Lock(), client=client,
             mdns_recovery=MdnsRecoveryController(), mdns_adapter=Mock(),
             mdns_stop=threading.Event(), result_queue=queue.Queue(),
+            adb_path_var=FakeVar("/test/adb"), timeout_var=FakeVar("30"),
+            _int_value=lambda *_args, **_kwargs: 30, _remember_adb_path=Mock(),
         )
+        gui._client_settings = lambda: AdbPilotGui._client_settings(gui)
+        gui._prepare_client_async = lambda *args, **kwargs: AdbPilotGui._prepare_client_async(gui, *args, **kwargs)
+        return gui
 
     def test_background_poll_updates_devices_after_recovery_via_queue(self):
         phone = Device("example:5555", "device")
@@ -267,7 +275,7 @@ class GuiHelperTests(unittest.TestCase):
                 gui = self.make_mdns_gui(client)
                 gui.device_poll_running = False
                 gui.DEVICE_POLL_INTERVAL_MS = 3000
-                gui._get_client = Mock(return_value=client)
+                gui._get_client = Mock(side_effect=AssertionError("must not resolve on Tk thread"))
                 gui._read_devices_and_recover = Mock(return_value=([], MdnsRecoveryResult("no_system_evidence")))
                 gui._render_device_poll_result = Mock()
                 gui._finish_device_poll = Mock()
@@ -276,7 +284,7 @@ class GuiHelperTests(unittest.TestCase):
                 AdbPilotGui._poll_devices(gui)
                 kind, label, payload, callback = gui.result_queue.get(timeout=2)
                 self.assertEqual((kind, label), ("ok", "设备监听"))
-                gui._get_client.assert_called_once()
+                gui._get_client.assert_not_called()
                 gui._render_device_poll_result.assert_not_called()
                 if replace_client:
                     gui.client = Mock()
@@ -286,6 +294,93 @@ class GuiHelperTests(unittest.TestCase):
                     gui._finish_device_poll.assert_called_once()
                 else:
                     gui._render_device_poll_result.assert_called_once_with(payload)
+
+    def test_slow_client_discovery_does_not_block_ui_entry_points(self):
+        main_thread = threading.get_ident()
+        for entry in ("_poll_devices", "refresh_devices", "restart_server"):
+            with self.subTest(entry=entry):
+                entered = threading.Event()
+                finish = threading.Event()
+                gui = self.make_mdns_gui(None)
+                gui.device_poll_running = False
+                gui.DEVICE_POLL_INTERVAL_MS = 3000
+                gui.after = Mock()
+                gui._poll_devices = Mock()
+                gui._finish_device_poll = Mock()
+                gui._run_async = Mock()
+                gui._read_devices_and_recover = Mock(return_value=([], None))
+                gui._render_device_poll_result = Mock()
+                client = Mock(adb_path=Path("/test/adb"), timeout=30)
+
+                def settings():
+                    self.assertEqual(threading.get_ident(), main_thread)
+                    return AdbPilotGui._client_settings(gui)
+
+                def discover(**_kwargs):
+                    self.assertNotEqual(threading.get_ident(), main_thread)
+                    entered.set()
+                    if not finish.wait(2):
+                        raise RuntimeError("UI did not return while discovery was blocked")
+                    return client
+
+                gui._client_settings = settings
+                with patch("adbpilot.gui.AdbClient", side_effect=discover):
+                    try:
+                        getattr(AdbPilotGui, entry)(gui)
+                        self.assertTrue(entered.wait(1))
+                        self.assertIsNone(gui.client)
+                        gui._run_async.assert_not_called()
+                    finally:
+                        finish.set()
+                    kind, _label, resolved, publish = gui.result_queue.get(timeout=2)
+                self.assertEqual(kind, "ok")
+                self.assertIs(resolved, client)
+                publish(resolved)
+                self.assertIs(gui.client, client)
+                gui._remember_adb_path.assert_called_once_with("/test/adb")
+                if entry == "_poll_devices":
+                    kind, _label, _payload, _callback = gui.result_queue.get(timeout=2)
+                    self.assertEqual(kind, "ok")
+                else:
+                    gui._run_async.assert_called_once()
+
+    def test_client_discovery_discards_result_after_settings_change_or_close(self):
+        for change in ("path", "timeout", "close"):
+            with self.subTest(change=change):
+                gui = self.make_mdns_gui(None)
+                ready, failed = Mock(), Mock()
+                client = Mock(adb_path=Path("/test/adb"), timeout=30)
+                with patch("adbpilot.gui.AdbClient", return_value=client):
+                    gui._prepare_client_async(ready, failed, label="设备监听")
+                    kind, _label, result, publish = gui.result_queue.get(timeout=2)
+                self.assertEqual(kind, "ok")
+                if change == "path":
+                    gui.adb_path_var.set("/other/adb")
+                elif change == "timeout":
+                    gui._int_value = lambda *_args, **_kwargs: 60
+                else:
+                    gui.mdns_stop.set()
+                publish(result)
+                ready.assert_not_called()
+                failed.assert_called_once_with(None)
+                self.assertIsNone(gui.client)
+                gui._remember_adb_path.assert_not_called()
+
+    def test_client_discovery_failure_allows_later_device_poll(self):
+        gui = self.make_mdns_gui(None)
+        gui.device_poll_running = False
+        gui.DEVICE_POLL_INTERVAL_MS = 3000
+        gui._poll_devices = Mock()
+        gui.after = Mock()
+        gui._finish_device_poll = lambda error: AdbPilotGui._finish_device_poll(gui, error)
+        with patch("adbpilot.gui.AdbClient", side_effect=RuntimeError("not found")):
+            AdbPilotGui._poll_devices(gui)
+            kind, _label, error, failed = gui.result_queue.get(timeout=2)
+        self.assertEqual(kind, "err")
+        self.assertTrue(gui.device_poll_running)
+        failed(error)
+        self.assertFalse(gui.device_poll_running)
+        gui.after.assert_called_once()
 
     def test_close_cancels_discovery_before_destroying_gui(self):
         gui = SimpleNamespace(

@@ -285,6 +285,36 @@ class MdnsRecoveryTests(unittest.TestCase):
         self.assertEqual(self.recover().status, "cooldown")
         self.assertEqual(self.client.run.call_count, calls)
 
+    def test_slow_attempt_gets_full_cooldown_after_completion(self):
+        for outcome in ("recovered", "restarted_unverified", "restart_failed"):
+            with self.subTest(outcome=outcome):
+                self.now = 100.0
+                self.controller = MdnsRecoveryController(MdnsRecoveryConfig(restart_cooldown_seconds=30))
+                self.client.mdns_recovery = self.controller
+                self.device_outputs = ["", "", ""]
+                self.mdns_outputs = [EMPTY, EMPTY, CONNECT if outcome == "recovered" else EMPTY]
+
+                def run(args, **kwargs):
+                    if args == ["start-server"]:
+                        self.now += 31
+                        if outcome == "restart_failed":
+                            raise subprocess.TimeoutExpired("adb", 30)
+                    return self.command(args, **kwargs)
+
+                self.client.run.side_effect = run
+                self.assertEqual(self.recover().status, outcome)
+                self.assertEqual(self.controller.state, MdnsRecoveryState.COOLDOWN)
+                self.assertEqual(self.controller.last_restart, 131)
+                calls = self.client.run.call_count
+                self.assertEqual(self.recover().status, "cooldown")
+                self.now += 29.9
+                self.assertEqual(self.recover().status, "cooldown")
+                self.assertEqual(self.client.run.call_count, calls)
+                self.now += 0.1
+                self.device_outputs = [""]
+                self.mdns_outputs = [CONNECT]
+                self.assertEqual(self.recover().status, "not_needed")
+
     def test_pre_restart_timeout_never_restarts(self):
         self.client.run.side_effect = subprocess.TimeoutExpired("private-guid", 3, "password")
         result = self.recover()
