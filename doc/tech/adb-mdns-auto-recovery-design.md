@@ -1,7 +1,7 @@
 # ADB mDNS 异常自动恢复技术方案
 
-- 状态：已实现，真机故障复现验证待执行
-- 初稿：2026-08-14；实现修订：2026-10-22
+- 状态：已实现；已复现启动超时，修复后的真机验收待执行
+- 初稿：2026-08-14；实现修订：2026-10-23
 - 适用项目：AdbPilot GUI；CLI / AI CLI 保持现有行为
 - AI 状态机规范：[adb-mdns-auto-recovery-state-machine.json](adb-mdns-auto-recovery-state-machine.json)（状态、条件、转移、动作与不变量）
 - 关联故障记录：[Android 无线调试一直显示“正在配对设备”](../../docs/troubleshooting/android-wireless-debugging-pairing-stuck.md)
@@ -99,11 +99,23 @@ start-server（必须成功）
 无论结果如何，重启尝试后都进入冷却
 ```
 
-恢复专用 ADB 查询、kill/start 单命令超时均为 3 秒；不修改原有手动 mDNS 查询的超时。设备保护查询读取原始 transport 列表，不触发去重过程中的额外 `getprop` 查询。
+恢复命令按阶段设置独立的固定预算，不复用 GUI 的普通命令超时，也不修改原有手动 mDNS 查询的超时：
+
+| 阶段 | 单命令超时 | 超时结果 |
+| --- | --- | --- |
+| `server-status`、`devices -l`、`mdns services` 查询 | 3 秒 | 重启前返回 `probe_failed`；重启完成后的验证查询返回 `restarted_unverified` |
+| `kill-server` | 3 秒 | `restart_failed`，进入冷却，不执行启动 |
+| `start-server` | 30 秒 | `restart_failed`，进入冷却，不立即重试 |
+
+启动预算由 `ADB_SERVER_START_TIMEOUT_SECONDS` 单独定义。启动可能在 mDNS/TLS 初始化后才返回 ACK；2026-10-23 的真机日志显示，原 3 秒预算使启动客户端超时被终止，Server 随后写 ACK 报 `Broken pipe` 并退出，后续设备轮询又拉起了新的 Server。设备最终上线不能替代本轮恢复成功的判定。
+
+`start-server` 在 30 秒内成功返回后，才设置 `restarted=True`、进入 `verifying` 并查询服务和设备；超过 3 秒但未超过启动预算的正常启动不再被判为失败。超过独立启动预算仍按真实失败处理，保持有界执行和冷却保护。
+
+设备保护查询读取原始 transport 列表，不触发去重过程中的额外 `getprop` 查询。
 
 自动恢复只重启当前客户端所连接的服务，不调用手动 `restart_server()` 中清理其他端口 ADB 的逻辑。`kill-server` 非零退出不阻止启动；命令异常或超时返回受控失败并冷却。
 
-取消在关键步骤边界检查，正在执行的 ADB 命令最多等本条超时。一旦进入 kill/start，不在两者之间中断启动，避免退出后只剩停止的服务。已完成重启后即使取消也保留 `restarted=True` 与冷却。
+取消在关键步骤边界检查，正在执行的 ADB 命令最多等本条超时，启动阶段最长等待 30 秒。一旦进入 kill/start，不在两者之间中断启动，避免退出后只剩停止的服务。已完成重启后即使取消也保留 `restarted=True` 与冷却。
 
 ## 6. 结果、隐私与可观测性
 
@@ -182,6 +194,8 @@ python -m unittest discover -s tests -v
 ```
 
 自动化测试不操作用户正在运行的 ADB Server，也不要求连接真实手机。真实替代进程仅模拟持续输出的浏览器，用于验证 OS 级 terminate、回收和管道关闭。
+
+启动超时回归测试另用真实 Python 子进程模拟延迟 3.2 秒的启动 ACK，并经由 `AdbClient.run()` 执行：旧版 3 秒预算下该测试失败，修复后必须完成启动、进入验证并返回 `recovered`。另一个测试模拟超过 30 秒启动预算的异常，确认返回 `restart_failed`、保留冷却且不立即重试。原有恢复测试同时检查普通查询和 `kill-server` 仍使用 3 秒预算。
 
 以下真机/平台验收仍需执行，不能用单元测试代替：
 

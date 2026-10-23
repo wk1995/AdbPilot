@@ -20,6 +20,9 @@ if TYPE_CHECKING:
 
 
 TLS_SERVICE_TYPES = ("_adb-tls-pairing._tcp", "_adb-tls-connect._tcp")
+# Server startup can wait for discovery/TLS initialization before sending its ACK.
+# Killing its client at the short query deadline can break the server's ACK pipe.
+ADB_SERVER_START_TIMEOUT_SECONDS = 30
 
 
 class MdnsRecoveryState(str, Enum):
@@ -218,7 +221,7 @@ class MdnsRecoveryController:
             transition(MdnsRecoveryState.RESTARTING, "ADB mDNS 状态持续异常，正在自动重启 ADB Server…")
             # Unlike the manual action, never stop competing servers on other ports.
             client.run(["kill-server"], check=False, timeout=3)
-            client.run(["start-server"], timeout=3)
+            client.run(["start-server"], timeout=ADB_SERVER_START_TIMEOUT_SECONDS)
             restarted = True
             transition(MdnsRecoveryState.VERIFYING)
             time.sleep(self.config.confirm_delay_seconds)

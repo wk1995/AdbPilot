@@ -1,8 +1,8 @@
 {
-  "spec_version": "1.0",
+  "spec_version": "1.1",
   "id": "adb-mdns-auto-recovery",
   "title": "ADB mDNS 异常自动恢复状态机",
-  "updated_at": "2026-10-22",
+  "updated_at": "2026-10-23",
   "implementation_status": "implemented_pending_device_validation",
   "technical_design": "adb-mdns-auto-recovery-design.md",
   "implementation": {
@@ -25,7 +25,7 @@
     "idle": {"description": "等待探测；本轮准入检查及最初的设备查询也在此状态完成"},
     "probing": {"description": "检查 ADB 能力及 ADB/系统 mDNS 可见性"},
     "confirming": {"description": "等待确认间隔，再查 ADB 服务并复查设备、取消条件"},
-    "restarting": {"description": "执行当前 ADB Server 的 kill/start"},
+    "restarting": {"description": "执行当前 ADB Server 的 kill/start，停止预算 3 秒，启动独立等待最多 30 秒"},
     "verifying": {"description": "稳定等待后查询恢复结果"},
     "cooldown": {"description": "重启尝试后的保护期，不执行自动恢复探测"}
   },
@@ -45,7 +45,9 @@
     "restart_cooldown_seconds": {"default": 60, "minimum": 30, "maximum": 86400},
     "system_browse_timeout_seconds": {"default": 1.2, "minimum": 0.1, "maximum": 5},
     "confirm_delay_seconds": {"default": 0.3, "minimum": 0.1, "maximum": 2},
-    "adb_command_timeout_seconds": {"fixed": 3}
+    "adb_query_timeout_seconds": {"fixed": 3},
+    "adb_server_stop_timeout_seconds": {"fixed": 3},
+    "adb_server_start_timeout_seconds": {"fixed": 30, "implementation_constant": "ADB_SERVER_START_TIMEOUT_SECONDS"}
   },
   "guards": {
     "cancelled": "application_closed or selected_client_replaced or caller_cancelled",
@@ -85,7 +87,7 @@
     "record_probe_and_read_devices": "last_probe = monotonic_now(); read raw adb devices with 3s timeout",
     "probe": "check server-status; query ADB TLS services; if empty and not cancelled, browse both system TLS types concurrently",
     "confirm": "emit redacted progress; wait confirm_delay_seconds; check cancellation; query ADB TLS services again; if still empty, re-read raw devices and check cancellation",
-    "restart": "attempted = True; last_restart = monotonic_now(); emit redacted progress; kill-server(check=False, timeout=3); start-server(timeout=3)",
+    "restart": "attempted = True; last_restart = monotonic_now(); emit redacted progress; kill-server(check=False, timeout=3); start-server(timeout=30); remain in restarting until startup returns successfully or fails",
     "verify": "restarted = True; wait confirm_delay_seconds; check cancellation; query ADB TLS services and raw devices with 3s timeouts",
     "note_manual_restart": "last_restart = monotonic_now(); state = cooldown",
     "release_lock": "release controller lock acquired by this call"
@@ -132,6 +134,8 @@
     {"id": "errors_are_not_empty_snapshots", "rule": "Query failure, timeout and malformed output must never serve as empty-list evidence."},
     {"id": "restart_current_server_only", "rule": "Automatic recovery must not call the manual restart path that stops competing servers on other ports."},
     {"id": "kill_start_sequence", "rule": "A nonzero kill-server exit code does not prevent start-server; kill failure by exception/timeout ends this attempt. Cancellation is not checked between kill and start."},
+    {"id": "independent_startup_budget", "rule": "Queries and kill-server retain 3s timeouts; start-server uses its independent fixed 30s budget. Startup taking more than 3s within that budget must not be killed or treated as failed. Do not derive this budget from the GUI query timeout."},
+    {"id": "startup_outcome", "rule": "Only successful start-server completion sets restarted=true and enters verifying. Exceeding 30s returns restart_failed and leaves the attempt subject to cooldown; never immediately retry startup."},
     {"id": "cooldown_after_attempt", "rule": "Record last_restart before kill; both successful and failed attempts remain subject to cooldown."},
     {"id": "cancel_preserves_restart", "rule": "Cancellation after successful start preserves restarted=true and last_restart."},
     {"id": "conflict_is_advice", "rule": "A numeric instance suffix alone never triggers restart. Visible services produce advice rather than restart."},
@@ -142,9 +146,13 @@
     {"id": "connection_race_boundary", "rule": "The final empty device check reduces but cannot eliminate external device-arrival races before kill-server."}
   ],
   "tests": [
-    {"path": "../../tests/test_mdns_recovery.py", "covers": ["states", "transitions", "guards", "cooldown", "cancellation", "redaction", "reentry"]},
+    {"path": "../../tests/test_mdns_recovery.py", "covers": ["states", "transitions", "guards", "cooldown", "cancellation", "redaction", "reentry", "slow_startup", "startup_timeout"]},
     {"path": "../../tests/test_platform_adapter.py", "covers": ["system_discovery", "partial_failure", "timeout", "child_cleanup"]},
     {"path": "../../tests/test_gui_helpers.py", "covers": ["queue_delivery", "serialization", "client_replacement", "shutdown", "manual_restart_cooldown"]}
+  ],
+  "regression_cases": [
+    {"test": "test_slow_server_start_exceeds_probe_timeout_and_recovers", "scenario": "Real surrogate startup ACK arrives after 3.2s through AdbClient.run", "expected_result": "recovered", "expected_restarted": true, "expected_final_state": "cooldown"},
+    {"test": "test_start_timeout_remains_bounded_and_enters_cooldown", "scenario": "start-server exceeds its 30s budget", "expected_result": "restart_failed", "expected_restarted": false, "expected_final_state": "cooldown", "immediate_retry": false}
   ],
   "validation_command": "python -m unittest discover -s tests -v",
   "pending_validation": ["macOS physical-device fault reproduction", "Windows/Linux compatible dns-sd environments"]

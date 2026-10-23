@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import threading
 import unittest
 from pathlib import Path
@@ -99,7 +100,7 @@ class MdnsRecoveryTests(unittest.TestCase):
 
     def command(self, args, **kwargs):
         self.commands.append((tuple(args), self.controller.state))
-        self.assertEqual(kwargs.get("timeout"), 3)
+        self.assertEqual(kwargs.get("timeout"), 30 if args == ["start-server"] else 3)
         if args == ["server-status"]:
             stdout = self.server_status
         elif args == ["mdns", "services"]:
@@ -248,6 +249,41 @@ class MdnsRecoveryTests(unittest.TestCase):
         self.assertEqual(self.controller.state, MdnsRecoveryState.COOLDOWN)
         self.assertNotIn("secret", repr(result) + result.message)
         self.assertEqual(self.recover().status, "cooldown")
+
+    def test_slow_server_start_exceeds_probe_timeout_and_recovers(self):
+        # Exercise the real command runner with a delayed startup ACK. A 3s
+        # startup budget kills this child, just as it killed the ADB client.
+        script = "import time; time.sleep(3.2); print('startup ACK', flush=True)"
+
+        def run(args, **kwargs):
+            if args == ["start-server"]:
+                with patch.object(self.client, "_build_command", return_value=[sys.executable, "-c", script]):
+                    return AdbClient.run(self.client, args, **kwargs)
+            return self.command(args, **kwargs)
+
+        self.client.run.side_effect = run
+        result = self.recover()
+        self.assertEqual(result.status, "recovered")
+        self.assertTrue(result.restarted)
+        self.assertEqual(result.adb_services_after[0].service_type, "_adb-tls-connect._tcp")
+        self.assertEqual(self.controller.state, MdnsRecoveryState.COOLDOWN)
+
+    def test_start_timeout_remains_bounded_and_enters_cooldown(self):
+        def run(args, **kwargs):
+            if args == ["start-server"]:
+                self.assertEqual(kwargs["timeout"], 30)
+                raise subprocess.TimeoutExpired("private-guid", kwargs["timeout"], "password")
+            return self.command(args, **kwargs)
+
+        self.client.run.side_effect = run
+        result = self.recover()
+        self.assertEqual(result.status, "restart_failed")
+        self.assertFalse(result.restarted)
+        self.assertEqual(self.controller.state, MdnsRecoveryState.COOLDOWN)
+        self.assertNotIn("password", repr(result) + result.message)
+        calls = self.client.run.call_count
+        self.assertEqual(self.recover().status, "cooldown")
+        self.assertEqual(self.client.run.call_count, calls)
 
     def test_pre_restart_timeout_never_restarts(self):
         self.client.run.side_effect = subprocess.TimeoutExpired("private-guid", 3, "password")
