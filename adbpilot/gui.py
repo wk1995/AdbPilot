@@ -1835,7 +1835,8 @@ class AdbPilotGui(BaseTk):
             result = client.recover_stale_mdns(
                 controller=self.mdns_recovery,
                 adapter=self.mdns_adapter,
-                cancelled=lambda: self.mdns_stop.is_set() or self.client is not client,
+                cancelled=lambda: (self.mdns_stop.is_set() or self.client is not client
+                                   or self.mdns_manual_restart_running),
                 progress=lambda message: self.result_queue.put(("progress", "mDNS 自动恢复", message, None)),
             )
             if result.restarted or result.devices_after:

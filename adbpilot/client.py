@@ -714,12 +714,19 @@ class AdbClient:
         def is_cancelled() -> bool:
             return cancelled is not None and cancelled()
 
+        def check_cancelled() -> None:
+            if is_cancelled():
+                report("扫码配对：退出扫码匹配状态（已取消）")
+                raise DeviceSelectionError("扫码配对已取消")
+
         report("扫码配对：进入等待扫码状态")
+        check_cancelled()
         try:
             initial_services = parse_mdns_services(self.mdns_services())
         except Exception:
             report("扫码配对：退出扫码匹配状态（异常）")
             raise
+        check_cancelled()
         known_connect_addresses = {
             service["address"]
             for service in initial_services
@@ -736,10 +743,9 @@ class AdbClient:
         post_pair_deadline: float | None = None
 
         while time.monotonic() < deadline:
-            if is_cancelled():
-                report("扫码配对：退出扫码匹配状态（已取消）")
-                raise DeviceSelectionError("扫码配对已取消")
+            check_cancelled()
             last_services = self.mdns_services()
+            check_cancelled()
             services = parse_mdns_services(last_services)
 
             pairing_service = find_mdns_service(
@@ -762,6 +768,7 @@ class AdbClient:
                 except Exception:
                     report("扫码配对：退出扫码匹配状态（异常）")
                     raise
+                check_cancelled()
                 report(f"扫码配对：adb pair 完成{f'：{pairing_output}' if pairing_output else ''}")
                 post_pair_deadline = min(deadline, time.monotonic() + 45)
 
@@ -782,6 +789,7 @@ class AdbClient:
                     break
             time.sleep(1)
 
+        check_cancelled()
         if not discovered:
             detail = last_services.strip() or "<empty>"
             message = (
@@ -801,14 +809,17 @@ class AdbClient:
         outputs: list[str] = []
         failures: list[str] = []
         for service in discovered.values():
+            check_cancelled()
             address = service["address"]
             report(f"扫码配对：正在连接 {address}")
             try:
                 connect_output = self.connect(address)
             except AdbCommandError as exc:
+                check_cancelled()
                 failures.append(f"{address}: {exc}")
                 report(f"扫码配对：连接失败 {address}")
                 continue
+            check_cancelled()
             outputs.append(f"{address}: {connect_output}" if connect_output else address)
             report(f"扫码配对：连接完成 {address}")
 

@@ -1,5 +1,5 @@
 {
-  "spec_version": "1.3",
+  "spec_version": "1.4",
   "id": "adb-mdns-auto-recovery",
   "title": "ADB mDNS 异常自动恢复状态机",
   "updated_at": "2026-10-23",
@@ -50,7 +50,7 @@
     "adb_server_start_timeout_seconds": {"fixed": 30, "implementation_constant": "ADB_SERVER_START_TIMEOUT_SECONDS"}
   },
   "guards": {
-    "cancelled": "application_closed or selected_client_replaced or caller_cancelled",
+    "cancelled": "application_closed or selected_client_replaced or caller_cancelled or gui_manual_recovery_busy",
     "disabled": "not config.enabled",
     "cooldown_active": "last_restart is not None and now - last_restart < config.restart_cooldown_seconds",
     "interval_pending": "last_probe is not None and now - last_probe < config.probe_interval_seconds",
@@ -167,7 +167,7 @@
     "transitions": [
       {"from": ["ready"], "event": "requested", "to": "confirming", "action": "Explain interruption of current USB/Wi-Fi sessions and invalidation of the old QR; ask for confirmation."},
       {"from": ["confirming"], "event": "declined", "to": "ready", "action": "No ADB command, QR cancellation or cooldown side effect."},
-      {"from": ["confirming"], "event": "confirmed", "to": "preparing_client", "action": "Cancel old QR, increment session generation, cover QR, set busy and disable both action buttons and new pairing; resolve client asynchronously."},
+      {"from": ["confirming"], "event": "confirmed", "to": "preparing_client", "action": "Cancel old QR, increment session generation, cover QR, set busy and disable both action buttons and new pairing; busy also cancels an in-flight automatic probe at its next checked boundary. Resolve client asynchronously."},
       {"from": ["preparing_client"], "event": "client_ready", "to": "waiting_qr", "action": "Wait for all captured unfinished QR worker completion events, including earlier QR generations, under one shared 30s deadline in the background."},
       {"from": ["preparing_client"], "event": "preparation_failed", "to": "ready", "action": "Clear busy and re-enable buttons; no restart or cooldown."},
       {"from": ["waiting_qr"], "event": "qr_timeout", "to": "ready", "action": "Report unfinished QR task; no ADB command or cooldown; re-enable buttons."},
@@ -186,6 +186,8 @@
       "Repeated clicks while busy do not show another dialog or issue another command.",
       "A modal QR dialog exposes the same notice/action as the main wireless panel.",
       "All old QR commands across QR generations must finish before kill/start; old callbacks are rejected by session generation.",
+      "QR cancellation is checked before/after initial discovery, after each discovery or pairing operation, and before/after each connection operation; a cancelled session must not start a follow-up pair/connect operation or report success.",
+      "Manual busy cancels an automatic probe already in progress before it can restart; if automatic kill/start has begun, finish both commands and preserve restarted/cooldown before releasing the shared service lock.",
       "A new QR/pair/connect operation and automatic recovery must not start while manual recovery is busy.",
       "The new manual action never stops competing ADB servers on other ports.",
       "checked means redetection finished, not that QR pairing succeeded."
@@ -195,7 +197,7 @@
     {"path": "../../tests/test_mdns_recovery.py", "covers": ["states", "transitions", "guards", "cooldown", "cancellation", "redaction", "reentry", "slow_startup", "startup_timeout", "full_cooldown_after_slow_attempt"]},
     {"path": "../../tests/test_platform_adapter.py", "covers": ["system_discovery", "partial_failure", "timeout", "child_cleanup"]},
     {"path": "../../tests/test_gui_helpers.py", "covers": ["queue_delivery", "serialization", "client_replacement", "shutdown", "manual_restart_cooldown", "async_client_discovery", "stale_resolution", "resolution_failure"]},
-    {"path": "../../tests/test_mdns_manual_recovery.py", "covers": ["protected_notice", "shared_modal_controls", "confirmation_cancel", "confirmed_manual_restart", "duplicate_request", "qr_completion_wait", "server_lock", "partial_verification", "unknown_snapshot", "cooldown", "stale_result", "manual_when_auto_disabled", "current_server_only"]}
+    {"path": "../../tests/test_mdns_manual_recovery.py", "covers": ["protected_notice", "shared_modal_controls", "confirmation_cancel", "confirmed_manual_restart", "duplicate_request", "qr_completion_wait", "inflight_auto_probe_takeover", "finish_inflight_kill_start", "qr_command_boundary_cancellation", "server_lock", "partial_verification", "unknown_snapshot", "cooldown", "stale_result", "manual_when_auto_disabled", "current_server_only"]}
   ],
   "regression_cases": [
     {"test": "test_slow_server_start_exceeds_probe_timeout_and_recovers", "scenario": "Real surrogate startup ACK arrives after 3.2s through AdbClient.run", "expected_result": "recovered", "expected_restarted": true, "expected_final_state": "cooldown"},
