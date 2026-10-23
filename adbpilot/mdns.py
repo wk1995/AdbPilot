@@ -104,6 +104,16 @@ class MdnsRecoveryResult:
         return RECOVERY_MESSAGES.get(self.status, "")
 
 
+@dataclass(frozen=True)
+class MdnsRedetectionResult:
+    """Manual restart outcome; None distinguishes unknown from an empty snapshot."""
+
+    status: str
+    restarted: bool = False
+    devices: tuple[Device, ...] | None = None
+    services: tuple[MdnsService, ...] | None = None
+
+
 def has_name_conflict(name: str) -> bool:
     return re.search(r"\((?:[2-9]|[1-9]\d+)\)$", name.strip()) is not None
 

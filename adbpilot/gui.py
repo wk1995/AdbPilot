@@ -25,7 +25,7 @@ from .history import load_devices, log_path, recent_events
 from .models import Device, RunningProcess
 from .packages import DependencyRequest, install_dependency
 from .platform_adapter import PlatformAdapter
-from .mdns import MdnsRecoveryConfig, MdnsRecoveryController, MdnsRecoveryResult
+from .mdns import MdnsRecoveryConfig, MdnsRecoveryController, MdnsRecoveryResult, MdnsRedetectionResult
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -236,12 +236,17 @@ class AdbPilotGui(BaseTk):
         self.qr_pair_status_var = tk.StringVar(value="等待手机扫描")
         self.qr_pair_session = 0
         self.qr_pair_cancel_event: threading.Event | None = None
+        self.qr_pair_worker_done: threading.Event | None = None
         self.macos_floating_process: subprocess.Popen[str] | None = None
         self.gui_config = load_gui_config()
         self.mdns_recovery = MdnsRecoveryController(MdnsRecoveryConfig.from_gui_config(self.gui_config))
         self.mdns_adapter = PlatformAdapter()
         self.mdns_stop = threading.Event()
         self.mdns_last_status = ""
+        self.mdns_recovery_notice_var = tk.StringVar(value="无设备记录时，将按条件自动检测无线调试服务。")
+        self.mdns_recovery_blocked = False
+        self.mdns_manual_restart_running = False
+        self.mdns_restart_buttons: list[ttk.Button] = []
         self.locked_serial_var = tk.StringVar()
         self.lock_status_var = tk.StringVar(value="未锁定")
         self.result_queue: queue.Queue[tuple[str, str, Any, ResultCallback | None]] = queue.Queue()
@@ -426,6 +431,7 @@ class AdbPilotGui(BaseTk):
         self.pairing_in_progress = False
         ttk.Label(wireless, textvariable=self.capability_status_var, wraplength=300).pack(fill=tk.X, padx=6, pady=(6, 0))
         ttk.Button(wireless, text="检查能力", command=self.check_wifi_capabilities, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(4, 6))
+        self._build_mdns_recovery_controls(wireless)
         ttk.Label(wireless, text="配对地址").pack(anchor=tk.W, padx=6, pady=(6, 0))
         ttk.Entry(wireless, textvariable=self.pair_addr_var, width=28).pack(fill=tk.X, padx=6, pady=(0, 4))
         ttk.Label(wireless, text="配对码").pack(anchor=tk.W, padx=6, pady=(2, 0))
@@ -433,7 +439,8 @@ class AdbPilotGui(BaseTk):
         self.pair_code_entry.pack(fill=tk.X, padx=6, pady=(0, 4))
         self.pair_button = ttk.Button(wireless, text="配对", command=self.pair_device, style="Quiet.TButton")
         self.pair_button.pack(fill=tk.X, padx=6, pady=(2, 6))
-        ttk.Button(wireless, text="扫码配对", command=self.qr_pair_device, style="Primary.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
+        self.qr_pair_button = ttk.Button(wireless, text="扫码配对", command=self.qr_pair_device, style="Primary.TButton")
+        self.qr_pair_button.pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Button(wireless, text="连接已配对", command=self.connect_paired_device, style="Quiet.TButton").pack(fill=tk.X, padx=6, pady=(0, 6))
         ttk.Label(wireless, text="连接地址").pack(anchor=tk.W, padx=6, pady=(2, 0))
         self.connect_addr_entry = ttk.Entry(wireless, textvariable=self.connect_addr_var, width=28)
@@ -1634,6 +1641,119 @@ class AdbPilotGui(BaseTk):
     def show_version(self) -> None:
         self._run_async("检测 ADB 版本", lambda: self._get_client().version())
 
+    def _build_mdns_recovery_controls(self, parent: tk.Misc) -> None:
+        ttk.Label(parent, textvariable=self.mdns_recovery_notice_var, wraplength=300,
+                  style="Muted.TLabel").pack(fill=tk.X, padx=6, pady=(0, 6))
+        button = ttk.Button(parent, text="重启 ADB 并重新检测", command=self.restart_adb_and_redetect,
+                            style="Quiet.TButton",
+                            state=tk.DISABLED if self.mdns_manual_restart_running else tk.NORMAL)
+        button.pack(fill=tk.X, padx=6, pady=(0, 8))
+        self.mdns_restart_buttons = [b for b in self.mdns_restart_buttons if b.winfo_exists()]
+        self.mdns_restart_buttons.append(button)
+
+    def _update_mdns_recovery_notice(self, devices: list[Device]) -> None:
+        blocked = bool(devices) and self.mdns_recovery.config.enabled
+        if not self.mdns_recovery.config.enabled:
+            message = "自动恢复已关闭，仍可手动重启 ADB 并重新检测。"
+        elif blocked:
+            message = (f"已有 {len(devices)} 条设备记录，已跳过自动恢复，避免中断 USB/Wi-Fi 会话。"
+                       "离线/未授权记录也受保护；另一台手机配对卡住时，可手动重启并重新检测。")
+        else:
+            message = "无设备记录时，将按条件自动检测无线调试服务。"
+        self.mdns_recovery_notice_var.set(message)
+        if blocked and not self.mdns_recovery_blocked:
+            self._append_output(message + "\n")
+        self.mdns_recovery_blocked = blocked
+
+    def _set_mdns_manual_restart_running(self, running: bool) -> None:
+        self.mdns_manual_restart_running = running
+        buttons = list(self.mdns_restart_buttons)
+        for name in ("qr_pair_button", "qr_pair_restart_button", "pair_button", "connect_button", "disconnect_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                buttons.append(button)
+        for button in buttons:
+            if button.winfo_exists():
+                button.configure(state=tk.DISABLED if running else tk.NORMAL)
+
+    def _set_mdns_manual_status(self, message: str) -> None:
+        self.wireless_status_var.set(message)
+        if self.qr_pair_window is not None and self.qr_pair_window.winfo_exists():
+            self.qr_pair_status_var.set(message)
+
+    def restart_adb_and_redetect(self) -> None:
+        if self.mdns_manual_restart_running:
+            return
+        if self.pairing_in_progress or self.wireless_busy:
+            self._set_mdns_manual_status("请等待当前配对或连接操作结束，再重启 ADB。")
+            return
+        window = self.qr_pair_window
+        parent = window if window is not None and window.winfo_exists() else self
+        if not messagebox.askyesno(
+            "重启 ADB 并重新检测",
+            "重启当前 ADB 服务会中断已有 USB/Wi-Fi 调试、安装或传输会话。"
+            "当前扫码任务将取消，完成后请重新生成二维码。是否继续？",
+            parent=parent, default=messagebox.NO,
+        ):
+            return
+        qr_done = self.qr_pair_worker_done
+        if self.qr_pair_cancel_event is not None:
+            self.qr_pair_cancel_event.set()
+            self.qr_pair_session += 1
+            self._finish_qr_pairing("旧二维码已取消，重启检测完成后请重新生成。")
+        self._set_mdns_manual_restart_running(True)
+        self._set_mdns_manual_status("正在等待旧扫码任务结束并重启 ADB…")
+
+        def failed(_exc: Exception | None) -> None:
+            self._set_mdns_manual_restart_running(False)
+            self._set_mdns_manual_status("重启检测未完成，请稍后重试。")
+
+        def ready(client: AdbClient) -> None:
+            def done(result: MdnsRedetectionResult) -> None:
+                self._set_mdns_manual_restart_running(False)
+                if self.mdns_stop.is_set() or self.client is not client:
+                    return
+                if result.devices is not None:
+                    self._render_devices(list(result.devices), mark_disconnected=True, noisy=True)
+                if result.status == "checked":
+                    message = (f"ADB 已重启并重新检测：{len(result.devices or ())} 台设备，"
+                               f"{len(result.services or ())} 个无线调试服务。若仍需配对，请重新生成二维码。")
+                elif result.status == "verification_failed":
+                    message = "ADB 已重启，但重新检测未完成；请稍后刷新设备或重新检查无线服务。"
+                elif result.status == "cancelled":
+                    message = "重启检测已取消，ADB 设置已变化或窗口已关闭。"
+                else:
+                    message = "ADB 重启失败，请检查 ADB 环境后重试。"
+                self._set_mdns_manual_status(message)
+                self._append_output(message + "\n")
+
+            self._run_async("重启 ADB 并重新检测", lambda: self._restart_and_redetect(client, qr_done), done, failed)
+
+        self._prepare_client_async(ready, failed, label="重启 ADB 并重新检测")
+
+    def _restart_and_redetect(
+        self, client: AdbClient, qr_done: threading.Event | None,
+    ) -> MdnsRedetectionResult:
+        if qr_done is not None and not qr_done.wait(30):
+            raise AdbPilotError("旧扫码任务尚未结束，请稍后再重启。")
+        with self.adb_service_lock:
+            if self.mdns_stop.is_set() or self.client is not client:
+                return MdnsRedetectionResult("cancelled")
+            restarted = False
+            devices = None
+            services = None
+            try:
+                client.restart_current_server()
+                restarted = True
+                devices = client.mdns_recovery_devices()
+                services = client.mdns_recovery_services()
+                return MdnsRedetectionResult("checked", True, devices, services)
+            except (OSError, subprocess.SubprocessError, AdbPilotError, ValueError):
+                return MdnsRedetectionResult("verification_failed" if restarted else "restart_failed",
+                                             restarted, devices, services)
+            finally:
+                self.mdns_recovery.note_restart()
+
     def restart_server(self) -> None:
         self._prepare_client_async(
             lambda client: self._run_async("重启 ADB 服务", lambda: self._restart_adb_server(client)),
@@ -1704,7 +1824,7 @@ class AdbPilotGui(BaseTk):
             if self.mdns_stop.is_set():
                 return [], None
             devices = client.devices()
-            if devices:
+            if devices or self.mdns_manual_restart_running:
                 return devices, None
             result = client.recover_stale_mdns(
                 controller=self.mdns_recovery,
@@ -1744,6 +1864,7 @@ class AdbPilotGui(BaseTk):
                 unique_devices[device.serial] = device
         devices = list(unique_devices.values())
         self.devices = devices
+        self._update_mdns_recovery_notice(devices)
         current_serials = {device.serial for device in devices}
         for item in self.device_table.get_children():
             self.device_table.delete(item)
@@ -1819,7 +1940,7 @@ class AdbPilotGui(BaseTk):
         self._run_async("读取设备详情", lambda: self._get_client().device_info(serial), self._display_mapping)
 
     def check_wifi_capabilities(self) -> None:
-        if self.wireless_busy or self.pairing_in_progress:
+        if self.wireless_busy or self.pairing_in_progress or getattr(self, "mdns_manual_restart_running", False):
             return
         try:
             client = self._get_client()
@@ -1835,7 +1956,7 @@ class AdbPilotGui(BaseTk):
         self._run_async("检查无线能力", lambda: client.wifi_capabilities(probe_network=True), done)
 
     def connect_device(self) -> None:
-        if self.wireless_busy:
+        if self.wireless_busy or getattr(self, "mdns_manual_restart_running", False):
             return
         address = self.connect_addr_var.get().strip()
         if not address:
@@ -1845,10 +1966,12 @@ class AdbPilotGui(BaseTk):
         self._run_wireless_action(address, connect=True)
 
     def connect_paired_device(self) -> None:
+        if self.mdns_manual_restart_running:
+            return
         self._run_async("连接已配对设备", lambda: self._get_client().connect_paired_by_mdns())
 
     def pair_device(self) -> None:
-        if self.pairing_in_progress or self.wireless_busy:
+        if self.pairing_in_progress or self.wireless_busy or getattr(self, "mdns_manual_restart_running", False):
             return
         address = self.pair_addr_var.get().strip()
         code = self.pair_code_var.get().strip()
@@ -1897,6 +2020,8 @@ class AdbPilotGui(BaseTk):
             self.pair_button.configure(state=tk.DISABLED if busy else tk.NORMAL, text="配对中…" if busy else "配对")
 
     def qr_pair_device(self) -> None:
+        if getattr(self, "mdns_manual_restart_running", False):
+            return
         if self.qr_pair_cancel_event is not None:
             self.qr_pair_cancel_event.set()
         self.qr_pair_session += 1
@@ -1925,16 +2050,23 @@ class AdbPilotGui(BaseTk):
             cancelled = "已取消" in str(exc)
             self._finish_qr_pairing("扫码已取消。" if cancelled else "扫码配对已结束，这个二维码不能再用。")
 
+        completed = threading.Event()
+        self.qr_pair_worker_done = completed
+
+        def pair() -> str:
+            try:
+                return self._get_client().pair_by_qr(
+                    service_name, password, cancelled=cancel_event.is_set,
+                    progress=lambda message: self.result_queue.put(
+                        ("progress", f"扫码配对:{session}", message, None)
+                    ),
+                )
+            finally:
+                completed.set()
+
         self._run_async(
             f"扫码配对:{session}:{service_name}",
-            lambda: self._get_client().pair_by_qr(
-                service_name,
-                password,
-                cancelled=cancel_event.is_set,
-                progress=lambda message: self.result_queue.put(
-                    ("progress", f"扫码配对:{session}", message, None)
-                ),
-            ),
+            pair,
             done,
             failed,
         )
@@ -1965,6 +2097,7 @@ class AdbPilotGui(BaseTk):
             style="Status.TLabel",
             wraplength=340,
         ).pack(anchor=tk.W, padx=16, pady=(0, 10))
+        self._build_mdns_recovery_controls(window)
 
         content = ttk.Frame(window, style="Surface.TFrame")
         content.pack(fill=tk.BOTH, padx=16, pady=(0, 8))
@@ -2117,6 +2250,8 @@ class AdbPilotGui(BaseTk):
             self.qr_pair_window.destroy()
 
     def disconnect_device(self) -> None:
+        if getattr(self, "mdns_manual_restart_running", False):
+            return
         if self.wireless_busy:
             return
         address = self.connect_addr_var.get().strip() or None

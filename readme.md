@@ -391,7 +391,7 @@ adb executable
 
 无线调试扫码后一直显示“正在配对设备”时，参见 [Android 无线调试配对卡住排查](./docs/troubleshooting/android-wireless-debugging-pairing-stuck.md)。
 
-GUI 已实现 [mDNS 异常自动恢复](./doc/tech/adb-mdns-auto-recovery-design.md)（[AI 状态机规范 JSON](./doc/tech/adb-mdns-auto-recovery-state-machine.json)）。默认每 15 秒探测，重启后冷却 60 秒；任何设备记录（含 offline、unauthorized）存在时不自动重启。需要 ADB `server-status` 明确报告 `mdns_enabled: true`，以及系统可用的 `dns-sd`（macOS 自带，其他平台缺失时自动跳过）。可在 `~/.adbpilot/gui.json` 中设置 `"wireless_recovery": {"enabled": false}`，重启 GUI 后关闭此功能。
+GUI 已实现 [mDNS 异常自动恢复](./doc/tech/adb-mdns-auto-recovery-design.md)（[AI 状态机规范 JSON](./doc/tech/adb-mdns-auto-recovery-state-machine.json)）。默认每 15 秒探测，重启后冷却 60 秒；任何设备记录（含 offline、unauthorized）存在时不自动重启。无线调试区和扫码弹窗会显示保护原因，并提供“重启 ADB 并重新检测”按钮：确认中断已有会话后，取消旧扫码任务、重启当前 ADB 并检查设备和无线服务。需要 ADB `server-status` 明确报告 `mdns_enabled: true`，以及系统可用的 `dns-sd`（macOS 自带，其他平台缺失时自动跳过）。可在 `~/.adbpilot/gui.json` 中设置 `"wireless_recovery": {"enabled": false}`，重启 GUI 后关闭此功能；手动按钮仍可用。
 
 ## 开发和测试
 

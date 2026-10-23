@@ -22,7 +22,7 @@ from .errors import (
 from . import history as connection_history
 from .models import AdbWifiCapabilities, CommandResult, Device, DeviceInfo, RunningProcess, WirelessPairingResult
 from .platform_adapter import PlatformAdapter
-from .mdns import MdnsRecoveryController, MdnsRecoveryResult, MdnsService, has_name_conflict
+from .mdns import ADB_SERVER_START_TIMEOUT_SECONDS, MdnsRecoveryController, MdnsRecoveryResult, MdnsService, has_name_conflict
 
 
 DEFAULT_TIMEOUT = 30
@@ -143,6 +143,12 @@ class AdbClient:
         self.run(["start-server"])
         detail = f"stopped competing adb: {', '.join(stopped)}" if stopped else ""
         self._record("restart-server", ok=True, message="adb server 已重启", detail=detail)
+
+    def restart_current_server(self) -> None:
+        """Restart only this client's server with the recovery startup budget."""
+        self.run(["kill-server"], check=False, timeout=3)
+        self.run(["start-server"], timeout=ADB_SERVER_START_TIMEOUT_SECONDS)
+        self._record("restart-server", ok=True, message="当前 adb server 已重启")
 
     def devices(self) -> list[Device]:
         result = self.run(["devices", "-l"])

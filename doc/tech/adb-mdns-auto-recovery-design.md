@@ -44,6 +44,7 @@ PlatformAdapter.cancel_mdns_discovery() -> None
 AdbClient.mdns_recovery_supported() -> bool
 AdbClient.mdns_recovery_devices() -> tuple[Device, ...]
 AdbClient.mdns_recovery_services() -> tuple[MdnsService, ...]
+AdbClient.restart_current_server() -> None
 AdbClient.recover_stale_mdns(*, controller=None, adapter=None,
                            cancelled=lambda: False, progress=None) -> MdnsRecoveryResult
 MdnsRecoveryController.note_restart() -> None
@@ -144,6 +145,8 @@ GUI 用 `result_queue` 传递进度与结果，只有主线程写输出和设备
 
 设备快照沿用已有 `Device` 结构供设备列表显示；序列号仅用于现有设备管理，不写入新增的恢复提示。此约束不改变原有连接历史模块的设备记录行为。
 
+手动“重启 ADB 并重新检测”使用独立的 `MdnsRedetectionResult`：`status` 为 `checked`、`verification_failed`、`restart_failed` 或 `cancelled`，并保留 `restarted`、`devices` 和 `services`。两个快照中的 `None` 表示尚未取得结果，空元组才表示查询成功但为空；未知设备快照不能清空已有列表。`checked` 仅表示重启后完成查询，不承诺扫码配对成功。
+
 ## 7. GUI 调度与并发
 
 - 设备监听仍为每 3 秒一轮；mDNS 深度探测独立节流到每 15 秒一次。
@@ -154,6 +157,19 @@ GUI 用 `result_queue` 传递进度与结果，只有主线程写输出和设备
 - 切换客户端后，旧任务在命令边界取消；旧结果不提交到当前设备列表。关闭应用时设置取消事件，并终止系统浏览进程。
 - 配置与时钟保存在 GUI 进程内，切换客户端不清空冷却；退出后不持久化状态。多个独立 GUI 进程之间不共享互斥和冷却。
 - 设备可能在最后一次复查与 kill-server 之间上线；共享 ADB 没有原子“空设备时重启”接口，保护只能缩小竞态窗口，不能彻底消除其他进程引入的竞争。
+
+### 7.1 在线设备保护提示与手动恢复
+
+无线调试区和扫码弹窗共用一份保护提示，并都提供“重启 ADB 并重新检测”按钮。弹窗具有模态抓取，必须在弹窗内也能操作，不能只把入口放在主窗口。
+
+- 自动恢复启用且有任何设备记录时，提示“已有设备记录，已跳过自动恢复，避免中断 USB/Wi-Fi 会话”，说明离线/未授权记录同样受保护。只有进入受保护状态时写一次提示日志，后续轮询不重复刷屏。
+- 无设备记录时清除受保护提示，按原条件继续自动检测；自动恢复被配置关闭时显示关闭原因，但手动按钮仍可用。在线设备的存在不等于 mDNS 异常，提示不得宣称已诊断故障。
+- 用户点击按钮后，明确确认重启会中断当前 USB/Wi-Fi 调试、安装和传输，并使旧二维码失效。取消确认不改变扫码任务，也不发起重启。
+- 确认后取消旧扫码会话、递增会话代次并覆盖旧二维码。两个重启按钮及扫码入口在操作期间禁用，重复请求直接忽略；新配对/连接操作也不在此期间启动。
+- 客户端仍在后台准备。后台 worker 最多等待 30 秒，让旧扫码 worker 及其在途命令结束；超时只提示稍后重试，不操作 ADB、不进入重启冷却。旧会话的进度和结果按代次丢弃。
+- 随后取得 `adb_service_lock`，再次检查应用关闭/客户端切换。只有用户确认的手动操作允许在设备列表非空时重启；自动路径的设备保护条件保持不变。执行 `restart_current_server()`，只重启当前客户端服务，不清理其他端口服务，停止/启动预算仍为 3/30 秒。
+- 重启成功后重新查询设备和 ADB mDNS 服务（各 3 秒）；主线程更新已知的设备快照，在无线调试区和扫码弹窗同步反馈设备/服务数量，并建议按需重新生成二维码。检测失败与重启失败分开提示，保留已知快照，不把未知当作“无设备”。
+- 整次重启/检测结束后保留完整冷却；手动流程运行期间轮询仍可显示设备，但不会并发发起自动恢复。客户端切换或关闭后不提交旧结果；解析失败或执行结束后恢复按钮。
 
 ## 8. 配置
 
@@ -189,6 +205,7 @@ GUI 用 `result_queue` 传递进度与结果，只有主线程写输出和设备
 | [test_mdns_recovery.py](../../tests/test_mdns_recovery.py) | 配置、Add/Rmv、多网卡、脱敏、六态主流程、二次确认、所有设备状态保护、设备中途上线、取消、节流/冷却、命令失败/超时、名称冲突、防重入、跨客户端冷却和慢尝试结束后的完整冷却 |
 | [test_platform_adapter.py](../../tests/test_platform_adapter.py) | 命令缺失、部分启动失败、浏览异常、超时 terminate/kill，以及真实替代子进程的并行运行与退出回收 |
 | [test_gui_helpers.py](../../tests/test_gui_helpers.py) | 队列进度、恢复后的设备更新、后台无 Tk 读取、已有设备跳过、关闭/切换取消、手动刷新互斥、重复提示抑制、手动重启冷却，以及三个入口的异步解析、过期结果丢弃和失败后继续轮询 |
+| [test_mdns_manual_recovery.py](../../tests/test_mdns_manual_recovery.py) | 在线保护提示及去重、主窗口/扫码弹窗共享控件、确认/取消、防重复点击、旧扫码任务退出等待、锁互斥、重启/检测失败区分、快照未知值保护、冷却、客户端切换，以及自动关闭时的手动恢复 |
 
 运行全部回归：
 
@@ -210,3 +227,4 @@ python -m unittest discover -s tests -v
 6. 带数字后缀服务已经可见但无法配对时，只提示手机侧处理。
 7. 关闭 GUI 时无 dns-sd 残留进程；缺少该命令的平台仍可手动重启服务。
 8. macOS 真机及 Windows/Linux 的兼容 dns-sd 环境分别验收输出格式与发现时序。
+9. USB 设备在线时对另一台手机扫码，确认弹窗内可看到保护原因并手动重启检测；取消不影响已有连接，确认后旧二维码失效，完成后可以重新生成。
