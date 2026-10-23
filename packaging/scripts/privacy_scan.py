@@ -53,7 +53,11 @@ PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "ADB device serial",
-        re.compile(r"\b(?:serial|device_serial|adb_serial)\s*[:=]\s*['\"]?[A-Za-z0-9]{8,}['\"]?", re.I),
+        re.compile(
+            r"\b(?:serial|device_serial|adb_serial)\s*[:=]\s*"
+            r"(?![A-Za-z_]\w*\.)['\"]?[A-Za-z0-9]{8,}['\"]?",
+            re.I,
+        ),
     ),
 )
 

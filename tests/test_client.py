@@ -1,9 +1,60 @@
+import subprocess
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from adbpilot.client import parse_devices, parse_foreground_package, parse_key_value_lines, parse_package_dump, parse_processes
+from adbpilot.client import (
+    AdbClient,
+    _parse_lsof_adb_listeners,
+    _parse_ss_adb_listeners,
+    find_mdns_service,
+    parse_devices,
+    parse_foreground_package,
+    parse_key_value_lines,
+    parse_mdns_services,
+    mdns_address_host,
+    parse_package_dump,
+    parse_processes,
+)
+from adbpilot.models import Device
+from adbpilot.errors import AdbCommandError, DeviceSelectionError
 
 
 class ClientParsingTests(unittest.TestCase):
+    def test_parse_mdns_services(self):
+        output = """List of discovered mdns services
+adb-14141FDF600081-QXjCrW  _adb-tls-pairing._tcp  192.168.86.38:33861
+studio-abc123XYZ9          _adb-tls-pairing._tcp  192.168.86.39:55861
+adb-14141FDF600081-TnSdi9  _adb-tls-connect._tcp.  192.168.86.38:33015
+adb-e8d3d34b-1grL4          adb-tls-connect._tcp   192.168.1.71:44177
+"""
+
+        services = parse_mdns_services(output)
+        service = find_mdns_service(
+            services,
+            name="studio-abc123XYZ9",
+            service_type="_adb-tls-pairing._tcp",
+        )
+        connect = find_mdns_service(
+            services,
+            service_type="_adb-tls-connect._tcp",
+            host="192.168.86.38",
+        )
+
+        self.assertEqual(len(services), 4)
+        self.assertEqual(service["address"], "192.168.86.39:55861")
+        self.assertEqual(connect["name"], "adb-14141FDF600081-TnSdi9")
+        connect_without_leading_underscore = find_mdns_service(
+            services,
+            service_type="_adb-tls-connect._tcp",
+            host="192.168.1.71",
+        )
+        self.assertEqual(connect_without_leading_underscore["address"], "192.168.1.71:44177")
+
+    def test_mdns_address_host(self):
+        self.assertEqual(mdns_address_host("192.168.86.38:33015"), "192.168.86.38")
+        self.assertEqual(mdns_address_host("[fe80::abcd]:33015"), "fe80::abcd")
+
     def test_parse_devices_with_details(self):
         output = """List of devices attached
 emulator-5554 device product:sdk_gphone64 model:sdk_gphone64_x86_64 device:emu64x transport_id:1
@@ -21,6 +72,150 @@ ZYX987 no permissions usb:2-1
         self.assertEqual(devices[1].state, "offline")
         self.assertEqual(devices[2].state, "unauthorized")
         self.assertEqual(devices[3].state, "no permissions")
+
+    def test_deduplicate_devices_by_hardware_serial(self):
+        client = AdbClient("adb")
+        client.run = Mock(
+            side_effect=lambda args, **kwargs: SimpleNamespace(
+                returncode=0,
+                stdout={"adb-phone._adb-tls-connect._tcp.": "PHONE-001", "192.168.1.71:44177": "PHONE-001"}[
+                    kwargs["serial"]
+                ]
+            )
+        )
+        devices = [
+            Device("adb-phone._adb-tls-connect._tcp.", "device"),
+            Device("192.168.1.71:44177", "device"),
+        ]
+
+        result = client._deduplicate_devices(devices)
+
+        self.assertEqual([device.serial for device in result], ["192.168.1.71:44177"])
+        self.assertEqual(client.run.call_count, 2)
+
+    def test_restart_server_stops_adb_holding_usb_on_another_port(self):
+        client = AdbClient("adb")
+        client.run = Mock(return_value=SimpleNamespace(returncode=0, stdout="", stderr=""))
+        client._record = Mock()
+        client._listening_adb_servers = Mock(return_value=[("5037", "11"), ("5038", "99")])
+
+        with patch("adbpilot.client.subprocess.run", return_value=SimpleNamespace(returncode=0)) as run:
+            client.restart_server()
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], [str(client.adb_path), "-P", "5038", "kill-server"])
+        self.assertEqual(
+            [call.args[0] for call in client.run.call_args_list],
+            [["kill-server"], ["start-server"]],
+        )
+        self.assertIn("5038", client._record.call_args.kwargs["detail"])
+
+    def test_deduplication_query_failure_preserves_other_devices(self):
+        devices = [Device("usb-one", "device"), Device("usb-two", "device")]
+        for error in (subprocess.TimeoutExpired(["adb", "shell"], 5), OSError("transport vanished")):
+            with self.subTest(error=type(error).__name__):
+                client = AdbClient.__new__(AdbClient)
+                client.run = Mock(side_effect=[error, SimpleNamespace(returncode=0, stdout="PHONE-002")])
+                self.assertEqual(client._deduplicate_devices(devices), devices)
+                self.assertEqual(client.run.call_count, 2)
+
+    def test_restart_server_survives_unavailable_competitor_diagnostics(self):
+        for error in (FileNotFoundError("ss"), subprocess.TimeoutExpired(["ss"], 5)):
+            with self.subTest(error=type(error).__name__):
+                client = AdbClient.__new__(AdbClient)
+                client._listening_adb_servers = Mock(side_effect=error)
+                client.run = Mock()
+                client._record = Mock()
+                client.restart_server()
+                self.assertEqual([call.args[0] for call in client.run.call_args_list], [
+                    ["kill-server"], ["start-server"],
+                ])
+
+    def test_restart_server_continues_after_one_competing_port_times_out(self):
+        client = AdbClient.__new__(AdbClient)
+        client.adb_path = "/test/adb"
+        client.timeout = 7
+        client._listening_adb_servers = Mock(return_value=[("5038", "11"), ("5039", "12")])
+        client.run = Mock()
+        client._record = Mock()
+        with patch("adbpilot.client.subprocess.run", side_effect=[
+            subprocess.TimeoutExpired(["adb", "-P", "5038", "kill-server"], 7),
+            SimpleNamespace(returncode=0),
+        ]) as run:
+            client.restart_server()
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("5039", client._record.call_args.kwargs["detail"])
+        self.assertNotIn("5038", client._record.call_args.kwargs["detail"])
+        self.assertEqual([call.args[0] for call in client.run.call_args_list], [["kill-server"], ["start-server"]])
+
+    def test_restart_server_still_reports_current_server_failure(self):
+        client = AdbClient.__new__(AdbClient)
+        client._listening_adb_servers = Mock(return_value=[])
+        client.run = Mock(side_effect=[None, AdbCommandError("start failed", 1)])
+        client._record = Mock()
+        with self.assertRaises(AdbCommandError):
+            client.restart_server()
+        client._record.assert_not_called()
+
+    def test_failed_property_command_does_not_merge_unrelated_devices(self):
+        client = AdbClient.__new__(AdbClient)
+        client.run = Mock(return_value=SimpleNamespace(returncode=1, stdout="permission denied"))
+        devices = [Device("usb-one", "device"), Device("usb-two", "device")]
+        self.assertEqual(client._deduplicate_devices(devices), devices)
+
+    def test_mdns_wait_does_not_accept_a_different_host(self):
+        client = AdbClient("adb")
+        client.mdns_services = Mock(
+            return_value="List of discovered mdns services\nother-phone _adb-tls-connect._tcp 192.168.1.9:42111\n"
+        )
+
+        with patch("adbpilot.client.time.monotonic", side_effect=[0, 0, 1]):
+            with patch("adbpilot.client.time.sleep"):
+                found = client.wait_for_mdns_connect_service(host="192.168.1.8", timeout=1)
+
+        self.assertIsNone(found)
+
+    def test_parse_adb_listener_ports(self):
+        lsof = """COMMAND   PID      USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+adb     23710 chengpeng    7u  IPv4 0x1      0t0  TCP *:5037 (LISTEN)
+adb     53986 chengpeng   14u  IPv4 0x2      0t0  TCP 127.0.0.1:5038 (LISTEN)
+chrome   1000 chengpeng    8u  IPv4 0x3      0t0  TCP *:8080 (LISTEN)
+"""
+        ss = """State  Recv-Q Send-Q Local Address:Port Peer Address:PortProcess
+LISTEN 0      128          0.0.0.0:5037      0.0.0.0:*    users:(("adb",pid=11,fd=7))
+LISTEN 0      128        127.0.0.1:5038      0.0.0.0:*    users:(("adb",pid=22,fd=8))
+LISTEN 0      128          0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=3,fd=3))
+"""
+
+        self.assertEqual(_parse_lsof_adb_listeners(lsof), [("5037", "23710"), ("5038", "53986")])
+        self.assertEqual(_parse_ss_adb_listeners(ss), [("5037", "11"), ("5038", "22")])
+
+    def test_pair_by_qr_can_be_cancelled_and_logs_exit(self):
+        client = AdbClient("adb")
+        client.mdns_services = Mock(return_value="List of discovered mdns services\n")
+        progress = []
+
+        with self.assertRaises(DeviceSelectionError):
+            client.pair_by_qr(
+                "studio-test",
+                "password",
+                timeout=120,
+                cancelled=lambda: True,
+                progress=progress.append,
+            )
+
+        self.assertEqual(progress[0], "扫码配对：进入等待扫码状态")
+        self.assertEqual(progress[-1], "扫码配对：退出扫码匹配状态（已取消）")
+
+    def test_pair_by_qr_logs_exit_when_initial_mdns_fails(self):
+        client = AdbClient("adb")
+        client.mdns_services = Mock(side_effect=RuntimeError("mdns unavailable"))
+        progress = []
+
+        with self.assertRaises(RuntimeError):
+            client.pair_by_qr("studio-test", "password", progress=progress.append)
+
+        self.assertEqual(progress[-1], "扫码配对：退出扫码匹配状态（异常）")
 
     def test_parse_key_value_lines(self):
         output = """AC powered: false

@@ -16,6 +16,7 @@ AdbPilot 是一个围绕 Android ADB 能力构建的跨平台命令行工具，�
 - Shell 执行：执行单条 adb shell 命令。
 - 屏幕操作：截屏、录屏、点击、滑动、输入和按键事件。
 - 无线调试：连接和断开 `host:port` 形式的无线 ADB 设备。
+- GUI mDNS 自动恢复：系统能发现无线调试服务但 ADB 持续发现不到时，在无设备的条件下自动重启当前 ADB 服务，带二次确认和冷却保护。
 
 ## 平台支持
 
@@ -176,6 +177,25 @@ bash packaging/macos/build_macos.sh x86_64
 dist/AdbPilot.app
 ```
 
+### macOS 未验证开发者提示
+
+如果直接运行本地打包或从浏览器下载的 `.app`，macOS 可能会提示：
+
+```text
+Apple 无法验证“AdbPilot”是否包含可能危害 Mac 安全或泄漏隐私的恶意软件。
+```
+
+这通常表示应用没有使用 Apple Developer ID 签名并完成 notarization，不等同于确认应用含有恶意软件。对于自己构建、确认来源可信的本地版本，可以移除 quarantine 属性后再打开：
+
+```bash
+xattr -dr com.apple.quarantine dist/AdbPilot.app
+open dist/AdbPilot.app
+```
+
+也可以在系统设置的“隐私与安全性”中选择“仍要打开”。不要对来源不可信的 `.app` 执行上述放行操作。
+
+如果要把 macOS 安装包分发给其他用户，建议使用 Apple Developer ID 对 `.app` 签名并提交 Apple notarization。该能力通常需要付费加入 Apple Developer Program，费用以 Apple 官方说明为准；notarization 本身没有单独按次收费。
+
 更多细节见 [packaging/macos/README.md](./packaging/macos/README.md)。
 
 ## AI/自动化 CLI
@@ -261,9 +281,14 @@ adbpilot info -s emulator-5554
 连接无线调试设备：
 
 ```bash
+adbpilot wifi-capabilities
+adbpilot pair 192.168.1.10:37123 --connect 192.168.1.10:5555
 adbpilot connect 192.168.1.10:5555
 adbpilot disconnect 192.168.1.10:5555
 ```
+
+`pair` 会单独询问六位配对码，不会把配对码放进命令参数。Android 11+ 首次无线调试要先用手机配对页面上的地址配对，再用无线调试主页上的连接地址连接；这两个端口经常不同。
+桌面 GUI 也支持“扫码配对”：点击无线调试区域的“扫码配对”，在手机无线调试中选择“使用二维码配对设备”并扫描弹窗二维码即可。
 
 安装和卸载应用：
 
@@ -361,6 +386,12 @@ adb executable
 ## 文档
 
 详细需求和阶段规划见 [plant.md](./plant.md)。
+
+无线设备 IP／端口变化后的自动重连设计：[PRD](./doc/wireless-auto-reconnect/prd.md) · [技术方案](./doc/wireless-auto-reconnect/technical-design.md)（设计稿，尚未实现）。
+
+无线调试扫码后一直显示“正在配对设备”时，参见 [Android 无线调试配对卡住排查](./docs/troubleshooting/android-wireless-debugging-pairing-stuck.md)。
+
+GUI 已实现 [mDNS 异常自动恢复](./doc/tech/adb-mdns-auto-recovery-design.md)（[AI 状态机规范 JSON](./doc/tech/adb-mdns-auto-recovery-state-machine.json)）。默认每 15 秒探测，重启后冷却 60 秒；任何设备记录（含 offline、unauthorized）存在时不自动重启。无线调试区和扫码弹窗会显示保护原因，并提供“重启 ADB 并重新检测”按钮：确认中断已有会话后，取消旧扫码任务、重启当前 ADB 并检查设备和无线服务。需要 ADB `server-status` 明确报告 `mdns_enabled: true`，以及系统可用的 `dns-sd`（macOS 自带，其他平台缺失时自动跳过）。可在 `~/.adbpilot/gui.json` 中设置 `"wireless_recovery": {"enabled": false}`，重启 GUI 后关闭此功能；手动按钮仍可用。
 
 ## 开发和测试
 

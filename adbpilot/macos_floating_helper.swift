@@ -204,6 +204,7 @@ final class FloatingController {
     private let lockedLevel = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.screenSaverWindow)) + 1)
     private let panel: FloatingPanel
     private let content: FloatingView
+    private var appliedTopmost: Bool?
 
     init() {
         panel = FloatingPanel(
@@ -220,8 +221,6 @@ final class FloatingController {
         panel.hidesOnDeactivate = false
         panel.isMovableByWindowBackground = false
         panel.ignoresMouseEvents = false
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-        panel.level = lockedLevel
 
         content.onRestore = { emit(["event": "restore"]) }
         content.onAction = { action in emit(["event": "action", "action": action]) }
@@ -233,8 +232,12 @@ final class FloatingController {
             panel.setFrameOrigin(NSPoint(x: CGFloat(x), y: NSScreen.mainScreenHeight - CGFloat(y) - height))
         }
         let topmost = message["topmostLocked"] as? Bool ?? true
-        panel.level = topmost ? lockedLevel : .normal
-        panel.collectionBehavior = topmost ? [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle] : [.fullScreenAuxiliary]
+        let shouldPresent = appliedTopmost == nil || (topmost && appliedTopmost == false)
+        if appliedTopmost != topmost {
+            panel.level = topmost ? lockedLevel : .normal
+            panel.collectionBehavior = topmost ? [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle] : [.fullScreenAuxiliary]
+            appliedTopmost = topmost
+        }
         content.state = FloatingState(
             title: message["title"] as? String ?? "无设备",
             subtitle: message["subtitle"] as? String ?? "等待连接",
@@ -243,7 +246,10 @@ final class FloatingController {
             topmostLocked: topmost,
             topmostLabel: message["topmostLabel"] as? String ?? (topmost ? "置顶" : "普通")
         )
-        panel.orderFrontRegardless()
+        // Polling updates must preserve the user's window stacking order.
+        if shouldPresent {
+            panel.orderFrontRegardless()
+        }
     }
 
     func close() {
@@ -268,7 +274,6 @@ func emit(_ object: [String: Any]) {
 let app = NSApplication.shared
 app.setActivationPolicy(.accessory)
 let controller = FloatingController()
-controller.apply([:])
 
 Thread.detachNewThread {
     while let line = readLine() {

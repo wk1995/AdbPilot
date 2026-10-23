@@ -24,8 +24,10 @@ logs/
 reports/
 screenshots/
 apks/
+tools/
 .adbpilot/
 .superpowers/
+.workbuddy/
 
 # OS / editor
 .DS_Store
