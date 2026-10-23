@@ -1830,13 +1830,16 @@ class AdbPilotGui(BaseTk):
             if self.mdns_stop.is_set():
                 return [], None
             devices = client.devices()
-            if devices or self.mdns_manual_restart_running:
+            if (devices or self.mdns_manual_restart_running
+                    or getattr(self, "pairing_in_progress", False) or getattr(self, "wireless_busy", False)):
                 return devices, None
             result = client.recover_stale_mdns(
                 controller=self.mdns_recovery,
                 adapter=self.mdns_adapter,
                 cancelled=lambda: (self.mdns_stop.is_set() or self.client is not client
-                                   or self.mdns_manual_restart_running),
+                                   or self.mdns_manual_restart_running
+                                   or getattr(self, "pairing_in_progress", False)
+                                   or getattr(self, "wireless_busy", False)),
                 progress=lambda message: self.result_queue.put(("progress", "mDNS 自动恢复", message, None)),
             )
             if result.restarted or result.devices_after:

@@ -1051,17 +1051,25 @@ class AdbClient:
         """
         own_port = os.environ.get("ANDROID_ADB_SERVER_PORT", "5037")
         stopped: list[str] = []
-        for port, pid in self._listening_adb_servers():
+        try:
+            listeners = self._listening_adb_servers()
+        except (OSError, subprocess.SubprocessError):
+            # ss/lsof are optional diagnostics; do not block our own restart.
+            return stopped
+        for port, pid in listeners:
             if port == own_port:
                 continue
-            completed = subprocess.run(
-                [str(self.adb_path), "-P", port, "kill-server"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout,
-            )
+            try:
+                completed = subprocess.run(
+                    [str(self.adb_path), "-P", port, "kill-server"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=self.timeout,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
             if completed.returncode == 0:
                 stopped.append(f"{port} (pid {pid})" if pid else port)
         return stopped

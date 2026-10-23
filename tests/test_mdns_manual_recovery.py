@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 from adbpilot.client import AdbClient
 from adbpilot.errors import AdbCommandError, AdbPilotError, DeviceSelectionError
 from adbpilot.gui import AdbPilotGui
-from adbpilot.mdns import MdnsRecoveryConfig, MdnsRecoveryController, MdnsRecoveryState, MdnsService, SystemMdnsDiscovery
+from adbpilot.mdns import MdnsRecoveryConfig, MdnsRecoveryController, MdnsRecoveryResult, MdnsRecoveryState, MdnsService, SystemMdnsDiscovery
 from adbpilot.models import Device
 
 
@@ -90,6 +90,39 @@ class ManualMdnsRecoveryTests(unittest.TestCase):
         self.gui._set_mdns_manual_restart_running(True)
         for widget in buttons:
             widget.configure.assert_called_with(state="disabled")
+
+    def test_automatic_recovery_skips_active_manual_wireless_operations(self):
+        self.client.devices.return_value = []
+        self.gui.mdns_adapter = Mock()
+        self.gui.result_queue = queue.Queue()
+        for name in ("pairing_in_progress", "wireless_busy"):
+            with self.subTest(operation=name):
+                setattr(self.gui, name, True)
+                try:
+                    devices, recovery = AdbPilotGui._read_devices_and_recover(self.gui, self.client)
+                    self.assertEqual(devices, [])
+                    self.assertIsNone(recovery)
+                    self.client.recover_stale_mdns.assert_not_called()
+                finally:
+                    setattr(self.gui, name, False)
+
+    def test_automatic_recovery_cancels_when_manual_wireless_operation_starts(self):
+        self.client.devices.return_value = []
+        self.gui.mdns_adapter = Mock()
+        self.gui.result_queue = queue.Queue()
+        for name in ("pairing_in_progress", "wireless_busy"):
+            with self.subTest(operation=name):
+                def probe(**kwargs):
+                    self.assertFalse(kwargs["cancelled"]())
+                    setattr(self.gui, name, True)
+                    self.assertTrue(kwargs["cancelled"]())
+                    return MdnsRecoveryResult("cancelled")
+                self.client.recover_stale_mdns.side_effect = probe
+                try:
+                    _, result = AdbPilotGui._read_devices_and_recover(self.gui, self.client)
+                    self.assertEqual(result.status, "cancelled")
+                finally:
+                    setattr(self.gui, name, False)
 
     def test_declining_confirmation_has_no_restart_or_qr_side_effects(self):
         self.gui.qr_pair_cancel_event = threading.Event()

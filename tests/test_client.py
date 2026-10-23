@@ -17,7 +17,7 @@ from adbpilot.client import (
     parse_processes,
 )
 from adbpilot.models import Device
-from adbpilot.errors import DeviceSelectionError
+from adbpilot.errors import AdbCommandError, DeviceSelectionError
 
 
 class ClientParsingTests(unittest.TestCase):
@@ -118,6 +118,44 @@ ZYX987 no permissions usb:2-1
                 client.run = Mock(side_effect=[error, SimpleNamespace(returncode=0, stdout="PHONE-002")])
                 self.assertEqual(client._deduplicate_devices(devices), devices)
                 self.assertEqual(client.run.call_count, 2)
+
+    def test_restart_server_survives_unavailable_competitor_diagnostics(self):
+        for error in (FileNotFoundError("ss"), subprocess.TimeoutExpired(["ss"], 5)):
+            with self.subTest(error=type(error).__name__):
+                client = AdbClient.__new__(AdbClient)
+                client._listening_adb_servers = Mock(side_effect=error)
+                client.run = Mock()
+                client._record = Mock()
+                client.restart_server()
+                self.assertEqual([call.args[0] for call in client.run.call_args_list], [
+                    ["kill-server"], ["start-server"],
+                ])
+
+    def test_restart_server_continues_after_one_competing_port_times_out(self):
+        client = AdbClient.__new__(AdbClient)
+        client.adb_path = "/test/adb"
+        client.timeout = 7
+        client._listening_adb_servers = Mock(return_value=[("5038", "11"), ("5039", "12")])
+        client.run = Mock()
+        client._record = Mock()
+        with patch("adbpilot.client.subprocess.run", side_effect=[
+            subprocess.TimeoutExpired(["adb", "-P", "5038", "kill-server"], 7),
+            SimpleNamespace(returncode=0),
+        ]) as run:
+            client.restart_server()
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("5039", client._record.call_args.kwargs["detail"])
+        self.assertNotIn("5038", client._record.call_args.kwargs["detail"])
+        self.assertEqual([call.args[0] for call in client.run.call_args_list], [["kill-server"], ["start-server"]])
+
+    def test_restart_server_still_reports_current_server_failure(self):
+        client = AdbClient.__new__(AdbClient)
+        client._listening_adb_servers = Mock(return_value=[])
+        client.run = Mock(side_effect=[None, AdbCommandError("start failed", 1)])
+        client._record = Mock()
+        with self.assertRaises(AdbCommandError):
+            client.restart_server()
+        client._record.assert_not_called()
 
     def test_failed_property_command_does_not_merge_unrelated_devices(self):
         client = AdbClient.__new__(AdbClient)
