@@ -64,8 +64,8 @@
 
 ### 2026-10-16 路径切换与版本下载
 
-- 主机：macOS。源码目录：`/Users/chengpeng/project/AdbPilot`。
-- 原有 adb：`/Users/chengpeng/wk2/environment/androidSdk/platform-tools/adb`，版本 37.0.0。
+- 主机：macOS。源码目录：`<项目目录>/AdbPilot`。
+- 原有 adb：`<Android SDK>/platform-tools/adb`，版本 37.0.0。
 - M15：默认目录显示为项目目录。下载后文件位于项目内 `tools/platform-tools-34.0.4/`。
 - M16：14:21:11 下载 34.0.4，14:21:12 已切换到 `tools/platform-tools-34.0.4/platform-tools/adb`。进度条按百分比更新。
 - M2：14:21:30 用这份 34.0.4 检查能力，提示「30.0.0–34.0.4 的早期配对实现，产品内不执行配对」，并提示默认不会自动连接。结果与通过标准一致。

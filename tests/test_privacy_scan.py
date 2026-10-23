@@ -47,6 +47,27 @@ class PrivacyScanTests(unittest.TestCase):
             )
             self.assertEqual(scanner.findings_in(sample, "readme.md"), [])
 
+    def test_distinguishes_serial_literals_from_attribute_expressions(self) -> None:
+        scanner = load_scanner()
+        with tempfile.TemporaryDirectory() as directory:
+            sample = Path(directory) / "client.py"
+            sample.write_text(
+                "serial=appeared.serial,\n"
+                "device_serial=appeared.serial,\n"
+                "serial='ABCDEF1234567890',\n"
+                'device_serial="ABCDEF1234567890",\n'
+                "serial=ABCDEF1234567890\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                scanner.findings_in(sample, "client.py"),
+                [
+                    "client.py:3: ADB device serial",
+                    "client.py:4: ADB device serial",
+                    "client.py:5: ADB device serial",
+                ],
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
