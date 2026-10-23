@@ -100,7 +100,8 @@ jobs:
             git commit -m "[home][mac-min] chore: release desktop platform versions"
             release_branch="release/desktop-versions"
             git push --force-with-lease origin "HEAD:refs/heads/$release_branch"
-            pr_number="$(gh pr view "$release_branch" --json number,state --jq 'select(.state=="OPEN") | .number')"
+            pr_number="$(gh pr list --base master --head "$release_branch" \
+              --state open --json number --jq '.[0].number // empty')"
             if [ -z "$pr_number" ]; then
               pr_url="$(gh pr create \
                 --base master \
