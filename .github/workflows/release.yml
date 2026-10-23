@@ -100,18 +100,19 @@ jobs:
             git commit -m "[home][mac-min] chore: release desktop platform versions"
             release_branch="release/desktop-versions"
             git push --force-with-lease origin "HEAD:refs/heads/$release_branch"
-            pr_number="$(gh pr view "$release_branch" --json number,state --jq 'select(.state=="OPEN") | .number')"
+            pr_number="$(gh pr list --base master --head "$release_branch" \
+              --state open --json number --jq '.[0].number // empty')"
             if [ -z "$pr_number" ]; then
               pr_url="$(gh pr create \
                 --base master \
                 --head "$release_branch" \
                 --title "[home][mac-min] chore: release desktop platform versions" \
                 --body "$(cat <<'EOF'
-Automated version bump. Packages are built only after this pull request merges.
+          Automated version bump. Packages are built only after this pull request merges.
 
-Required checks merge this pull request when they pass.
-EOF
-)")"
+          Required checks merge this pull request when they pass.
+          EOF
+          )")"
               pr_number="${pr_url##*/}"
             fi
             gh pr merge "$pr_number" --merge --auto
@@ -263,6 +264,7 @@ EOF
           set -euo pipefail
           asset="AdbPilot-macos-$VERSION-$ARCH.zip"
           for attempt in 1 2 3 4 5; do
+            echo "Uploading $asset (attempt $attempt/5)"
             if gh release upload "$TAG" "$asset" --clobber; then
               exit 0
             fi
