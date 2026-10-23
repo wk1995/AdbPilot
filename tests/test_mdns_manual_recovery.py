@@ -142,7 +142,9 @@ class ManualMdnsRecoveryTests(unittest.TestCase):
         qr_done = Mock()
         qr_done.wait.side_effect = lambda timeout: waiting.set() or finished.wait(timeout)
         results = []
-        worker = threading.Thread(target=lambda: results.append(self.gui._restart_and_redetect(self.client, qr_done)))
+        latest_done = threading.Event()
+        latest_done.set()
+        worker = threading.Thread(target=lambda: results.append(self.gui._restart_and_redetect(self.client, (latest_done, qr_done))))
         worker.start()
         try:
             self.assertTrue(waiting.wait(1))
@@ -152,6 +154,16 @@ class ManualMdnsRecoveryTests(unittest.TestCase):
             worker.join(2)
         self.assertFalse(worker.is_alive())
         self.assertEqual(results[0].status, "checked")
+
+    def test_manual_request_captures_workers_from_previous_qr_generations(self):
+        older, current = threading.Event(), threading.Event()
+        self.gui.qr_pair_worker_events = [older, current]
+        self.gui.qr_pair_worker_done = current
+        self.gui._restart_and_redetect = Mock()
+        self.start_manual()
+        _, work, _, _ = self.gui._run_async.call_args.args
+        work()
+        self.assertEqual(self.gui._restart_and_redetect.call_args.args[1], (older, current))
 
     def test_qr_worker_completion_is_signalled_on_success_and_failure(self):
         for failure in (None, RuntimeError("pair failed")):

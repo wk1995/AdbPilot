@@ -237,6 +237,7 @@ class AdbPilotGui(BaseTk):
         self.qr_pair_session = 0
         self.qr_pair_cancel_event: threading.Event | None = None
         self.qr_pair_worker_done: threading.Event | None = None
+        self.qr_pair_worker_events: list[threading.Event] = []
         self.macos_floating_process: subprocess.Popen[str] | None = None
         self.gui_config = load_gui_config()
         self.mdns_recovery = MdnsRecoveryController(MdnsRecoveryConfig.from_gui_config(self.gui_config))
@@ -1696,7 +1697,9 @@ class AdbPilotGui(BaseTk):
             parent=parent, default=messagebox.NO,
         ):
             return
-        qr_done = self.qr_pair_worker_done
+        qr_done = tuple(getattr(self, "qr_pair_worker_events", ()))
+        if self.qr_pair_worker_done is not None and self.qr_pair_worker_done not in qr_done:
+            qr_done += (self.qr_pair_worker_done,)
         if self.qr_pair_cancel_event is not None:
             self.qr_pair_cancel_event.set()
             self.qr_pair_session += 1
@@ -1732,10 +1735,13 @@ class AdbPilotGui(BaseTk):
         self._prepare_client_async(ready, failed, label="重启 ADB 并重新检测")
 
     def _restart_and_redetect(
-        self, client: AdbClient, qr_done: threading.Event | None,
+        self, client: AdbClient, qr_done: threading.Event | tuple[threading.Event, ...] | None,
     ) -> MdnsRedetectionResult:
-        if qr_done is not None and not qr_done.wait(30):
-            raise AdbPilotError("旧扫码任务尚未结束，请稍后再重启。")
+        qr_events = qr_done if isinstance(qr_done, tuple) else (() if qr_done is None else (qr_done,))
+        deadline = time.monotonic() + 30
+        for event in qr_events:
+            if not event.wait(max(0, deadline - time.monotonic())):
+                raise AdbPilotError("旧扫码任务尚未结束，请稍后再重启。")
         with self.adb_service_lock:
             if self.mdns_stop.is_set() or self.client is not client:
                 return MdnsRedetectionResult("cancelled")
@@ -2052,6 +2058,8 @@ class AdbPilotGui(BaseTk):
 
         completed = threading.Event()
         self.qr_pair_worker_done = completed
+        self.qr_pair_worker_events = [event for event in getattr(self, "qr_pair_worker_events", ()) if not event.is_set()]
+        self.qr_pair_worker_events.append(completed)
 
         def pair() -> str:
             try:

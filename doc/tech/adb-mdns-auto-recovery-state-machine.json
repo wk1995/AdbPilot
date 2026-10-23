@@ -168,7 +168,7 @@
       {"from": ["ready"], "event": "requested", "to": "confirming", "action": "Explain interruption of current USB/Wi-Fi sessions and invalidation of the old QR; ask for confirmation."},
       {"from": ["confirming"], "event": "declined", "to": "ready", "action": "No ADB command, QR cancellation or cooldown side effect."},
       {"from": ["confirming"], "event": "confirmed", "to": "preparing_client", "action": "Cancel old QR, increment session generation, cover QR, set busy and disable both action buttons and new pairing; resolve client asynchronously."},
-      {"from": ["preparing_client"], "event": "client_ready", "to": "waiting_qr", "action": "Wait for the captured QR worker completion event in the background, with a 30s deadline."},
+      {"from": ["preparing_client"], "event": "client_ready", "to": "waiting_qr", "action": "Wait for all captured unfinished QR worker completion events, including earlier QR generations, under one shared 30s deadline in the background."},
       {"from": ["preparing_client"], "event": "preparation_failed", "to": "ready", "action": "Clear busy and re-enable buttons; no restart or cooldown."},
       {"from": ["waiting_qr"], "event": "qr_timeout", "to": "ready", "action": "Report unfinished QR task; no ADB command or cooldown; re-enable buttons."},
       {"from": ["waiting_qr"], "event": "qr_finished", "to": "restarting", "action": "Acquire adb_service_lock and recheck closing/client identity; restart only the selected client's server, even with device records. Stop/start budgets are 3/30s."},
@@ -185,7 +185,7 @@
       "Only explicit confirmation authorizes a restart with device records; automatic recovery still skips all such records.",
       "Repeated clicks while busy do not show another dialog or issue another command.",
       "A modal QR dialog exposes the same notice/action as the main wireless panel.",
-      "Old QR commands must finish before kill/start; old callbacks are rejected by session generation.",
+      "All old QR commands across QR generations must finish before kill/start; old callbacks are rejected by session generation.",
       "A new QR/pair/connect operation and automatic recovery must not start while manual recovery is busy.",
       "The new manual action never stops competing ADB servers on other ports.",
       "checked means redetection finished, not that QR pairing succeeded."
