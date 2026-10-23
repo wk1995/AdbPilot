@@ -164,6 +164,7 @@ class GuiHelperTests(unittest.TestCase):
             adb_service_lock=threading.Lock(), client=client,
             mdns_recovery=MdnsRecoveryController(), mdns_adapter=Mock(),
             mdns_stop=threading.Event(), result_queue=queue.Queue(),
+            mdns_manual_restart_running=False,
             adb_path_var=FakeVar("/test/adb"), timeout_var=FakeVar("30"),
             _int_value=lambda *_args, **_kwargs: 30, _remember_adb_path=Mock(),
         )
