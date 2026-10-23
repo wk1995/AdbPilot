@@ -1,3 +1,5 @@
+import itertools
+import queue
 import subprocess
 import threading
 import unittest
@@ -6,9 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from adbpilot.client import AdbClient
-from adbpilot.errors import AdbPilotError
+from adbpilot.errors import AdbCommandError, AdbPilotError, DeviceSelectionError
 from adbpilot.gui import AdbPilotGui
-from adbpilot.mdns import MdnsRecoveryConfig, MdnsRecoveryController, MdnsRecoveryState, MdnsService
+from adbpilot.mdns import MdnsRecoveryConfig, MdnsRecoveryController, MdnsRecoveryState, MdnsService, SystemMdnsDiscovery
 from adbpilot.models import Device
 
 
@@ -273,6 +275,82 @@ class ManualMdnsRecoveryTests(unittest.TestCase):
         AdbPilotGui.qr_pair_device(self.gui)
         self.gui._run_async.assert_not_called()
 
+    def test_manual_request_takes_over_inflight_auto_probe_before_old_qr_finishes(self):
+        browsing, finish_browse = threading.Event(), threading.Event()
+        qr_done = threading.Event()
+        self.gui.qr_pair_cancel_event = threading.Event()
+        self.gui.qr_pair_worker_done = qr_done
+        self.gui.mdns_adapter = Mock()
+        self.gui.result_queue = queue.Queue()
+        self.client.devices.return_value = []
+        self.client.mdns_recovery_devices.return_value = ()
+        self.client.mdns_recovery_services.return_value = ()
+        self.client.mdns_recovery_supported.return_value = True
+        self.client.recover_stale_mdns.side_effect = lambda **kwargs: self.gui.mdns_recovery.recover(
+            self.client, kwargs["adapter"], cancelled=kwargs["cancelled"],
+        )
+
+        def browse(**kwargs):
+            browsing.set()
+            if not finish_browse.wait(2):
+                raise RuntimeError("test did not release browser")
+            return SystemMdnsDiscovery(True, (MdnsService("_adb-tls-pairing._tcp"),))
+
+        self.gui.mdns_adapter.discover_system_adb_mdns_services.side_effect = browse
+        automatic_results, manual_results = [], []
+        automatic = threading.Thread(target=lambda: automatic_results.append(
+            AdbPilotGui._read_devices_and_recover(self.gui, self.client)))
+        manual = None
+        automatic.start()
+        try:
+            self.assertTrue(browsing.wait(1))
+            self.start_manual()
+            self.assertTrue(self.gui.qr_pair_cancel_event.is_set())
+            _, work, _, _ = self.gui._run_async.call_args.args
+            manual = threading.Thread(target=lambda: manual_results.append(work()))
+            manual.start()
+            finish_browse.set()
+            automatic.join(2)
+            self.assertFalse(automatic.is_alive())
+            self.assertEqual(automatic_results[0][1].status, "cancelled")
+            self.client.run.assert_not_called()
+            self.client.restart_current_server.assert_not_called()
+            self.assertIsNone(self.gui.mdns_recovery.last_restart)
+        finally:
+            finish_browse.set()
+            qr_done.set()
+            automatic.join(2)
+            if manual is not None:
+                manual.join(2)
+        self.assertFalse(manual.is_alive())
+        self.assertEqual(manual_results[0].status, "checked")
+        self.client.restart_current_server.assert_called_once()
+
+    def test_manual_takeover_during_kill_still_completes_automatic_start(self):
+        self.gui.mdns_adapter = Mock()
+        self.gui.result_queue = queue.Queue()
+        self.gui.mdns_adapter.discover_system_adb_mdns_services.return_value = SystemMdnsDiscovery(
+            True, (MdnsService("_adb-tls-pairing._tcp"),),
+        )
+        self.client.devices.return_value = []
+        self.client.mdns_recovery_devices.return_value = ()
+        self.client.mdns_recovery_services.return_value = ()
+        self.client.mdns_recovery_supported.return_value = True
+        self.client.recover_stale_mdns.side_effect = lambda **kwargs: self.gui.mdns_recovery.recover(
+            self.client, kwargs["adapter"], cancelled=kwargs["cancelled"],
+        )
+        def command(args, **kwargs):
+            if args == ["kill-server"]:
+                self.gui.mdns_manual_restart_running = True
+        self.client.run.side_effect = command
+        with patch("adbpilot.mdns.time.sleep"):
+            _, result = AdbPilotGui._read_devices_and_recover(self.gui, self.client)
+        self.assertEqual([call.args[0] for call in self.client.run.call_args_list],
+                         [["kill-server"], ["start-server"]])
+        self.assertEqual(result.status, "cancelled")
+        self.assertTrue(result.restarted)
+        self.assertEqual(self.gui.mdns_recovery.state, MdnsRecoveryState.COOLDOWN)
+
     def test_manual_action_remains_available_when_auto_recovery_is_disabled(self):
         self.gui.mdns_recovery.config = MdnsRecoveryConfig(enabled=False)
         self.start_manual()
@@ -302,6 +380,67 @@ class CurrentServerRestartTests(unittest.TestCase):
         self.assertEqual(client.run.call_args_list[1].args, (["start-server"],))
         self.assertEqual(client.run.call_args_list[1].kwargs, {"timeout": 30})
         client._stop_competing_adb_servers.assert_not_called()
+
+
+class QrCancellationBoundaryTests(unittest.TestCase):
+    def test_active_qr_session_still_pairs_and_connects_multiple_devices(self):
+        for partial_failure in (False, True):
+            with self.subTest(partial_failure=partial_failure):
+                client = object.__new__(AdbClient)
+                services = ("studio-test _adb-tls-pairing._tcp 192.0.2.8:37000\n"
+                            "phone-a _adb-tls-connect._tcp 192.0.2.8:38000\n"
+                            "phone-b _adb-tls-connect._tcp 192.0.2.9:38000\n")
+                client.mdns_services = Mock(side_effect=lambda: "" if client.mdns_services.call_count == 1 else services)
+                client.pair = Mock(return_value=SimpleNamespace(paired=True, next_action="paired"))
+                client.connect = Mock(side_effect=[
+                    AdbCommandError("failed", 1, "", "") if partial_failure else "connected",
+                    "connected",
+                ])
+                with patch("adbpilot.client.time.monotonic", side_effect=itertools.count()), patch("adbpilot.client.time.sleep"):
+                    result = client.pair_by_qr("studio-test", "test-secret")
+                client.pair.assert_called_once()
+                self.assertEqual(client.connect.call_count, 2)
+                self.assertIn("192.0.2.9:38000: connected", result)
+                self.assertEqual("部分设备连接失败" in result, partial_failure)
+
+    def test_cancellation_at_command_boundaries_prevents_followup_pair_or_connect(self):
+        empty = "List of discovered mdns services\n"
+        pairing = "studio-test _adb-tls-pairing._tcp 192.0.2.8:37000\n"
+        services = ("phone-a _adb-tls-connect._tcp 192.0.2.8:38000\n"
+                    "phone-b _adb-tls-connect._tcp 192.0.2.9:38000\n")
+        for phase in ("before_initial", "initial_query", "poll_query", "pair", "connect"):
+            with self.subTest(phase=phase):
+                client = object.__new__(AdbClient)
+                cancel = threading.Event()
+                progress = []
+                if phase == "before_initial":
+                    cancel.set()
+
+                def mdns():
+                    initial = client.mdns_services.call_count == 1
+                    if (initial and phase == "initial_query") or (not initial and phase == "poll_query"):
+                        cancel.set()
+                    return empty if initial else services if phase == "connect" else pairing
+
+                def pair(*args, **kwargs):
+                    cancel.set()
+                    return SimpleNamespace(paired=True, next_action="paired")
+
+                def connect(*args, **kwargs):
+                    cancel.set()
+                    return "connected"
+
+                client.mdns_services = Mock(side_effect=mdns)
+                client.pair = Mock(side_effect=pair)
+                client.connect = Mock(side_effect=connect)
+                with patch("adbpilot.client.time.monotonic", side_effect=itertools.count()), patch("adbpilot.client.time.sleep"):
+                    with self.assertRaisesRegex(DeviceSelectionError, "已取消"):
+                        client.pair_by_qr("studio-test", "test-secret", cancelled=cancel.is_set, progress=progress.append)
+                self.assertEqual(progress[-1], "扫码配对：退出扫码匹配状态（已取消）")
+                self.assertEqual(client.pair.call_count, 1 if phase == "pair" else 0)
+                self.assertEqual(client.connect.call_count, 1 if phase == "connect" else 0)
+                if phase == "before_initial":
+                    client.mdns_services.assert_not_called()
 
 
 if __name__ == "__main__":
