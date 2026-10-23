@@ -150,9 +150,10 @@ class AdbClient:
         self.run(["start-server"], timeout=ADB_SERVER_START_TIMEOUT_SECONDS)
         self._record("restart-server", ok=True, message="当前 adb server 已重启")
 
-    def devices(self) -> list[Device]:
+    def devices(self, *, deduplicate: bool = True) -> list[Device]:
         result = self.run(["devices", "-l"])
-        return self._deduplicate_devices(parse_devices(result.stdout))
+        devices = parse_devices(result.stdout)
+        return self._deduplicate_devices(devices) if deduplicate else devices
 
     def _deduplicate_devices(self, devices: list[Device]) -> list[Device]:
         """Collapse multiple ADB transports that point to the same handset."""
@@ -184,12 +185,17 @@ class AdbClient:
         return deduplicated
 
     def _hardware_serial(self, device: Device) -> str | None:
-        result = self.run(
-            ["shell", "getprop", "ro.serialno"],
-            serial=device.serial,
-            timeout=5,
-            check=False,
-        )
+        try:
+            result = self.run(
+                ["shell", "getprop", "ro.serialno"],
+                serial=device.serial,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
         value = result.stdout.strip()
         if not value or value.lower() in {"unknown", "<unknown>"}:
             return None
@@ -502,8 +508,10 @@ class AdbClient:
                 capabilities=capabilities,
             )
 
-        before = self.devices()
-        appeared = self._wait_for_new_tls_device(before, wait_for_device_seconds)
+        # ADB reports the identity it paired. A new transport alone may belong
+        # to another handset, and the target may already be online at this point.
+        guid = re.search(r"\[guid=([^\]\r\n]+)\]", result.stdout + "\n" + result.stderr)
+        appeared = self._wait_for_paired_tls_device(guid[1] if guid else "", wait_for_device_seconds)
         if appeared is not None:
             self._record(
                 "pair",
@@ -894,14 +902,17 @@ class AdbClient:
             )
         return result
 
-    def _wait_for_new_tls_device(self, before: list[Device], seconds: float) -> Device | None:
-        known = {device.serial for device in before}
+    def _wait_for_paired_tls_device(self, guid: str, seconds: float) -> Device | None:
+        if not guid:
+            return None
+        expected = f"{guid}._adb-tls-connect._tcp"
         deadline = time.monotonic() + max(seconds, 0)
         while True:
-            for device in self.devices():
-                if device.serial in known or not is_tls_connect_serial(device.serial):
-                    continue
-                return device
+            # Deduplication can hide this TLS alias behind the same phone's
+            # USB or IP transport. Pairing needs the raw transport identity.
+            for device in self.devices(deduplicate=False):
+                if device.is_ready and device.serial.rstrip(".") == expected:
+                    return device
             if time.monotonic() >= deadline:
                 return None
             time.sleep(min(1, max(deadline - time.monotonic(), 0)))

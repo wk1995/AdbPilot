@@ -90,6 +90,35 @@ class AdbDownloadTests(unittest.TestCase):
             result = download_platform_tools("37.0.0", root, system_name="Linux", opener=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not download")))
         self.assertEqual(result, existing)
 
+    def test_failed_extraction_is_not_reused_as_a_complete_download(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("platform-tools/adb", b"incomplete")
+            archive.writestr("../invalid-member", b"invalid")
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(AdbDownloadError):
+                download_platform_tools(
+                    "37.0.0", root, system_name="Linux",
+                    opener=lambda *_args, **_kwargs: FakeResponse(buffer.getvalue()),
+                )
+            self.assertFalse(version_directory(root, "37.0.0").exists())
+            result = download_platform_tools(
+                "37.0.0", root, system_name="Linux",
+                opener=lambda *_args, **_kwargs: FakeResponse(package_bytes(content=b"complete")),
+            )
+            self.assertEqual(result.read_bytes(), b"complete")
+
+    def test_package_without_adb_does_not_publish_an_installation(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(AdbDownloadError):
+                download_platform_tools(
+                    "37.0.0", root, system_name="Linux",
+                    opener=lambda *_args, **_kwargs: FakeResponse(package_bytes(name="NOTICE.txt")),
+                )
+            self.assertFalse(version_directory(root, "37.0.0").exists())
+
     def test_download_drops_special_permission_bits(self):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:

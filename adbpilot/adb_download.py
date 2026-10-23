@@ -116,9 +116,19 @@ def download_platform_tools(
 
         if progress:
             progress("正在解压")
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
         try:
-            with zipfile.ZipFile(archive) as package:
-                _extract_platform_tools(package, target_dir)
+            # Publish only a fully extracted package, on the same filesystem.
+            # A failed extraction must never become a reusable adb cache.
+            with tempfile.TemporaryDirectory(prefix=".platform-tools-", dir=target_dir.parent) as staging_dir:
+                staged = Path(staging_dir) / "package"
+                with zipfile.ZipFile(archive) as package:
+                    _extract_platform_tools(package, staged)
+                if not (staged / "platform-tools" / adb_executable_name(system_name)).is_file():
+                    raise AdbDownloadError("安装包里没有找到 adb")
+                if target_dir.exists():
+                    shutil.rmtree(target_dir)
+                staged.replace(target_dir)
         except (OSError, zipfile.BadZipFile) as exc:
             raise AdbDownloadError(f"解压失败：{exc}") from exc
 

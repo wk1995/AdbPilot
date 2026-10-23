@@ -131,12 +131,12 @@ class WifiStateMachineTests(unittest.TestCase):
 
     def test_pairing_code_uses_stdin_and_waits_for_tls_device(self):
         tls = Device("adb-phone._adb-tls-connect._tcp", "device")
-        self.client.devices = Mock(side_effect=[[], [tls]])
+        self.client.devices = Mock(return_value=[tls])
         with patch("adbpilot.client.subprocess.run") as run:
             run.side_effect = [
                 self.version("37.0.1"),
                 self.capabilities(),
-                subprocess.CompletedProcess(["adb", "pair", "192.168.1.10:37123"], 0, "Successfully paired\n", ""),
+                subprocess.CompletedProcess(["adb", "pair", "192.168.1.10:37123"], 0, "Successfully paired [guid=adb-phone]\n", ""),
             ]
             result = self.client.pair("192.168.1.10:37123", "123456", wait_for_device_seconds=0)
         pair_call = run.call_args_list[-1]
@@ -159,8 +159,60 @@ class WifiStateMachineTests(unittest.TestCase):
         self.assertEqual(result.status, "paired_waiting_for_connect")
         self.assertFalse(result.connected)
 
+    def test_pair_accepts_target_that_auto_connected_before_first_snapshot(self):
+        target = Device("adb-target._adb-tls-connect._tcp", "device")
+        self.client.devices = Mock(return_value=[target])
+        with patch.object(self.client, "wifi_capabilities", return_value=self._ready()), patch.object(
+            self.client, "_run_with_input", return_value=subprocess.CompletedProcess(
+                [], 0, "Successfully paired to 192.168.1.10:37123 [guid=adb-target]", ""
+            ),
+        ):
+            result = self.client.pair("192.168.1.10:37123", "123456", wait_for_device_seconds=0)
+        self.assertTrue(result.connected)
+        self.assertEqual(result.device_serial, target.serial)
+
+    def test_pair_waits_for_target_instead_of_unrelated_tls_arrival(self):
+        other = Device("adb-other._adb-tls-connect._tcp", "device")
+        target = Device("adb-target._adb-tls-connect._tcp.", "device")
+        self.client.devices = Mock(side_effect=[[], [other], [other, target]])
+        with patch.object(self.client, "wifi_capabilities", return_value=self._ready()), patch.object(
+            self.client, "_run_with_input", return_value=subprocess.CompletedProcess(
+                [], 0, "Successfully paired to 192.168.1.10:37123 [guid=adb-target]", ""
+            ),
+        ), patch("adbpilot.client.time.sleep"):
+            result = self.client.pair("192.168.1.10:37123", "123456", wait_for_device_seconds=2)
+        self.assertEqual(result.device_serial, target.serial)
+        self.assertTrue(result.connected)
+
+    def test_pair_uses_raw_transports_when_usb_alias_would_hide_tls_identity(self):
+        self.client.run = Mock(return_value=subprocess.CompletedProcess(
+            [], 0, "List of devices attached\nusb-target device\nadb-target._adb-tls-connect._tcp device\n", ""
+        ))
+        with patch.object(self.client, "wifi_capabilities", return_value=self._ready()), patch.object(
+            self.client, "_run_with_input", return_value=subprocess.CompletedProcess(
+                [], 0, "Successfully paired [guid=adb-target]", ""
+            ),
+        ):
+            result = self.client.pair("192.168.1.10:37123", "123456", wait_for_device_seconds=0)
+        self.assertEqual(result.device_serial, "adb-target._adb-tls-connect._tcp")
+        self.client.run.assert_called_once_with(["devices", "-l"])
+
+    def test_pair_does_not_claim_offline_target_or_target_without_identity(self):
+        for output, device in (
+            ("Successfully paired [guid=adb-target]", Device("adb-target._adb-tls-connect._tcp", "offline")),
+            ("Successfully paired", Device("adb-other._adb-tls-connect._tcp", "device")),
+        ):
+            with self.subTest(output=output):
+                self.client.devices = Mock(return_value=[device])
+                with patch.object(self.client, "wifi_capabilities", return_value=self._ready()), patch.object(
+                    self.client, "_run_with_input", return_value=subprocess.CompletedProcess([], 0, output, ""),
+                ):
+                    result = self.client.pair("192.168.1.10:37123", "123456", wait_for_device_seconds=0)
+                self.assertEqual(result.status, "paired_waiting_for_connect")
+                self.assertFalse(result.connected)
+
     def test_explicit_connect_is_a_separate_state(self):
-        self.client.devices = Mock(side_effect=[[], [], [Device("192.168.1.10:5555", "device")]])
+        self.client.devices = Mock(return_value=[Device("192.168.1.10:5555", "device")])
         self.client.connect = Mock(return_value="connected to 192.168.1.10:5555")
         with patch("adbpilot.client.subprocess.run") as run:
             run.side_effect = [
@@ -326,10 +378,10 @@ class WifiStateMachineTests(unittest.TestCase):
 
     def test_qr_secret_is_not_forced_to_six_digits(self):
         tls = Device("adb-phone._adb-tls-connect._tcp", "device")
-        self.client.devices = Mock(side_effect=[[], [tls]])
+        self.client.devices = Mock(return_value=[tls])
         with patch.object(self.client, "wifi_capabilities", return_value=self._ready()):
             with patch("adbpilot.client.subprocess.run") as run:
-                run.return_value = subprocess.CompletedProcess([], 0, "Successfully paired\n", "secret-value")
+                run.return_value = subprocess.CompletedProcess([], 0, "Successfully paired [guid=adb-phone]\n", "secret-value")
                 result = self.client.pair(
                     "192.168.1.10:37123",
                     "secret-value",

@@ -1,3 +1,4 @@
+import subprocess
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -76,6 +77,7 @@ ZYX987 no permissions usb:2-1
         client = AdbClient("adb")
         client.run = Mock(
             side_effect=lambda args, **kwargs: SimpleNamespace(
+                returncode=0,
                 stdout={"adb-phone._adb-tls-connect._tcp.": "PHONE-001", "192.168.1.71:44177": "PHONE-001"}[
                     kwargs["serial"]
                 ]
@@ -107,6 +109,21 @@ ZYX987 no permissions usb:2-1
             [["kill-server"], ["start-server"]],
         )
         self.assertIn("5038", client._record.call_args.kwargs["detail"])
+
+    def test_deduplication_query_failure_preserves_other_devices(self):
+        devices = [Device("usb-one", "device"), Device("usb-two", "device")]
+        for error in (subprocess.TimeoutExpired(["adb", "shell"], 5), OSError("transport vanished")):
+            with self.subTest(error=type(error).__name__):
+                client = AdbClient.__new__(AdbClient)
+                client.run = Mock(side_effect=[error, SimpleNamespace(returncode=0, stdout="PHONE-002")])
+                self.assertEqual(client._deduplicate_devices(devices), devices)
+                self.assertEqual(client.run.call_count, 2)
+
+    def test_failed_property_command_does_not_merge_unrelated_devices(self):
+        client = AdbClient.__new__(AdbClient)
+        client.run = Mock(return_value=SimpleNamespace(returncode=1, stdout="permission denied"))
+        devices = [Device("usb-one", "device"), Device("usb-two", "device")]
+        self.assertEqual(client._deduplicate_devices(devices), devices)
 
     def test_mdns_wait_does_not_accept_a_different_host(self):
         client = AdbClient("adb")
