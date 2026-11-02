@@ -21,6 +21,9 @@ _PROGRESS_LINE = re.compile(r"^Progress (\d+) of (\d+)$")
 _DOWNLOAD_LINE = re.compile(r"^Downloading\s+(\S+?)(?:\s+\(([^)]+)\))?$")
 _PHASE_LINE = re.compile(r"^(Collecting|Downloading|Installing|Successfully installed)\b")
 
+# Substring that appears in pip's PEP 668 "externally managed" refusal.
+_PEP668_MARKER = "externally managed"
+
 
 class DependencyError(AdbPilotError):
     """Raised when a Python dependency cannot be downloaded or installed."""
@@ -122,7 +125,22 @@ def install_dependency(
 
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "pip 安装失败").strip()
-        raise DependencyError(detail)
+        # PEP 668: uv/pipx/distro Python refuses an in-place `pip install`
+        # ("externally managed"). Retry once with the escape hatch pip itself
+        # suggests, so the optional QR dependency can still be installed at
+        # runtime without the user editing their environment by hand.
+        if _PEP668_MARKER in detail.lower() and "--break-system-packages" not in command:
+            if progress:
+                progress("检测到外部管理环境，尝试以 --break-system-packages 重试")
+            retry_command = command + ["--break-system-packages"]
+            try:
+                completed = run(retry_command, progress=progress, timeout=180)
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise DependencyError(f"安装失败：{exc}") from exc
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout or "pip 安装失败").strip()
+        if completed.returncode != 0:
+            raise DependencyError(detail)
 
     if request.import_names:
         import importlib

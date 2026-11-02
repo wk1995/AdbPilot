@@ -52,6 +52,25 @@ class PackageTests(unittest.TestCase):
                 )
         self.assertIn("network down", str(caught.exception))
 
+    def test_install_retries_with_break_system_packages_on_pep668(self):
+        first = subprocess.CompletedProcess(
+            args=[],
+            returncode=1,
+            stdout="error: externally-managed-environment\nThis environment is externally managed",
+            stderr="",
+        )
+        second = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+        runner = Mock(side_effect=[first, second])
+        with patch("adbpilot.packages.missing_imports", side_effect=[("qrcode",), ()]):
+            result = install_dependency(
+                DependencyRequest(requirement="qrcode[pil]", import_names=("qrcode", "PIL")),
+                runner=runner,
+            )
+        self.assertEqual(runner.call_count, 2)
+        retry_command = runner.call_args_list[1].args[0]
+        self.assertIn("--break-system-packages", retry_command)
+        self.assertIn("安装完成", result)
+
     def test_format_pip_progress_separates_download_and_install(self):
         state: dict[str, int] = {}
         lines = [
