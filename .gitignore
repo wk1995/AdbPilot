@@ -6,6 +6,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Connection history test output
+/tests_test_connection_history_*/
+
 # Build
 build/
 dist/
