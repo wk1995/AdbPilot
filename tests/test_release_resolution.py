@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "packaging" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 try:
-    from bump_version import sync_version
+    from bump_version import read_version, sync_version
     from resolve_release import is_business_file, resolve_release, validate_release_tag
     from release_status import (
         github_release_complete, mark_complete, marker_name, package_names,
@@ -242,13 +242,14 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertEqual(retried["macos_version"], first["macos_version"])
 
     def test_version_rollback_cannot_overwrite_existing_release_tag(self):
+        original_version = read_version("windows", self.root)
         self.write("adbpilot/gui.py", "release A\n")
         self.commit()
         first = self.resolve(selected={"windows"})
         sync_version("windows", first["windows_version"], self.root)
         self.commit()
         self.git("tag", self.tag("windows"))
-        sync_version("windows", "0.0.3", self.root)
+        sync_version("windows", original_version, self.root)
         self.write("adbpilot/gui.py", "release B\n")
         self.commit()
         with self.assertRaisesRegex(RuntimeError, "already exists"):
@@ -277,11 +278,12 @@ class ReleaseResolutionTests(unittest.TestCase):
         self.assertIn("already exists", completed.stderr)
 
     def test_existing_tag_reuse_requires_matching_business_code(self):
-        validate_release_tag("windows", "0.0.3", False, self.root)
+        version = read_version("windows", self.root)
+        validate_release_tag("windows", version, False, self.root)
         self.write("adbpilot/gui.py", "changed\n")
         self.commit()
         with self.assertRaisesRegex(RuntimeError, "business code differs"):
-            validate_release_tag("windows", "0.0.3", False, self.root)
+            validate_release_tag("windows", version, False, self.root)
 
 
 class ReleaseStatusTests(unittest.TestCase):
