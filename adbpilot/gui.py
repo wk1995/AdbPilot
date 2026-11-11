@@ -220,6 +220,7 @@ class AdbPilotGui(BaseTk):
         self.client: AdbClient | None = None
         self.adb_service_lock = threading.Lock()
         self.devices: list[Device] = []
+        self.device_transports: list[Device] = []
         self.device_rows: dict[str, dict[str, Any]] = {}
         self.device_poll_running = False
         self.manual_refresh_in_progress = False
@@ -1778,23 +1779,23 @@ class AdbPilotGui(BaseTk):
 
     def _read_devices(self, client: AdbClient | None = None) -> list[Device]:
         with self.adb_service_lock:
-            return (client or self._get_client()).devices()
+            return (client or self._get_client()).devices(deduplicate=False, observe_identities=True)
 
     def refresh_devices(self) -> None:
         self.manual_refresh_in_progress = True
 
-        def done(devices: list[Device]) -> None:
-            self.manual_refresh_in_progress = False
-            self._render_devices(devices, mark_disconnected=True, noisy=True)
+        def ready(client: AdbClient) -> None:
+            def done(devices: list[Device]) -> None:
+                self.manual_refresh_in_progress = False
+                if self.client is client and not self.mdns_stop.is_set():
+                    self._render_devices(devices, mark_disconnected=True, noisy=True)
+
+            self._run_async("刷新设备", lambda: self._read_devices(client), done, failed)
 
         def failed(_exc: Exception) -> None:
             self.manual_refresh_in_progress = False
 
-        self._prepare_client_async(
-            lambda client: self._run_async("刷新设备", lambda: self._read_devices(client), done, failed),
-            failed,
-            label="刷新设备",
-        )
+        self._prepare_client_async(ready, failed, label="刷新设备")
 
     def _poll_devices(self) -> None:
         if self.mdns_stop.is_set():
@@ -1829,7 +1830,7 @@ class AdbPilotGui(BaseTk):
         with self.adb_service_lock:
             if self.mdns_stop.is_set():
                 return [], None
-            devices = client.devices()
+            devices = client.devices(deduplicate=False, observe_identities=True)
             if (devices or self.mdns_manual_restart_running
                     or getattr(self, "pairing_in_progress", False) or getattr(self, "wireless_busy", False)):
                 return devices, None
@@ -1862,20 +1863,20 @@ class AdbPilotGui(BaseTk):
         self._render_devices(devices, mark_disconnected=True, noisy=False)
 
     def _render_devices(self, devices: list[Device], *, mark_disconnected: bool = True, noisy: bool = True) -> None:
-        previous_connected = {
-            serial
-            for serial, row in self.device_rows.items()
-            if row.get("state") != "已断开"
-        }
+        previous_connected = {device.serial for device in self.device_transports}
         unique_devices: dict[str, Device] = {}
         for device in devices:
             previous = unique_devices.get(device.serial)
             if previous is None or (not previous.is_ready and device.is_ready):
                 unique_devices[device.serial] = device
-        devices = list(unique_devices.values())
+        transports = list(unique_devices.values())
+        self.device_transports = transports
+        current_serials = set(unique_devices)
+        devices = transports
+        if self.client is not None:
+            devices = self.client.deduplicate_cached_devices(transports, preferred_serial=self._selected_serial())
         self.devices = devices
-        self._update_mdns_recovery_notice(devices)
-        current_serials = {device.serial for device in devices}
+        self._update_mdns_recovery_notice(transports)
         for item in self.device_table.get_children():
             self.device_table.delete(item)
         next_rows: dict[str, dict[str, Any]] = {}
@@ -1908,7 +1909,7 @@ class AdbPilotGui(BaseTk):
 
         self.device_table.tag_configure("disconnected", foreground="#9ca3af")
         self.device_rows = next_rows
-        self._record_rendered_device_changes(previous_connected, devices)
+        self._record_rendered_device_changes(previous_connected, transports)
 
         selected = self.selected_serial_var.get().strip()
         locked = self.locked_serial_var.get().strip()

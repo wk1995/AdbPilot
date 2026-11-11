@@ -130,7 +130,7 @@ class GuiHelperTests(unittest.TestCase):
 
         client = Mock()
         client.restart_server.side_effect = restart
-        client.devices.side_effect = lambda: query_started.set() or []
+        client.devices.side_effect = lambda **_options: query_started.set() or []
         gui = SimpleNamespace(adb_service_lock=threading.Lock(), _get_client=lambda: client,
                               mdns_recovery=MdnsRecoveryController())
 
@@ -198,6 +198,33 @@ class GuiHelperTests(unittest.TestCase):
             self.assertEqual(AdbPilotGui._read_devices_and_recover(gui, client), ([phone], None))
             client.recover_stale_mdns.assert_not_called()
 
+    def test_gui_dedup_preserves_locked_transport_and_does_not_report_hidden_alias_as_disconnected(self):
+        usb = Device("test-usb", "device", {"transport_id": "1", "usb": "1"})
+        wifi = Device("192.0.2.10:37001", "device", {"transport_id": "2"})
+        client = Mock()
+        client.deduplicate_cached_devices.return_value = [usb]
+        gui = self.make_mdns_gui(client)
+        gui.device_transports = [usb, wifi]
+        gui.device_rows = {device.serial: {"state": device.state} for device in gui.device_transports}
+        gui.device_table = Mock()
+        gui.device_table.get_children.return_value = []
+        gui.selected_serial_var = FakeVar(wifi.serial)
+        gui.locked_serial_var = FakeVar(usb.serial)
+        gui._selected_serial = lambda: AdbPilotGui._selected_serial(gui)
+        gui._record_rendered_device_changes = Mock()
+        gui._append_output = Mock()
+        gui._update_mdns_recovery_notice = Mock()
+        gui._update_lock_status = Mock()
+        gui._render_floating_devices = Mock()
+
+        AdbPilotGui._render_devices(gui, [usb, wifi], noisy=False)
+
+        client.deduplicate_cached_devices.assert_called_once_with([usb, wifi], preferred_serial=usb.serial)
+        gui._record_rendered_device_changes.assert_called_once_with({usb.serial, wifi.serial}, [usb, wifi])
+        self.assertEqual(gui.selected_serial_var.get(), usb.serial)
+        self.assertNotIn(wifi.serial, gui.device_rows)
+        gui._append_output.assert_not_called()
+
     def test_closed_poll_does_not_query_or_recover(self):
         client = Mock()
         gui = self.make_mdns_gui(client)
@@ -231,7 +258,7 @@ class GuiHelperTests(unittest.TestCase):
         client.recover_stale_mdns.side_effect = recover
         gui = self.make_mdns_gui(client)
         refresh_client = Mock()
-        refresh_client.devices.side_effect = lambda: queried.set() or []
+        refresh_client.devices.side_effect = lambda **_options: queried.set() or []
         def refresh():
             query_attempted.set()
             AdbPilotGui._read_devices(gui, refresh_client)

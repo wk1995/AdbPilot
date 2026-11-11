@@ -18,10 +18,10 @@
 ## 代码入口与会话（R1、R2、R5）
 
 - 在 [`cli.py`](../../adbpilot/cli.py#L45) 增加 `lag record` 和 `lag compare`，由 `lag.py` 管理会话，`lag_report.py` 负责报告、帧解析和离线比较。`compare` 在初始化 `AdbClient` 前分发，支持没有 ADB 的电脑。
-- 复用 [`AdbClient.run`](../../adbpilot/client.py#L47) 和 [`parse_devices`](../../adbpilot/client.py#L1206)。为 `run` 和 `_build_command` 增加可选 `transport_id`，与 `serial` 互斥。通过 `adb devices -l` 的原始结果选目标。多条在线传输时用户传入精确的 `--serial`，仅一条时可省略。ADB 支持 `-t ID` 指向 server 内的传输。 [ADB 手册](https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/docs/user/adb.1.md)
+- 复用 [`AdbClient.run`](../../adbpilot/client.py#L51) 和 [`parse_devices`](../../adbpilot/client.py#L1240)。为 `run` 和 `_build_command` 增加可选 `transport_id`，与 `serial` 互斥。通过 `adb devices -l` 的原始结果选目标。多条在线传输时用户传入精确的 `--serial`，仅一条时可省略。ADB 支持 `-t ID` 指向 server 内的传输。 [ADB 手册](https://android.googlesource.com/platform/packages/modules/adb/+/refs/heads/main/docs/user/adb.1.md)
 - 传输类型优先读取 `usb` 等 ADB 元数据，识别无线 mDNS 标识和 IP 端点。模拟器及无法确认物理介质的远程 ADB 连接保留明确的 `emulator` 或 `unknown` 标记。首版真机流程只承诺验证 USB 和无线 ADB。
 - 会话内每次设备端调用前，用一次主机侧设备列表检查已选 `serial`、`transport_id` 和 `device` 状态。出现明确的掉线、授权失效或 ID 变化即终止，已有样本写入部分报告。缺少 ID 的 ADB 返回兼容提示。连接列表与发命令之间存在竞态，遇到共享 ADB server 重启或设备重新授权，应废弃受影响的测量轮次。诊断只发只读命令，不主动配对、断开、重启或恢复连接。
-- 默认 30 秒，可配置 10–120 秒。每 3 秒安排一个探针，`adb -t <ID> shell -n true` 单次超时 2 秒，主机侧列表检查也受独立的短超时和剩余会话预算约束。`-n` 让标记输入留在诊断 CLI。采样串行，错过的时刻跳过，避免慢链路上追赶补采。连续超时可持续记录到窗口结束，确认目标丢失立即停止。
+- 默认 30 秒，可配置 10–120 秒。每 3 秒安排一个探针，`adb -t <ID> shell -n true` 单次超时 2 秒，主机侧列表检查也受独立的短超时和剩余会话预算约束。`-n` 让标记输入留在诊断 CLI。采样串行，错过的时刻跳过。两次连续设备命令超时后保存快照，每 15 秒最多再执行一次探针，确认目标丢失立即停止。[超时状态与快照](freeze-diagnostics-design.md#先修正诊断结果和采集负载)
 - 探针用 `time.monotonic_ns()` 计时，从启动 ADB 子进程前到命令返回。计时包含进程启动、主机 ADB server、传输和设备 shell 执行。预检与设备列表查询的耗时放在探针计时之外。记录计划点、实际发起时间、耗时和状态。只从成功样本计算中位数和最大值，超时、失败、跳过单独计数。少于 5 个成功样本时显示样本不足，不输出差值。
 - `--mark-on-enter` 只在交互终端启用。输入线程只入队时间点，采集线程仍是唯一的设备端命令调用者。提示和进度发到 stderr，结构化 stdout 保留给 JSON。Ctrl+C 停止调度，尽量写出部分报告，退出码 `130`。正常输出 `0`，参数、目标、I/O 错误或目标中断返回 `2`，并在能够写入时保留已取得的数据。
 

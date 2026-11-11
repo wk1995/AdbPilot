@@ -6,6 +6,7 @@ import os
 import subprocess
 import time
 import re
+from contextlib import nullcontext
 from pathlib import Path
 from typing import BinaryIO, Callable, Iterable, TextIO
 
@@ -20,6 +21,7 @@ from .errors import (
     suggestion_for_device_state,
 )
 from . import history as connection_history
+from .device_identity import DeviceIdentityCache
 from .models import AdbWifiCapabilities, CommandResult, Device, DeviceInfo, RunningProcess, WirelessPairingResult
 from .platform_adapter import PlatformAdapter
 from .mdns import ADB_SERVER_START_TIMEOUT_SECONDS, MdnsRecoveryController, MdnsRecoveryResult, MdnsService, has_name_conflict
@@ -30,6 +32,8 @@ DEFAULT_TIMEOUT = 30
 
 class AdbClient:
     """Small, testable wrapper around the adb executable."""
+
+    _device_identities: DeviceIdentityCache | None = None
 
     def __init__(
         self,
@@ -139,24 +143,48 @@ class AdbClient:
         # Another adb (Android Studio, a second SDK) can hold the USB device
         # on a different port. kill-server only stops the server this client
         # talks to, so the phone stays invisible after a "successful" restart.
-        stopped = self._stop_competing_adb_servers()
-        self.run(["kill-server"], check=False)
-        self.run(["start-server"])
+        with self._device_identities.restarting() if self._device_identities is not None else nullcontext():
+            stopped = self._stop_competing_adb_servers()
+            self.run(["kill-server"], check=False)
+            self.run(["start-server"])
         detail = f"stopped competing adb: {', '.join(stopped)}" if stopped else ""
         self._record("restart-server", ok=True, message="adb server 已重启", detail=detail)
 
     def restart_current_server(self) -> None:
         """Restart only this client's server with the recovery startup budget."""
-        self.run(["kill-server"], check=False, timeout=3)
-        self.run(["start-server"], timeout=ADB_SERVER_START_TIMEOUT_SECONDS)
+        with self._device_identities.restarting() if self._device_identities is not None else nullcontext():
+            self.run(["kill-server"], check=False, timeout=3)
+            self.run(["start-server"], timeout=ADB_SERVER_START_TIMEOUT_SECONDS)
         self._record("restart-server", ok=True, message="当前 adb server 已重启")
 
-    def devices(self, *, deduplicate: bool = True) -> list[Device]:
-        result = self.run(["devices", "-l"])
+    def devices(self, *, deduplicate: bool = True, observe_identities: bool = False) -> list[Device]:
+        if observe_identities and self._device_identities is None:
+            self._device_identities = DeviceIdentityCache()
+        cache = self._device_identities
+        try:
+            result = self.run(["devices", "-l"])
+        except (AdbCommandError, OSError, subprocess.SubprocessError):
+            if observe_identities and cache is not None:
+                cache.clear()
+            raise
         devices = parse_devices(result.stdout)
+        if observe_identities and cache is not None:
+            if re.search(r"daemon not running|server version .*killing", result.stderr, re.I):
+                cache.clear()
+            cache.observe(devices, self._cached_hardware_serial)
+            return self.deduplicate_cached_devices(devices) if deduplicate else devices
         return self._deduplicate_devices(devices) if deduplicate else devices
 
-    def _deduplicate_devices(self, devices: list[Device]) -> list[Device]:
+    def deduplicate_cached_devices(self, devices: list[Device], *, preferred_serial: str | None = None) -> list[Device]:
+        cache = self._device_identities
+        if cache is None:
+            return devices
+        return self._deduplicate_devices(devices, identity_lookup=cache.lookup, preferred_serial=preferred_serial)
+
+    def _deduplicate_devices(
+        self, devices: list[Device], *, identity_lookup: Callable[[Device], str | None] | None = None,
+        preferred_serial: str | None = None,
+    ) -> list[Device]:
         """Collapse multiple ADB transports that point to the same handset."""
         ready_devices = [device for device in devices if device.is_ready]
         if len(ready_devices) < 2:
@@ -169,7 +197,7 @@ class AdbClient:
                 deduplicated.append(device)
                 continue
 
-            hardware_serial = self._hardware_serial(device)
+            hardware_serial = (identity_lookup or self._hardware_serial)(device)
             if not hardware_serial:
                 deduplicated.append(device)
                 continue
@@ -180,19 +208,23 @@ class AdbClient:
                 deduplicated.append(device)
                 continue
 
-            if self._device_preference(device) > self._device_preference(deduplicated[existing_index]):
+            previous = deduplicated[existing_index]
+            if device.serial == preferred_serial or (
+                previous.serial != preferred_serial and self._device_preference(device) > self._device_preference(previous)
+            ):
                 deduplicated[existing_index] = device
 
         return deduplicated
 
     def _hardware_serial(self, device: Device) -> str | None:
+        return self._read_hardware_serial(["shell", "getprop", "ro.serialno"], serial=device.serial, timeout=5)
+
+    def _cached_hardware_serial(self, identifier: int) -> str | None:
+        return self._read_hardware_serial(["shell", "-n", "getprop", "ro.serialno"], transport_id=identifier, timeout=2)
+
+    def _read_hardware_serial(self, command: list[str], **options: str | int) -> str | None:
         try:
-            result = self.run(
-                ["shell", "getprop", "ro.serialno"],
-                serial=device.serial,
-                timeout=5,
-                check=False,
-            )
+            result = self.run(command, check=False, **options)
         except (OSError, subprocess.SubprocessError):
             return None
         if result.returncode != 0:
@@ -670,9 +702,11 @@ class AdbClient:
         cancelled: Callable[[], bool] = lambda: False,
         progress: Callable[[str], None] | None = None,
     ) -> MdnsRecoveryResult:
-        return (controller or self.mdns_recovery).recover(
-            self, adapter or self.platform_adapter, cancelled=cancelled, progress=progress,
-        )
+        cache = self._device_identities
+        with cache.restarting() if cache is not None else nullcontext():
+            return (controller or self.mdns_recovery).recover(
+                self, adapter or self.platform_adapter, cancelled=cancelled, progress=progress,
+            )
 
     def wait_for_mdns_connect_service(self, *, host: str | None = None, timeout: int = 30) -> dict[str, str] | None:
         deadline = time.monotonic() + timeout

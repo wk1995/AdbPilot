@@ -45,12 +45,17 @@ class FakeClient:
         self.frames = 0
         self.delay = 0.02
         self.timeout_first = False
+        self.timeout_all = False
+        self.host_error_after = None
         self.interrupt_first = False
         self.replace_after = None
 
     def run(self, command, *, timeout, check=True, transport_id=None):
         self.commands.append((command, transport_id, timeout))
         if command == ["devices", "-l"]:
+            if self.host_error_after == self.probes:
+                self.clock.sleep(timeout)
+                raise subprocess.TimeoutExpired(command, timeout)
             output = DEVICES
             if self.replace_after == self.probes:
                 output = output.replace("transport_id:8", "transport_id:9")
@@ -66,7 +71,7 @@ class FakeClient:
             output = frame_dump(*rows)
         else:
             self.probes += 1
-            if self.probes == 1 and self.timeout_first:
+            if self.timeout_all or (self.probes == 1 and self.timeout_first):
                 self.clock.sleep(timeout)
                 raise subprocess.TimeoutExpired(command, timeout, output="private device output")
             if self.probes == 1 and self.interrupt_first:
@@ -81,11 +86,11 @@ class LagTests(unittest.TestCase):
         self.clock = FakeClock()
         self.client = FakeClient(self.clock)
 
-    def capture(self, *, package=None, serial=WIFI, duration=15):
+    def capture(self, *, package=None, serial=WIFI, duration=15, on_checkpoint=None):
         with patch.object(lag.time, "monotonic_ns", self.clock.now), patch.object(lag.time, "sleep", self.clock.sleep):
             with redirect_stderr(io.StringIO()):
                 return lag.record_session(self.client, serial=serial, package=package, label="wifi-test",
-                                          duration=duration, mark_on_enter=False)
+                                          duration=duration, mark_on_enter=False, on_checkpoint=on_checkpoint)
 
     def test_mixed_transports_require_explicit_selection(self):
         devices = parse_devices(DEVICES)
@@ -153,6 +158,51 @@ class LagTests(unittest.TestCase):
         self.assertEqual(report["adb"]["median_ms"], 20)
         starts = [sample["started_ms"] for sample in report["adb"]["samples"]]
         self.assertTrue(all(right - left >= 3000 for left, right in zip(starts, starts[1:])))
+
+    def test_repeated_timeouts_checkpoint_and_back_off_without_final_frame_query(self):
+        self.client.timeout_all = True
+        checkpoint = []
+
+        def save(report):
+            self.assertEqual(self.client.probes, 2)
+            checkpoint.append(report)
+
+        report = self.capture(package=PACKAGE, duration=35, on_checkpoint=save)
+        self.assertEqual(len(checkpoint), 1)
+        self.assertEqual(checkpoint[0]["status"], "partial")
+        self.assertEqual(checkpoint[0]["adb"]["counts"]["timeout"], 2)
+        self.assertEqual(checkpoint[0]["diagnosis"]["first_detected_ms"], 5000)
+        self.assertEqual(report["session_id"], checkpoint[0]["session_id"])
+        starts = [sample["started_ms"] for sample in report["adb"]["samples"] if sample["status"] == "timeout"]
+        self.assertEqual(starts, [0, 3000, 18000, 33000])
+        self.assertEqual(report["adb"]["skipped_by_reason"], {"host_query_failed": 0, "backoff": 8})
+        self.assertEqual(report["frames"]["reasons"], ["device_unresponsive"])
+        self.assertEqual(self.client.frames, 1)
+
+    def test_host_query_failures_do_not_count_as_device_timeouts(self):
+        self.client.timeout_first = True
+        self.client.host_error_after = 1
+        report = self.capture()
+        self.assertNotIn("diagnosis", report)
+        self.assertEqual(report["adb"]["counts"]["timeout"], 1)
+        self.assertEqual(report["adb"]["skipped_by_reason"]["host_query_failed"], 4)
+
+    def test_cli_publishes_separate_timeout_snapshot_and_final_report(self):
+        self.client.timeout_all = True
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.json"
+            stderr = io.StringIO()
+            with patch.object(cli, "AdbClient", return_value=self.client), patch.object(
+                lag.time, "monotonic_ns", self.clock.now
+            ), patch.object(lag.time, "sleep", self.clock.sleep), redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+                self.assertEqual(cli.main(["lag", "record", "--serial", WIFI, "--out", str(path), "--json"]), 0)
+            checkpoint, = Path(directory).glob("report.timeout-*.json")
+            saved = lag_report.load_report(checkpoint)
+            final = lag_report.load_report(path)
+            self.assertEqual(saved["status"], "partial")
+            self.assertEqual(saved["diagnosis"], final["diagnosis"])
+            self.assertIn(lag_report.UNRESPONSIVE_MESSAGE, stderr.getvalue())
+            self.assertEqual(final["adb"]["counts"]["timeout"], 3)
 
     def test_interruption_produces_serializable_partial_report(self):
         self.client.interrupt_first = True

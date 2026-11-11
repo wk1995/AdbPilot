@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 from .client import AdbClient, is_tls_connect_serial, parse_devices
@@ -25,6 +25,8 @@ DEFAULT_DURATION = 30
 MIN_DURATION = 10
 MAX_DURATION = 120
 INTERVAL = 3
+BACKOFF_INTERVAL = 15
+UNRESPONSIVE_TIMEOUTS = 2
 NANOSECONDS_PER_SECOND = 1_000_000_000
 PROBE_TIMEOUT = 2
 FRAME_TIMEOUT = 4
@@ -180,20 +182,30 @@ def _wait_until(deadline: int) -> None:
 
 
 def _sample_probes(client: AdbClient, target: Device, identifier: int, start: int, duration: int,
-                   samples: list[dict[str, Any]]) -> None:
+                   samples: list[dict[str, Any]], on_unresponsive: Callable[[int], None]) -> None:
     last_probe = start - INTERVAL * NANOSECONDS_PER_SECOND
+    consecutive_timeouts = 0
+    backed_off = False
     for offset in range(0, duration, INTERVAL):
         planned = start + offset * NANOSECONDS_PER_SECOND
         slot_end = start + min(offset + INTERVAL, duration) * NANOSECONDS_PER_SECOND
         sample = {"planned_ms": offset * 1000, "started_ms": None, "elapsed_ms": None, "status": "skipped"}
         samples.append(sample)
-        _wait_until(min(slot_end, max(planned, last_probe + INTERVAL * NANOSECONDS_PER_SECOND)))
+        interval = BACKOFF_INTERVAL if backed_off else INTERVAL
+        next_probe = last_probe + interval * NANOSECONDS_PER_SECOND
+        skip_for_backoff = backed_off and next_probe >= slot_end
+        _wait_until(planned if skip_for_backoff else min(slot_end, max(planned, next_probe)))
         remaining = (slot_end - time.monotonic_ns()) / NANOSECONDS_PER_SECOND
         if remaining <= 0:
             continue
         try:
             _check_target(client, target, min(PROBE_TIMEOUT, remaining))
         except (AdbCommandError, subprocess.TimeoutExpired):
+            sample["skip_reason"] = "host_query_failed"
+            consecutive_timeouts = 0
+            continue
+        if skip_for_backoff:
+            sample["skip_reason"] = "backoff"
             continue
 
         probe_start = time.monotonic_ns()
@@ -217,11 +229,16 @@ def _sample_probes(client: AdbClient, target: Device, identifier: int, start: in
             if status != "skipped":
                 sample.update(status=status, started_ms=milliseconds(probe_start - start),
                               elapsed_ms=milliseconds(time.monotonic_ns() - probe_start))
+        consecutive_timeouts = consecutive_timeouts + 1 if status == "timeout" else 0
+        if not backed_off and consecutive_timeouts >= UNRESPONSIVE_TIMEOUTS:
+            backed_off = True
+            on_unresponsive(time.monotonic_ns())
     _wait_until(start + duration * NANOSECONDS_PER_SECOND)
 
 
 def record_session(client: AdbClient, *, serial: str | None, package: str | None, label: str | None,
-                   duration: int, mark_on_enter: bool) -> dict[str, Any]:
+                   duration: int, mark_on_enter: bool,
+                   on_checkpoint: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
     target, identifier = _select_target(client, serial)
     samples: list[dict[str, Any]] = []
     marks: list[int] = []
@@ -229,8 +246,44 @@ def record_session(client: AdbClient, *, serial: str | None, package: str | None
     watcher = None
     reason = None
     version = sdk = start = end = None
+    first_unresponsive = None
+    session_id = uuid4().hex
     started_at = datetime.now(timezone.utc).isoformat()
     frames = frame_result("unavailable", "capture_interrupted") if package else frame_result("not_requested")
+
+    def build_report(status: str, finished: int) -> dict[str, Any]:
+        report = {
+            "schema_version": SCHEMA_VERSION,
+            "session_id": session_id,
+            "status": status,
+            "stop_reason": reason,
+            "context": {
+                "started_at": started_at, "label": label, "package": package,
+                "host_platform": f"{platform.system()}-{platform.machine()}",
+                "adb_version": version, "android_sdk": sdk, "transport": _transport_type(target),
+                "duration_seconds": duration, "interval_seconds": INTERVAL,
+                "elapsed_ms": milliseconds(finished - start) if start is not None else 0,
+            },
+            "adb": {"samples": list(samples), **summarize_probes(samples)},
+            "frames": frames,
+            "marks": [milliseconds(mark - start) for mark in list(marks) if start is not None and start <= mark <= finished],
+        }
+        if first_unresponsive is not None:
+            report["diagnosis"] = {
+                "status": "device_unresponsive",
+                "first_detected_ms": milliseconds(first_unresponsive - start),
+                "backoff_seconds": BACKOFF_INTERVAL,
+            }
+        return report
+
+    def note_unresponsive(detected: int) -> None:
+        nonlocal first_unresponsive, frames
+        first_unresponsive = detected
+        if package:
+            frames = frame_result("unavailable", "device_unresponsive")
+        if on_checkpoint is not None:
+            on_checkpoint(build_report("partial", detected))
+
     try:
         version, sdk = _metadata(client, target, identifier)
         before, frame_error = _frames(client, target, identifier, package) if package else (None, None)
@@ -245,10 +298,10 @@ def record_session(client: AdbClient, *, serial: str | None, package: str | None
         if mark_on_enter:
             watcher = threading.Thread(target=_watch_enter, args=(stop, marks), daemon=True)
             watcher.start()
-        _sample_probes(client, target, identifier, start, duration, samples)
+        _sample_probes(client, target, identifier, start, duration, samples, note_unresponsive)
         end = time.monotonic_ns()
         stop.set()
-        if before is not None and package:
+        if before is not None and package and first_unresponsive is None:
             after, frame_error = _frames(client, target, identifier, package)
             if after is None:
                 frames = frame_result("unavailable", frame_error or "unsupported_frame_output")
@@ -276,19 +329,4 @@ def record_session(client: AdbClient, *, serial: str | None, package: str | None
             watcher.join(timeout=0.2)
 
     status = "complete" if reason is None else "partial" if start is not None else "failed"
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "session_id": uuid4().hex,
-        "status": status,
-        "stop_reason": reason,
-        "context": {
-            "started_at": started_at, "label": label, "package": package,
-            "host_platform": f"{platform.system()}-{platform.machine()}",
-            "adb_version": version, "android_sdk": sdk, "transport": _transport_type(target),
-            "duration_seconds": duration, "interval_seconds": INTERVAL,
-            "elapsed_ms": milliseconds(end - start) if start is not None else 0,
-        },
-        "adb": {"samples": samples, **summarize_probes(samples)},
-        "frames": frames,
-        "marks": [milliseconds(mark - start) for mark in marks if start is not None and start <= mark <= end],
-    }
+    return build_report(status, end)

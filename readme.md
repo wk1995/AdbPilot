@@ -368,6 +368,8 @@ adbpilot lag compare wifi-idle.json wifi-debug.json --same-device
 
 默认采集 30 秒。`--mark-on-enter` 可在交互终端标记卡顿时刻，`--package com.example.app` 可补充应用的近期 HWUI 帧数据。报告中的 ADB 耗时包含电脑和手机两端的命令处理。近期帧样本的覆盖可能短于采集窗口。要比较关闭无线调试时的手机画面表现，可用手机本地 System Tracing 录制。 [真机对照步骤](doc/wireless-debug-lag/feasibility.md#真机对照)
 
+ADB 仍显示在线且连续两次设备命令超时时，CLI 会立即提示无响应，在 `--out` 同目录保存一份 `*.timeout-*.json` 快照。后续每 15 秒最多执行一次探针，并跳过结束帧查询。最终报告仍写入 `--out` 指定的文件。
+
 ## 推荐架构
 
 ```text

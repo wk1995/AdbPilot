@@ -18,6 +18,8 @@ SCHEMA_VERSION = 1
 MIN_SUCCESSFUL_PROBES = 5
 FRAME_SOURCE = "gfxinfo_framestats"
 PROBE_STATUSES = ("ok", "timeout", "failed", "skipped")
+SKIP_REASONS = ("host_query_failed", "backoff")
+UNRESPONSIVE_MESSAGE = "ADB 显示在线，设备命令无响应（连续超时）。"
 FRAME_STATUSES = ("recent", "partial", "unavailable", "not_requested")
 REPORT_LIMIT = 1024 * 1024
 
@@ -28,14 +30,18 @@ def milliseconds(nanoseconds: int) -> float:
 
 def summarize_probes(samples: list[dict[str, Any]]) -> dict[str, Any]:
     counts = dict.fromkeys(PROBE_STATUSES, 0)
+    skipped = dict.fromkeys(SKIP_REASONS, 0)
     elapsed = []
     for sample in samples:
         status = sample["status"]
         counts[status] += 1
+        if status == "skipped" and sample.get("skip_reason") in skipped:
+            skipped[sample["skip_reason"]] += 1
         if status == "ok":
             elapsed.append(sample["elapsed_ms"])
     return {
         "counts": counts,
+        "skipped_by_reason": skipped,
         "median_ms": round(statistics.median(elapsed), 3) if elapsed else None,
         "max_ms": max(elapsed) if elapsed else None,
     }
@@ -206,6 +212,14 @@ def _validate_report(report: Any) -> None:
         raise ValueError("不支持的诊断报告版本")
     if report["status"] not in ("complete", "partial", "failed"):
         raise ValueError("未知的会话状态")
+    diagnosis = report.get("diagnosis")
+    if diagnosis is not None and (
+        diagnosis["status"] != "device_unresponsive"
+        or not _nonnegative_number(diagnosis["first_detected_ms"])
+        or not _nonnegative_number(diagnosis["backoff_seconds"])
+        or diagnosis["backoff_seconds"] == 0
+    ):
+        raise ValueError("诊断状态无效")
     context = report["context"]
     for field_name in ("host_platform", "adb_version", "transport", "label", "package"):
         value = context[field_name]
@@ -226,6 +240,8 @@ def _validate_report(report: Any) -> None:
     for sample in samples:
         if sample["status"] not in PROBE_STATUSES or not _nonnegative_number(sample["planned_ms"]):
             raise ValueError("ADB 样本状态或时间无效")
+        if "skip_reason" in sample and (sample["status"] != "skipped" or sample["skip_reason"] not in SKIP_REASONS):
+            raise ValueError("ADB 样本跳过原因无效")
         for field_name in ("started_ms", "elapsed_ms"):
             value = sample[field_name]
             if (sample["status"] == "skipped" and value is not None) or (
@@ -258,6 +274,8 @@ def compare_reports(baseline: dict[str, Any], current: dict[str, Any], *, same_d
         reasons.append("未确认是同一台手机")
     if baseline["status"] != "complete" or current["status"] != "complete":
         reasons.append("至少一份采集未完整结束")
+    if any(report.get("diagnosis") for report in (baseline, current)):
+        reasons.append("至少一份报告因设备命令无响应而降频")
     if any(summary["counts"]["ok"] < MIN_SUCCESSFUL_PROBES for summary in summaries):
         reasons.append(f"至少一份报告的成功样本少于 {MIN_SUCCESSFUL_PROBES} 条")
     for key, label in (
@@ -280,4 +298,6 @@ def compare_reports(baseline: dict[str, Any], current: dict[str, Any], *, same_d
             "status": report["status"], "context": report["context"],
             "adb": summary, "frames": report["frames"], "marks": report["marks"],
         }
+        if report.get("diagnosis"):
+            result[name]["diagnosis"] = report["diagnosis"]
     return result

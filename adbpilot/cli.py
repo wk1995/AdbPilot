@@ -520,8 +520,19 @@ def handle_lag_record(client: AdbClient, args: argparse.Namespace) -> int:
     lag.validate_inputs(args.package, args.label, args.mark_on_enter)
     if args.out.exists() or args.out.is_symlink():
         raise AdbPilotError(f"报告文件已存在，请选择新路径：{args.out}")
+
+    def save_checkpoint(report: dict[str, Any]) -> None:
+        path = args.out.with_name(f"{args.out.stem}.timeout-{report['session_id'][:8]}.json")
+        print(f"{lag_report.UNRESPONSIVE_MESSAGE} 后续每 {lag.BACKOFF_INTERVAL} 秒最多探测一次。", file=sys.stderr, flush=True)
+        try:
+            lag_report.write_report(path, report)
+        except AdbPilotError as exc:
+            print(f"超时快照保存失败：{exc}", file=sys.stderr, flush=True)
+        else:
+            print(f"超时快照已保存至 {path}", file=sys.stderr, flush=True)
+
     report = lag.record_session(client, serial=args.serial, package=args.package, label=args.label,
-                                duration=args.duration, mark_on_enter=args.mark_on_enter)
+                                duration=args.duration, mark_on_enter=args.mark_on_enter, on_checkpoint=save_checkpoint)
     lag_report.write_report(args.out, report)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
@@ -568,7 +579,12 @@ def _print_lag_summary(report: dict[str, Any]) -> None:
     statuses = {"complete": "已完成", "partial": "部分完成", "failed": "采集失败"}
     print(f"{label} · {transport.get(context['transport'], '未知传输')} · {statuses[report['status']]}"
           f" · {context['elapsed_ms'] / 1000:.1f}/{context['duration_seconds']:g} 秒")
+    if report.get("diagnosis"):
+        print(f"采集过程中检测到 {lag_report.UNRESPONSIVE_MESSAGE}")
     print(f"ADB 命令耗时  成功 {counts['ok']}  超时 {counts['timeout']}  失败 {counts['failed']}  跳过 {counts['skipped']}")
+    skipped = report["adb"]["skipped_by_reason"]
+    if any(skipped.values()):
+        print(f"跳过原因  主机列表查询失败 {skipped['host_query_failed']}  探测降频 {skipped['backoff']}")
     print(f"中位数 {duration(report['adb']['median_ms'])}  最大值 {duration(report['adb']['max_ms'])}")
     if counts["ok"] < lag_report.MIN_SUCCESSFUL_PROBES:
         print(f"成功样本少于 {lag_report.MIN_SUCCESSFUL_PROBES} 条。")
@@ -581,6 +597,7 @@ def _print_lag_summary(report: dict[str, Any]) -> None:
             "buffer_discontinuity": "前后帧缓冲无交集", "no_new_frames": "未取得新的有效帧",
             "capture_interrupted": "未完成前后帧采集", "frame_query_timeout": "帧查询超时",
             "frame_query_failed": "帧查询失败", "unsupported_frame_output": "设备未返回可识别的帧数据",
+            "device_unresponsive": "设备命令连续超时，已跳过结束帧查询",
         }
         if frames["reasons"]:
             print("帧数据限制  " + "；".join(frame_reasons.get(reason, "其他限制") for reason in frames["reasons"]))
