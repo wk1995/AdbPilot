@@ -49,10 +49,11 @@ class AdbClient:
         args: Iterable[str],
         *,
         serial: str | None = None,
-        timeout: int | None = None,
+        transport_id: int | None = None,
+        timeout: float | None = None,
         check: bool = True,
     ) -> CommandResult:
-        command = self._build_command(args, serial=serial)
+        command = self._build_command(args, serial=serial, transport_id=transport_id)
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -1098,9 +1099,15 @@ class AdbClient:
             return _parse_ss_adb_listeners(completed.stdout)
         return []
 
-    def _build_command(self, args: Iterable[str], *, serial: str | None = None) -> list[str]:
+    def _build_command(
+        self, args: Iterable[str], *, serial: str | None = None, transport_id: int | None = None
+    ) -> list[str]:
         command = [str(self.adb_path)]
-        if serial:
+        if transport_id is not None:
+            if serial:
+                raise ValueError("ADB serial and transport_id are mutually exclusive")
+            command.extend(["-t", str(transport_id)])
+        elif serial:
             command.extend(["-s", serial])
         command.extend(str(arg) for arg in args)
         return command
@@ -1206,6 +1213,9 @@ def parse_devices(output: str) -> list[Device]:
         parts = line.split()
         if len(parts) < 2:
             continue
+        # mDNS can append a spaced conflict suffix to an instance name.
+        if len(parts) >= 3 and re.fullmatch(r"\([0-9]+\)\._adb-tls-connect\._tcp\.?", parts[1], re.I):
+            parts[:2] = [f"{parts[0]} {parts[1]}"]
 
         serial, state = parts[0], parts[1]
         detail_start = 2

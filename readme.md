@@ -356,6 +356,18 @@ adbpilot bugreport ./reports/bugreport.zip
 adbpilot install -s emulator-5554 app-debug.apk
 ```
 
+### 无线调试卡顿诊断
+
+先用 `adb devices -l` 确认目标连接。有多个在线传输时，用 `--serial` 指定该行的完整标识。保持同一台手机、电脑和应用，分别采集连接空闲与出现卡顿的场景。
+
+```bash
+adbpilot lag record --serial 192.0.2.10:37001 --label wifi-idle --out wifi-idle.json
+adbpilot lag record --serial 192.0.2.10:37001 --label wifi-debug --out wifi-debug.json
+adbpilot lag compare wifi-idle.json wifi-debug.json --same-device
+```
+
+默认采集 30 秒。`--mark-on-enter` 可在交互终端标记卡顿时刻，`--package com.example.app` 可补充应用的近期 HWUI 帧数据。报告中的 ADB 耗时包含电脑和手机两端的命令处理。近期帧样本的覆盖可能短于采集窗口。要比较关闭无线调试时的手机画面表现，可用手机本地 System Tracing 录制。 [真机对照步骤](doc/wireless-debug-lag/feasibility.md#真机对照)
+
 ## 推荐架构
 
 ```text

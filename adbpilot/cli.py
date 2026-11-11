@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import lag, lag_report
 from .client import AdbClient, capability_summary, pairing_status_text
 from .errors import AdbPilotError, suggestion_for_device_state
 from .history import format_device_row, load_devices, log_path, recent_events
@@ -21,11 +22,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if not hasattr(args, "handler"):
-        parser.print_help()
+    if not hasattr(args, "handler") and not hasattr(args, "local_handler"):
+        getattr(args, "help_parser", parser).print_help()
         return 0
 
     try:
+        if hasattr(args, "local_handler"):
+            return args.local_handler(args)
         client = AdbClient(adb_path=args.adb_path, timeout=args.timeout)
         return args.handler(client, args)
     except KeyboardInterrupt:
@@ -207,6 +210,27 @@ def build_parser() -> argparse.ArgumentParser:
     logcat.add_argument("--tag", help="按 tag 过滤")
     logcat.add_argument("--level", choices=["V", "D", "I", "W", "E", "F", "S"], help="日志级别")
     logcat.set_defaults(handler=handle_logcat)
+
+    diagnostic = subparsers.add_parser("lag", help="采集和对比无线调试卡顿证据")
+    diagnostic.set_defaults(help_parser=diagnostic)
+    diagnostic_commands = diagnostic.add_subparsers(dest="lag_command")
+    capture = diagnostic_commands.add_parser("record", help="短时采集 ADB 命令耗时和可选的应用近期帧数据")
+    capture.add_argument("-s", "--serial", help="adb devices -l 中的完整传输标识；多条在线时必须指定")
+    capture.add_argument("--duration", type=int, default=lag.DEFAULT_DURATION,
+                         help=f"采集秒数，{lag.MIN_DURATION}–{lag.MAX_DURATION} 秒，默认 {lag.DEFAULT_DURATION} 秒")
+    capture.add_argument("--package", help="额外读取此应用的近期 HWUI 帧数据")
+    capture.add_argument("--label", help="场景标签，例如 wifi-idle")
+    capture.add_argument("--mark-on-enter", action="store_true", help="在交互终端按 Enter 标记卡顿时刻")
+    capture.add_argument("--out", type=Path, required=True, help="本地 JSON 报告文件路径")
+    capture.add_argument("--json", action="store_true", help="同时将报告以 JSON 输出到 stdout")
+    capture.set_defaults(handler=handle_lag_record)
+
+    compare = diagnostic_commands.add_parser("compare", help="离线比较两份诊断报告")
+    compare.add_argument("baseline", type=Path, help="基线 JSON 报告")
+    compare.add_argument("current", type=Path, help="当前场景 JSON 报告")
+    compare.add_argument("--same-device", action="store_true", help="确认两份报告来自同一台手机")
+    compare.add_argument("--json", action="store_true", help="以 JSON 输出比较结果")
+    compare.set_defaults(local_handler=handle_lag_compare)
 
     return parser
 
@@ -488,6 +512,80 @@ def handle_logcat(client: AdbClient, args: argparse.Namespace) -> int:
         with args.output.open("w", encoding="utf-8", errors="replace") as output:
             return client.logcat(args.serial, output=output, package=args.package, tag=args.tag, level=args.level)
     return client.logcat(args.serial, package=args.package, tag=args.tag, level=args.level)
+
+
+def handle_lag_record(client: AdbClient, args: argparse.Namespace) -> int:
+    if not lag.MIN_DURATION <= args.duration <= lag.MAX_DURATION:
+        raise AdbPilotError(f"采集时长应为 {lag.MIN_DURATION}–{lag.MAX_DURATION} 秒。")
+    lag.validate_inputs(args.package, args.label, args.mark_on_enter)
+    if args.out.exists() or args.out.is_symlink():
+        raise AdbPilotError(f"报告文件已存在，请选择新路径：{args.out}")
+    report = lag.record_session(client, serial=args.serial, package=args.package, label=args.label,
+                                duration=args.duration, mark_on_enter=args.mark_on_enter)
+    lag_report.write_report(args.out, report)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        _print_lag_summary(report)
+        print(f"报告已保存至 {args.out}")
+
+    reason = report["stop_reason"]
+    if reason:
+        print(lag.STOP_MESSAGES[reason], file=sys.stderr)
+        return 130 if reason == "interrupted" else 2
+    return 0
+
+
+def handle_lag_compare(args: argparse.Namespace) -> int:
+    baseline = lag_report.load_report(args.baseline)
+    current = lag_report.load_report(args.current)
+    comparison = lag_report.compare_reports(baseline, current, same_device=args.same_device)
+    if args.json:
+        print(json.dumps(comparison, ensure_ascii=False, indent=2))
+        return 0
+
+    print("基线")
+    _print_lag_summary(comparison["baseline"])
+    print("\n当前")
+    _print_lag_summary(comparison["current"])
+    delta = comparison["delta_ms"]
+    if delta is None:
+        print("\n仅并排展示。" + "；".join(comparison["comparison_limits"]) + "。")
+    else:
+        print(f"\nADB 命令耗时变化（当前减基线）  中位数 {delta['median_ms']:+.3f} ms  最大值 {delta['max_ms']:+.3f} ms")
+    return 0
+
+
+def _print_lag_summary(report: dict[str, Any]) -> None:
+    def duration(value: float | None) -> str:
+        return "无数据" if value is None else f"{value:.3f} ms"
+
+    context = report["context"]
+    counts = report["adb"]["counts"]
+    frames = report["frames"]
+    label = context["label"] or "未命名场景"
+    transport = {"usb": "USB", "wifi": "Wi-Fi", "tcpip": "TCP/IP（物理链路未知）", "emulator": "模拟器"}
+    statuses = {"complete": "已完成", "partial": "部分完成", "failed": "采集失败"}
+    print(f"{label} · {transport.get(context['transport'], '未知传输')} · {statuses[report['status']]}"
+          f" · {context['elapsed_ms'] / 1000:.1f}/{context['duration_seconds']:g} 秒")
+    print(f"ADB 命令耗时  成功 {counts['ok']}  超时 {counts['timeout']}  失败 {counts['failed']}  跳过 {counts['skipped']}")
+    print(f"中位数 {duration(report['adb']['median_ms'])}  最大值 {duration(report['adb']['max_ms'])}")
+    if counts["ok"] < lag_report.MIN_SUCCESSFUL_PROBES:
+        print(f"成功样本少于 {lag_report.MIN_SUCCESSFUL_PROBES} 条。")
+    if frames["status"] != "not_requested":
+        print(f"{context['package']} 近期 HWUI 帧  {frames['frame_count']} 帧 · {frames['window_count']} 个窗口"
+              f" · 样本跨度 {duration(frames['span_ms'])}")
+        print(f"帧完成耗时  中位数 {duration(frames['median_ms'])}  最大值 {duration(frames['max_ms'])}")
+        frame_reasons = {
+            "invalid_frame_data": "帧数据格式不完整", "windows_changed": "窗口或进程发生变化",
+            "buffer_discontinuity": "前后帧缓冲无交集", "no_new_frames": "未取得新的有效帧",
+            "capture_interrupted": "未完成前后帧采集", "frame_query_timeout": "帧查询超时",
+            "frame_query_failed": "帧查询失败", "unsupported_frame_output": "设备未返回可识别的帧数据",
+        }
+        if frames["reasons"]:
+            print("帧数据限制  " + "；".join(frame_reasons.get(reason, "其他限制") for reason in frames["reasons"]))
+    if report["marks"]:
+        print("卡顿标记（相对采集开始）  " + "、".join(f"{mark / 1000:.3f} 秒" for mark in report["marks"]))
 
 
 def device_to_dict(device: Device) -> dict[str, Any]:
