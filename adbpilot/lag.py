@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from .client import AdbClient, is_tls_connect_serial, parse_devices
 from .errors import AdbCommandError, AdbPilotError
 from .lag_report import (
     SCHEMA_VERSION, FrameSnapshot, frame_result, milliseconds, parse_frame_stats, summarize_frames, summarize_probes,
+    write_report,
 )
 from .models import CommandResult, Device
 
@@ -47,6 +49,31 @@ class SessionStopped(Exception):
         self.reason = reason
 
 
+class RecordingControl:
+    """Coordinates user marks and cancellation with the sampling thread."""
+
+    def __init__(self) -> None:
+        self.cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._recording = False
+        self._marks: list[int] = []
+
+    def set_recording(self, recording: bool) -> None:
+        with self._lock:
+            self._recording = recording
+
+    def mark(self) -> bool:
+        with self._lock:
+            if not self._recording or self.cancelled.is_set():
+                return False
+            self._marks.append(time.monotonic_ns())
+            return True
+
+    def marks_between(self, start: int, end: int) -> list[float]:
+        with self._lock:
+            return [milliseconds(mark - start) for mark in self._marks if start <= mark <= end]
+
+
 def validate_inputs(package: str | None, label: str | None, mark_on_enter: bool) -> None:
     if package is not None and not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*", package):
         raise AdbPilotError("请提供有效的 Android 应用包名。")
@@ -60,7 +87,7 @@ def _devices(client: AdbClient, timeout: float = PROBE_TIMEOUT) -> list[Device]:
     return parse_devices(client.run(["devices", "-l"], timeout=timeout).stdout)
 
 
-def _select_target(client: AdbClient, serial: str | None) -> tuple[Device, int]:
+def _select_target(client: AdbClient, serial: str | None, expected_transport_id: str | None = None) -> tuple[Device, int]:
     try:
         devices = _devices(client)
     except (OSError, AdbCommandError, subprocess.TimeoutExpired) as exc:
@@ -77,6 +104,8 @@ def _select_target(client: AdbClient, serial: str | None) -> tuple[Device, int]:
     identifier = target.details.get("transport_id", "")
     if not re.fullmatch(r"[1-9][0-9]{0,19}", identifier):
         raise AdbPilotError("当前 ADB 未提供传输 ID。请更新 Android Platform-Tools。")
+    if expected_transport_id is not None and identifier != expected_transport_id:
+        raise AdbPilotError("选中的 ADB 传输已变化。请刷新设备列表后重试。")
     return target, int(identifier)
 
 
@@ -154,13 +183,13 @@ def _frames(client: AdbClient, target: Device, identifier: int, package: str) ->
     return snapshot, "unsupported_frame_output" if snapshot is None else None
 
 
-def _watch_enter(stop: threading.Event, marks: list[int]) -> None:
+def _watch_enter(stop: threading.Event, mark: Callable[[], bool]) -> None:
     if os.name == "nt":
         import msvcrt
 
         while not stop.wait(0.05):
             if msvcrt.kbhit() and msvcrt.getwch() == "\r":
-                marks.append(time.monotonic_ns())
+                mark()
         return
 
     import select
@@ -172,17 +201,28 @@ def _watch_enter(stop: threading.Event, marks: list[int]) -> None:
                 data = os.read(fd, 4096)
                 if not data:
                     return
-                marks.extend([time.monotonic_ns()] * data.count(b"\n"))
+                for _ in range(data.count(b"\n")):
+                    mark()
     except (OSError, ValueError):
         return
 
 
-def _wait_until(deadline: int) -> None:
-    time.sleep(max(0, (deadline - time.monotonic_ns()) / NANOSECONDS_PER_SECOND))
+def _check_cancelled(cancelled: threading.Event | None) -> None:
+    if cancelled is not None and cancelled.is_set():
+        raise SessionStopped("interrupted")
+
+
+def _wait_until(deadline: int, cancelled: threading.Event | None) -> None:
+    seconds = max(0, (deadline - time.monotonic_ns()) / NANOSECONDS_PER_SECOND)
+    if cancelled is None:
+        time.sleep(seconds)
+    elif cancelled.wait(seconds):
+        raise SessionStopped("interrupted")
 
 
 def _sample_probes(client: AdbClient, target: Device, identifier: int, start: int, duration: int,
-                   samples: list[dict[str, Any]], on_unresponsive: Callable[[int], None]) -> None:
+                   samples: list[dict[str, Any]], on_unresponsive: Callable[[int], None],
+                   cancelled: threading.Event | None) -> None:
     last_probe = start - INTERVAL * NANOSECONDS_PER_SECOND
     consecutive_timeouts = 0
     backed_off = False
@@ -194,7 +234,7 @@ def _sample_probes(client: AdbClient, target: Device, identifier: int, start: in
         interval = BACKOFF_INTERVAL if backed_off else INTERVAL
         next_probe = last_probe + interval * NANOSECONDS_PER_SECOND
         skip_for_backoff = backed_off and next_probe >= slot_end
-        _wait_until(planned if skip_for_backoff else min(slot_end, max(planned, next_probe)))
+        _wait_until(planned if skip_for_backoff else min(slot_end, max(planned, next_probe)), cancelled)
         remaining = (slot_end - time.monotonic_ns()) / NANOSECONDS_PER_SECOND
         if remaining <= 0:
             continue
@@ -208,6 +248,7 @@ def _sample_probes(client: AdbClient, target: Device, identifier: int, start: in
             sample["skip_reason"] = "backoff"
             continue
 
+        _check_cancelled(cancelled)
         probe_start = time.monotonic_ns()
         remaining = (slot_end - probe_start) / NANOSECONDS_PER_SECOND
         if remaining <= 0:
@@ -233,15 +274,19 @@ def _sample_probes(client: AdbClient, target: Device, identifier: int, start: in
         if not backed_off and consecutive_timeouts >= UNRESPONSIVE_TIMEOUTS:
             backed_off = True
             on_unresponsive(time.monotonic_ns())
-    _wait_until(start + duration * NANOSECONDS_PER_SECOND)
+    _wait_until(start + duration * NANOSECONDS_PER_SECOND, cancelled)
 
 
 def record_session(client: AdbClient, *, serial: str | None, package: str | None, label: str | None,
                    duration: int, mark_on_enter: bool,
-                   on_checkpoint: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
-    target, identifier = _select_target(client, serial)
+                   on_checkpoint: Callable[[dict[str, Any]], None] | None = None,
+                   on_started: Callable[[], None] | None = None,
+                   control: RecordingControl | None = None,
+                   expected_transport_id: str | None = None) -> dict[str, Any]:
+    target, identifier = _select_target(client, serial, expected_transport_id)
+    cancelled = control.cancelled if control is not None else None
+    control = control or RecordingControl()
     samples: list[dict[str, Any]] = []
-    marks: list[int] = []
     stop = threading.Event()
     watcher = None
     reason = None
@@ -266,7 +311,7 @@ def record_session(client: AdbClient, *, serial: str | None, package: str | None
             },
             "adb": {"samples": list(samples), **summarize_probes(samples)},
             "frames": frames,
-            "marks": [milliseconds(mark - start) for mark in list(marks) if start is not None and start <= mark <= finished],
+            "marks": control.marks_between(start, finished) if start is not None else [],
         }
         if first_unresponsive is not None:
             report["diagnosis"] = {
@@ -285,22 +330,26 @@ def record_session(client: AdbClient, *, serial: str | None, package: str | None
             on_checkpoint(build_report("partial", detected))
 
     try:
+        _check_cancelled(cancelled)
         version, sdk = _metadata(client, target, identifier)
+        _check_cancelled(cancelled)
         before, frame_error = _frames(client, target, identifier, package) if package else (None, None)
         if frame_error:
             frames = frame_result("unavailable", frame_error)
-        message = f"开始 {duration} 秒 ADB 采集，请在手机上复现卡顿。"
-        if mark_on_enter:
-            message += " 按 Enter 标记卡顿时刻。"
-        print(message, file=sys.stderr, flush=True)
+        _check_cancelled(cancelled)
         started_at = datetime.now(timezone.utc).isoformat()
         start = time.monotonic_ns()
+        control.set_recording(True)
+        if on_started is not None:
+            on_started()
         if mark_on_enter:
-            watcher = threading.Thread(target=_watch_enter, args=(stop, marks), daemon=True)
+            watcher = threading.Thread(target=_watch_enter, args=(stop, control.mark), daemon=True)
             watcher.start()
-        _sample_probes(client, target, identifier, start, duration, samples, note_unresponsive)
+        _sample_probes(client, target, identifier, start, duration, samples, note_unresponsive, cancelled)
+        control.set_recording(False)
         end = time.monotonic_ns()
         stop.set()
+        _check_cancelled(cancelled)
         if before is not None and package and first_unresponsive is None:
             after, frame_error = _frames(client, target, identifier, package)
             if after is None:
@@ -315,6 +364,7 @@ def record_session(client: AdbClient, *, serial: str | None, package: str | None
                 pass
         if all(sample["status"] == "skipped" for sample in samples):
             reason = "no_probe"
+        _check_cancelled(cancelled)
     except SessionStopped as exc:
         reason = exc.reason
     except OSError:
@@ -322,6 +372,7 @@ def record_session(client: AdbClient, *, serial: str | None, package: str | None
     except KeyboardInterrupt:
         reason = "interrupted"
     finally:
+        control.set_recording(False)
         stop.set()
         if end is None:
             end = time.monotonic_ns()
@@ -330,3 +381,35 @@ def record_session(client: AdbClient, *, serial: str | None, package: str | None
 
     status = "complete" if reason is None else "partial" if start is not None else "failed"
     return build_report(status, end)
+
+
+def record_to_path(
+    client: AdbClient, output: Path, *, serial: str | None, package: str | None = None,
+    label: str | None = None, duration: int = DEFAULT_DURATION, mark_on_enter: bool = False,
+    control: RecordingControl | None = None, expected_transport_id: str | None = None,
+    on_event: Callable[[str, str], None],
+) -> dict[str, Any]:
+    """Run the same capture and report workflow for the CLI and desktop GUI."""
+    if not MIN_DURATION <= duration <= MAX_DURATION:
+        raise AdbPilotError(f"采集时长应为 {MIN_DURATION}–{MAX_DURATION} 秒。")
+    validate_inputs(package, label, mark_on_enter)
+    if output.exists() or output.is_symlink():
+        raise AdbPilotError(f"报告文件已存在，请选择新路径：{output}")
+
+    def save_checkpoint(report: dict[str, Any]) -> None:
+        on_event("unresponsive", "")
+        path = output.with_name(f"{output.stem}.timeout-{report['session_id'][:8]}.json")
+        try:
+            write_report(path, report)
+        except AdbPilotError as exc:
+            on_event("checkpoint_failed", str(exc))
+        else:
+            on_event("checkpoint_saved", str(path))
+
+    report = record_session(
+        client, serial=serial, package=package, label=label, duration=duration, mark_on_enter=mark_on_enter,
+        on_started=lambda: on_event("started", ""), on_checkpoint=save_checkpoint, control=control,
+        expected_transport_id=expected_transport_id,
+    )
+    write_report(output, report)
+    return report

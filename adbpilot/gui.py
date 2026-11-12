@@ -21,6 +21,7 @@ from . import __version__
 from .adb_download import ADB_VERSIONS, default_download_root, download_platform_tools, open_directory
 from .client import AdbClient, capability_summary, pairing_status_text
 from .errors import AdbDownloadError, AdbNotFoundError, AdbPilotError, PairingCodeError, WirelessAddressError
+from .gui_lag import LagDiagnosticsTab
 from .history import load_devices, log_path, recent_events
 from .models import Device, RunningProcess
 from .packages import DependencyRequest, install_dependency
@@ -286,6 +287,7 @@ class AdbPilotGui(BaseTk):
         style.configure("CommandBar.TFrame", background=COLORS["surface"])
         style.configure("TLabel", background=COLORS["surface"], foreground=COLORS["text"], padding=(0, 2))
         style.configure("Muted.TLabel", background=COLORS["surface"], foreground=COLORS["muted"])
+        style.configure("Warning.TLabel", background=COLORS["surface"], foreground=COLORS["warning"])
         style.configure("AppMuted.TLabel", background=COLORS["app"], foreground=COLORS["muted"])
         style.configure("Header.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=ui_font(13, "bold"))
         style.configure("Title.TLabel", background=COLORS["surface"], foreground=COLORS["text"], font=ui_font(18, "bold"))
@@ -465,6 +467,8 @@ class AdbPilotGui(BaseTk):
         self._build_shell_tab(self.tabs)
         self._build_log_tab(self.tabs)
         self._build_history_tab(self.tabs)
+        self.lag_tab = LagDiagnosticsTab(self.tabs, self)
+        self.tabs.add(self.lag_tab, text="卡顿诊断")
 
     def _build_apps_tab(self, tabs: ttk.Notebook) -> None:
         tab = ttk.Frame(tabs, padding=16, style="Surface.TFrame")
@@ -1235,6 +1239,7 @@ class AdbPilotGui(BaseTk):
 
     def _close_app(self) -> None:
         self.mdns_stop.set()
+        self.lag_tab.stop_recording()
         self.mdns_adapter.cancel_mdns_discovery()
         self._stop_macos_floating_window()
         if self.floating_window is not None and self.floating_window.winfo_exists():
@@ -1549,6 +1554,8 @@ class AdbPilotGui(BaseTk):
         func: Callable[[], Any],
         on_success: ResultCallback | None = None,
         on_error: ResultCallback | None = None,
+        *,
+        daemon: bool = True,
     ) -> None:
         self.status_var.set(f"执行中：{label}")
         self._append_output(f"$ {label}\n")
@@ -1560,7 +1567,7 @@ class AdbPilotGui(BaseTk):
             except Exception as exc:  # noqa: BLE001 - GUI must show unexpected worker failures.
                 self.result_queue.put(("err", label, exc, on_error))
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(target=worker, daemon=daemon).start()
 
     def _process_results(self) -> None:
         while True:
@@ -1570,6 +1577,9 @@ class AdbPilotGui(BaseTk):
                 break
 
             if kind == "progress":
+                if callback:
+                    callback(payload)
+                    continue
                 if label.startswith("扫码配对:") and label.split(":", 2)[1] != str(self.qr_pair_session):
                     continue
                 message = str(payload).split("\n", 1)[0]

@@ -204,6 +204,33 @@ class LagTests(unittest.TestCase):
             self.assertIn(lag_report.UNRESPONSIVE_MESSAGE, stderr.getvalue())
             self.assertEqual(final["adb"]["counts"]["timeout"], 3)
 
+    def test_external_mark_and_stop_share_the_recording_clock(self):
+        control = lag.RecordingControl()
+        self.assertFalse(control.mark())
+        run = self.client.run
+
+        def stop_after_probe(command, **options):
+            result = run(command, **options)
+            if command == ["shell", "-n", "true"]:
+                self.assertTrue(control.mark())
+                control.cancelled.set()
+            return result
+
+        self.client.run = stop_after_probe
+        with patch.object(lag.time, "monotonic_ns", self.clock.now):
+            report = lag.record_session(self.client, serial=WIFI, package=None, label=None, duration=30,
+                                        mark_on_enter=False, control=control, expected_transport_id="8")
+        self.assertEqual(report["stop_reason"], "interrupted")
+        self.assertEqual(report["adb"]["counts"]["ok"], 1)
+        self.assertEqual(report["marks"], [20])
+        self.assertFalse(control.mark())
+
+    def test_device_selection_rejects_changed_transport_before_recording(self):
+        with self.assertRaisesRegex(AdbPilotError, "传输已变化"):
+            lag.record_session(self.client, serial=WIFI, package=None, label=None, duration=30,
+                               mark_on_enter=False, expected_transport_id="9")
+        self.assertEqual(len(self.client.commands), 1)
+
     def test_interruption_produces_serializable_partial_report(self):
         self.client.interrupt_first = True
         report = self.capture()

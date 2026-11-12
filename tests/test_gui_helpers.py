@@ -414,11 +414,12 @@ class GuiHelperTests(unittest.TestCase):
         gui = SimpleNamespace(
             mdns_stop=threading.Event(), mdns_adapter=Mock(),
             _stop_macos_floating_window=Mock(), floating_window=None,
-            destroy=Mock(),
+            destroy=Mock(), lag_tab=Mock(),
         )
         gui.destroy.side_effect = lambda: self.assertTrue(gui.mdns_stop.is_set())
         AdbPilotGui._close_app(gui)
         gui.mdns_adapter.cancel_mdns_discovery.assert_called_once()
+        gui.lag_tab.stop_recording.assert_called_once()
         gui.destroy.assert_called_once()
 
     def test_generate_adb_qr_pairing_payload(self):

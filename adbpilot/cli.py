@@ -515,25 +515,21 @@ def handle_logcat(client: AdbClient, args: argparse.Namespace) -> int:
 
 
 def handle_lag_record(client: AdbClient, args: argparse.Namespace) -> int:
-    if not lag.MIN_DURATION <= args.duration <= lag.MAX_DURATION:
-        raise AdbPilotError(f"采集时长应为 {lag.MIN_DURATION}–{lag.MAX_DURATION} 秒。")
-    lag.validate_inputs(args.package, args.label, args.mark_on_enter)
-    if args.out.exists() or args.out.is_symlink():
-        raise AdbPilotError(f"报告文件已存在，请选择新路径：{args.out}")
-
-    def save_checkpoint(report: dict[str, Any]) -> None:
-        path = args.out.with_name(f"{args.out.stem}.timeout-{report['session_id'][:8]}.json")
-        print(f"{lag_report.UNRESPONSIVE_MESSAGE} 后续每 {lag.BACKOFF_INTERVAL} 秒最多探测一次。", file=sys.stderr, flush=True)
-        try:
-            lag_report.write_report(path, report)
-        except AdbPilotError as exc:
-            print(f"超时快照保存失败：{exc}", file=sys.stderr, flush=True)
+    def show_event(event: str, detail: str) -> None:
+        if event == "started":
+            message = f"开始 {args.duration} 秒 ADB 采集，请在手机上复现卡顿。"
+            if args.mark_on_enter:
+                message += " 按 Enter 标记卡顿时刻。"
+        elif event == "unresponsive":
+            message = f"{lag_report.UNRESPONSIVE_MESSAGE} 后续每 {lag.BACKOFF_INTERVAL} 秒最多探测一次。"
+        elif event == "checkpoint_saved":
+            message = f"超时快照已保存至 {detail}"
         else:
-            print(f"超时快照已保存至 {path}", file=sys.stderr, flush=True)
+            message = f"超时快照保存失败：{detail}"
+        print(message, file=sys.stderr, flush=True)
 
-    report = lag.record_session(client, serial=args.serial, package=args.package, label=args.label,
-                                duration=args.duration, mark_on_enter=args.mark_on_enter, on_checkpoint=save_checkpoint)
-    lag_report.write_report(args.out, report)
+    report = lag.record_to_path(client, args.out, serial=args.serial, package=args.package, label=args.label,
+                                duration=args.duration, mark_on_enter=args.mark_on_enter, on_event=show_event)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:
