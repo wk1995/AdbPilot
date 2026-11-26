@@ -31,8 +31,10 @@ class GuiLagTests(unittest.TestCase):
         tab = SimpleNamespace(
             app=app, control=None, status=FakeVar(), warning=FakeVar(), mark_status=FakeVar(),
             report_path=FakeVar(), snapshot_path=FakeVar(), start_button=Mock(), mark_button=Mock(), stop_button=Mock(),
+            recovery_path=FakeVar(), incident=None, recovering=False, dual_button=Mock(), recovery_button=Mock(),
         )
         tab._reset_controls = lambda: LagDiagnosticsTab._reset_controls(tab)
+        tab._begin = lambda message: LagDiagnosticsTab._begin(tab, message)
         return tab
 
     def test_start_rejects_offline_device_before_opening_save_dialog(self):

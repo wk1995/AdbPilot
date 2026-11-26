@@ -1836,18 +1836,22 @@ class AdbPilotGui(BaseTk):
         self.after(self.DEVICE_POLL_INTERVAL_MS, self._poll_devices)
 
     def _read_devices_and_recover(self, client: AdbClient) -> tuple[list[Device], MdnsRecoveryResult | None]:
+        def diagnosing() -> bool:
+            return getattr(getattr(self, "lag_tab", None), "control", None) is not None
+
         # Serialize the entire bounded probe/restart with refresh and manual restart.
         with self.adb_service_lock:
             if self.mdns_stop.is_set():
                 return [], None
             devices = client.devices(deduplicate=False, observe_identities=True)
-            if (devices or self.mdns_manual_restart_running
+            if (devices or diagnosing() or self.mdns_manual_restart_running
                     or getattr(self, "pairing_in_progress", False) or getattr(self, "wireless_busy", False)):
                 return devices, None
             result = client.recover_stale_mdns(
                 controller=self.mdns_recovery,
                 adapter=self.mdns_adapter,
                 cancelled=lambda: (self.mdns_stop.is_set() or self.client is not client
+                                   or diagnosing()
                                    or self.mdns_manual_restart_running
                                    or getattr(self, "pairing_in_progress", False)
                                    or getattr(self, "wireless_busy", False)),
@@ -1881,6 +1885,7 @@ class AdbPilotGui(BaseTk):
                 unique_devices[device.serial] = device
         transports = list(unique_devices.values())
         self.device_transports = transports
+        self.lag_tab.refresh_transports()
         current_serials = set(unique_devices)
         devices = transports
         if self.client is not None:

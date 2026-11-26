@@ -166,8 +166,8 @@ def summarize_frames(before: FrameSnapshot, after: FrameSnapshot) -> dict[str, A
     return result
 
 
-def write_report(path: Path, report: dict[str, Any]) -> None:
-    """Publish a complete file in the destination directory without overwriting."""
+def write_report(path: Path, report: dict[str, Any], *, replace: bool = False) -> None:
+    """Atomically publish a report, optionally updating a session-owned file."""
     temporary = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,7 +176,9 @@ def write_report(path: Path, report: dict[str, Any]) -> None:
                 temporary = Path(output.name)
                 json.dump(report, output, ensure_ascii=False, indent=2, allow_nan=False)
                 output.write("\n")
-            if os.name == "nt":
+            if replace:
+                temporary.replace(path)
+            elif os.name == "nt":
                 # Unlike POSIX rename, this fails if the destination already exists.
                 temporary.rename(path)
             else:

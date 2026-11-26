@@ -198,6 +198,14 @@ class GuiHelperTests(unittest.TestCase):
             self.assertEqual(AdbPilotGui._read_devices_and_recover(gui, client), ([phone], None))
             client.recover_stale_mdns.assert_not_called()
 
+    def test_active_diagnostics_skip_automatic_restart_on_empty_device_list(self):
+        client = Mock()
+        client.devices.return_value = []
+        gui = self.make_mdns_gui(client)
+        gui.lag_tab = SimpleNamespace(control=object())
+        self.assertEqual(AdbPilotGui._read_devices_and_recover(gui, client), ([], None))
+        client.recover_stale_mdns.assert_not_called()
+
     def test_gui_dedup_preserves_locked_transport_and_does_not_report_hidden_alias_as_disconnected(self):
         usb = Device("test-usb", "device", {"transport_id": "1", "usb": "1"})
         wifi = Device("192.0.2.10:37001", "device", {"transport_id": "2"})
@@ -205,6 +213,7 @@ class GuiHelperTests(unittest.TestCase):
         client.deduplicate_cached_devices.return_value = [usb]
         gui = self.make_mdns_gui(client)
         gui.device_transports = [usb, wifi]
+        gui.lag_tab = Mock()
         gui.device_rows = {device.serial: {"state": device.state} for device in gui.device_transports}
         gui.device_table = Mock()
         gui.device_table.get_children.return_value = []
